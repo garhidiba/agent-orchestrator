@@ -1,2 +1,119 @@
 # Project overrides; omitted fields inherit user settings.
 schema_version: 1
+model_selection:
+  profile: balanced
+  allow_cross_host: false
+  allow_unverified_models: false
+  catalog_cache_ttl_hours: 24
+  on_model_unavailable: pause
+  on_catalog_change: recommend_only
+hosts:
+  codex:
+    enabled: true
+    roles:
+      coordinator:
+        model: inherit
+        effort: inherit
+      requirements:
+        model: gpt-6.1-sol
+        effort: medium
+      planner:
+        model: gpt-6.1-sol
+        effort: medium
+      coder:
+        model: gpt-6.1-sol
+        effort: medium
+      tester:
+        model: gpt-6.1-sol
+        effort: medium
+      reviewer:
+        model: gpt-6.1-sol
+        effort: medium
+      repair:
+        model: gpt-6.1-sol
+        effort: medium
+      final_auditor:
+        model: gpt-6.1-sol
+        effort: medium
+  claude:
+    enabled: true
+    roles:
+      coordinator:
+        model: inherit
+        effort: inherit
+      requirements:
+        model: auto
+        effort: auto
+      planner:
+        model: auto
+        effort: auto
+      coder:
+        model: auto
+        effort: auto
+      tester:
+        model: auto
+        effort: auto
+      reviewer:
+        model: auto
+        effort: auto
+      repair:
+        model: auto
+        effort: auto
+      final_auditor:
+        model: auto
+        effort: auto
+execution:
+  mode: interactive_native
+  max_parallel_workers: 4
+  max_parallel_test_jobs: 1
+  max_task_attempts: 3
+  max_review_rounds: 3
+  max_repeated_finding_rounds: 2
+  task_timeout_minutes: 30
+  run_timeout_minutes: 180
+  on_host_disconnect: pause_and_preserve
+planning:
+  require_approval: true
+  preserve_user_overrides: true
+git:
+  target_branch: null
+  integration_prefix: orch
+  merge_strategy: merge_no_ff
+  commit_policy: atomic_unit
+  finalization: approval_required
+  remote_push: false
+  dirty_checkout_policy: stop
+review:
+  required: true
+  block_on:
+    - critical
+    - high
+  independent_session: true
+  final_audit: true
+  unresolved_nonblocking: report
+quality:
+  baseline_required: true
+  commands:
+    - id: project-check
+      executable: npm
+      args:
+        - run
+        - check
+      cwd: .
+      stages:
+        - baseline
+        - task
+        - integration
+        - final
+      required: true
+      timeout_seconds: 900
+  allow_missing_tests: false
+cleanup:
+  on_success: owned_merged_clean_only
+  on_failure: preserve
+  keep_reports: true
+  keep_integration_until_finalized: true
+observability:
+  telemetry: off
+  store_raw_prompts: false
+  redact_secrets: true
