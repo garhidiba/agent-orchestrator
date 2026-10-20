@@ -54,3 +54,9 @@ npm run schema
 설치본 `0.1.0-local.16e8bcab654f3cb2`로 임시 Git 저장소에서 실제 native `spawn_agent`를 사용했다. 워커가 지정 worktree에서 read-only bootstrap 후 `result.txt`에 정확한 `ORCH native ready\n` 바이트를 썼다. MCP가 content assertion, 단위 커밋, 통합을 수행했고 별도 네이티브 reviewer와 auditor가 실제 diff/바이트/계보를 확인했다. 최종 target SHA는 `fcbcfae2bd809f2e8eee399a99d79bc4b3ff5f4a`, run은 `run-e131609e-1617-42d6-bdd3-d10e5d909fa2`, 보고서는 `COMPLETED`, `completionVerified=true`, blockers 빈 배열, cleanup complete이다. 원본 프로젝트는 수정하지 않았다.
 
 이는 현재 Codex 대화에서의 단일 태스크 실행 증거다. 실제 모델·effort·계정 권한은 null/unknown을 유지하며 Claude native E2E, 역할별 concrete model/effort, 다른 OS, heartbeat 연장은 이 테스트로 승인하지 않는다. 최신 source에서는 host.executionReady 표시도 실제 연결 상태와 일치시켰으며 관련 MCP/protocol/skill 집중 테스트 17개가 통과했다.
+
+## 프로젝트 자동 초기화와 진입 이름 변경
+
+사용자 확인 범위에 따라 진입 스킬만 `agent-orch` / `agent-orch-configure`로 변경했다. `.orch` 설정·상태, 내부 `orch_*` MCP 도구와 등록 이름은 유지한다. 기본 진입은 인증된 `orch_project_init`으로 누락된 프로젝트 설정을 원자적으로 생성하며 기존 설정은 덮어쓰지 않는다. 명시적 no-write 요청과 설정 설명 전용 호출은 읽기 전용이다. 생성 파일은 schema_version만 고정하고 나머지 필드는 전역 설정을 상속한다. 프로젝트 초기화가 임의 Git 커밋이나 dirty 검사 우회를 수행하지는 않는다.
+
+관련 config 7개·MCP 6개·installer/skill 19개 테스트와 typecheck가 통과했다. 이전 소유 스킬의 새 이름 이전, rollback 및 제거, 사용자 편집 보존도 검증했다. 실제 두 호스트 설치에서 새 스킬·MCP 연결·프로젝트 최초 생성·재호출 보존·전역 상속을 확인했고, Codex skills/list(forceReload)에서 두 새 이름의 enabled=true와 소유된 legacy 스킬 제거를 확인했다. Windows 실행과 이번 변경 후 전체 테스트 suite 재실행은 포함하지 않았다.
