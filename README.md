@@ -92,6 +92,75 @@ On an execution request, `$agent-orch` first connects this conversation’s nati
 
 **Readiness:** `installation=READY` means MCP is ready; `NEEDS_HOST_HANDSHAKE` asks the skill to connect the current native Agent tool, then `nativeDispatch=READY` permits dispatch. Missing tools, wrong Git identity, expired challenges or unsupported concrete model/effort pins still block execution. Actual model/access observations remain separate from parent-relayed native receipts; see [compatibility](docs/compatibility.md).
 
+## Project configuration
+
+`$agent-orch init` creates `<your-project>/.orch/config.yaml`. This is the project's readable YAML configuration; edit it directly or ask `$agent-orch-configure` to validate and change specific settings. Keep credentials out of this file. Track the configuration according to your project policy; runtime data under `.orch/state/` belongs in `.gitignore`.
+
+| Section | What it controls |
+|---|---|
+| `schema_version` | Configuration format version; currently `1`. |
+| `model_selection` | Selection goal (`balanced`, `quality`, `economy`, `fast`), metadata cache lifetime in hours, and behavior when a model is unavailable. Profiles are goals, not hardcoded model rankings; changing the label alone does not select different models. |
+| `hosts.codex` / `hosts.claude` | Host enablement and each role's `model` and `effort`. Configuration can include both hosts; execution uses the current host without cross-host fallback. |
+| `execution` | Worker parallelism, task-attempt/review limits, and task/run timeouts in **minutes**. Defaults allow four parallel workers and three task attempts. Quality gates are currently serialized; `max_parallel_test_jobs` does not enable concurrent checks. |
+| `planning` | Whether the plan requires approval; explicit user overrides are preserved. |
+| `git` | Target branch, integration branch prefix, atomic commits and finalization approval. `target_branch: null` uses the invocation branch. Dirty checkouts stop write runs; automatic remote push is disabled. |
+| `review` | Independent review, blocking finding severities (default: `critical` and `high`) and final audit. |
+| `quality` | Project-specific verification commands and the stages at which they run. The shipped command list is empty; configure trusted checks for your project. |
+| `cleanup` | Remove only owned, merged, clean resources after success; preserve failed-run resources and reports. |
+| `observability` | Telemetry is off, raw prompts are not stored, and secret redaction is enabled. |
+
+Some safety fields accept only their shipped values; they are not permission switches. Unknown keys and invalid values fail validation. See the [complete defaults](templates/defaults/config.yaml) and [configuration reference](references/configuration.md).
+
+### Role models and reasoning effort
+
+Each host has eight [roles](references/agent-roles.md): `coordinator`, `requirements`, `planner`, `coder`, `tester`, `reviewer`, `repair` and `final_auditor`. Each role has two separate fields:
+
+- `model`: `auto` requests selection from supported current-host metadata; `inherit` follows the parent session; a concrete model ID pins that model.
+- `effort`: `auto` requests a supported default/selection; `inherit` follows the parent; a concrete level pins reasoning effort. Available levels depend on the host and model.
+
+For example, this repository currently uses the following **excerpt**, based on its current Codex host. It is not a universal default or a replacement for the entire generated file:
+
+```yaml
+hosts:
+  codex:
+    roles:
+      coordinator: { model: inherit, effort: inherit }
+      coder: { model: gpt-6.1-sol, effort: medium }
+      reviewer: { model: gpt-6.1-sol, effort: medium }
+```
+
+Use your host's supported IDs and effort levels. Existing concrete pins survive automatic optimization. `auto` can remain unresolved when metadata is missing; a valid YAML file does not prove model access or actual execution. The coordinator remains the current conversation; editing its policy does not switch that conversation's model.
+
+To configure roles through the installed skill:
+
+```text
+$agent-orch-configure 이 프로젝트의 coder와 reviewer 모델·추론 수준을 현재 호스트에서 지원되는 값으로 설정해줘. 다른 역할의 기존 설정은 유지해줘.
+```
+
+### Project verification commands
+
+Add checks that actually exist in the client project. For example, **only for a project that already defines `npm run check`**, this excerpt registers that command:
+
+```yaml
+quality:
+  commands:
+    - id: project-check
+      executable: npm
+      args: [run, check]
+      cwd: .
+      stages: [baseline, task, integration, final]
+      required: true
+      timeout_seconds: 900
+```
+
+`executable` and `args` are separate command arguments, not a shell command string. `cwd` is relative to the checkout being checked. `stages` selects the baseline, task, integration and final gates; `required: true` makes failure block that gate. Command timeouts are in **seconds**. This setting does not install npm or create a package script; use your project's own build/test tools.
+
+### Inheritance and when changes apply
+
+Precedence is **shipped defaults → user/global → project → session**, with later layers winning; host permissions still take priority. Objects merge by field, while arrays such as `quality.commands` replace the lower-layer list. Initialization materializes global/default values into the project file, so those written fields become project overrides. Later global edits do not replace them; removing a project key reveals its inherited value. Global configuration paths and per-field source inspection are documented in the [reference](references/configuration.md).
+
+Model/profile changes are read for the next worker attempt; an already prepared or running attempt keeps its configuration revision. Changes to execution, Git, review or quality policy require a new run.
+
 ## CLI and development checks
 
 These are developer commands run only from the ORCH source checkout, not client-project setup commands. Public initialization uses the installed conversation entry points above; there is no `npm run orch -- init` command. These source commands inspect settings and hosts. The role listing shows requested policy; metadata does not prove same-session model access. In the conversation, `orch_doctor` provides a separate read-only composite diagnostic; native readiness still requires the current-host handshake.
