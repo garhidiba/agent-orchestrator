@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { lstat, mkdir, readFile, realpath, rm, rmdir, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, readdir, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { redact } from '../quality/redact.ts';
 import { assertNoStagedSecrets } from '../quality/secrets.ts';
@@ -107,8 +108,7 @@ export class Engine {
   async change<T>(runId: string, operation: string, expected: number, input: unknown, fn: (run: Run) => Promise<T>, administrativeAbandon = false) {
     id.parse(operation);
     const snapshot = this.status(runId);
-    const mutex = join(snapshot.data.commonDir, 'orch', 'locks', 'operation');
-    await mkdir(mutex).catch(() => { throw new Error('OPERATION_LOCKED'); });
+    const mutex = await this.acquireOperationMutex(snapshot.data, operation);
     try {
       const current = this.status(runId);
       // Disposal is administrative; it never executes or upgrades a pinned runtime.
@@ -148,7 +148,69 @@ export class Engine {
       const saved = this.store.save(runId, current.version, current.data, 'run.changed', operation, response);
       if (this.canReleaseWriteLock(current.data)) await this.releaseRunLock(current.data);
       return saved;
-    } finally { this.activeOperation = null; await rmdir(mutex); }
+    } finally { this.activeOperation = null; await this.releaseOperationMutex(mutex); }
+  }
+  private async withOperationMutexGuard<T>(path: string, fn: () => Promise<T>, waitForBusy = false) {
+    const guard = join(dirname(path), 'operation-guard.db'), deadline = Date.now() + 5000;
+    for (;;) {
+      const info = await lstat(guard).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+      check(!info || info.isFile() && !info.isSymbolicLink(), 'OPERATION_LOCK_UNSAFE');
+      const database = new DatabaseSync(guard);
+      try {
+        database.exec('PRAGMA busy_timeout=0');
+        if (info?.size) check(database.prepare('PRAGMA application_id').get()?.application_id === 0x4f52434d, 'OPERATION_LOCK_UNSAFE');
+        else database.exec('PRAGMA application_id=0x4f52434d');
+        // Keep the checked directory generation stable until its filesystem maintenance finishes.
+        database.exec('BEGIN IMMEDIATE');
+        try { return await fn(); }
+        finally { database.exec('ROLLBACK'); }
+      } catch (error) {
+        if (![5, 6].includes((error as { errcode?: number }).errcode ?? -1)) throw error;
+        if (!waitForBusy || Date.now() >= deadline) throw new Error('OPERATION_LOCKED', { cause: error });
+      } finally { database.close(); }
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  }
+  private async acquireOperationMutex(run: Run, operationId: string) {
+    const path = join(run.commonDir, 'orch', 'locks', 'operation');
+    return this.withOperationMutexGuard(path, async () => {
+      await mkdir(path).catch(() => { throw new Error('OPERATION_LOCKED'); });
+      const owner = `owner-${hash(run.id)}-${hash(operationId)}-${randomUUID()}`;
+      try { await mkdir(join(path, owner)); }
+      catch (error) { await rmdir(path); throw error; }
+      return { path, owner };
+    });
+  }
+  private async releaseOperationMutex(mutex: { path: string; owner: string }) {
+    return this.withOperationMutexGuard(mutex.path, () => this.retireOperationMutex(mutex), true);
+  }
+  private async retireOperationMutex(mutex: { path: string; owner: string }) {
+    const entries = await readdir(mutex.path), info = await lstat(join(mutex.path, mutex.owner));
+    check(entries.length === 1 && entries[0] === mutex.owner && info.isDirectory() && !info.isSymbolicLink(), 'OPERATION_LOCKED');
+    // Retire the global mutex atomically; an exit during cleanup must not leave it ownerless.
+    const released = `${mutex.path}-released-${randomUUID()}`;
+    await rename(mutex.path, released);
+    await rmdir(join(released, mutex.owner));
+    await rmdir(released);
+  }
+  private async recoverOperationMutex(run: Run, operationId: string | null, ownsWriteLock: boolean) {
+    const path = join(run.commonDir, 'orch', 'locks', 'operation');
+    return this.withOperationMutexGuard(path, async () => {
+      const info = await lstat(path).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+      if (!info) return;
+      check(info.isDirectory() && !info.isSymbolicLink(), 'OPERATION_LOCKED');
+      const entries = await readdir(path);
+      if (entries.length) {
+        const owner = entries[0], prefix = `owner-${hash(run.id)}-`;
+        check(entries.length === 1 && /^owner-[a-f0-9]{64}-[a-f0-9]{64}-[a-f0-9-]{36}$/.test(owner) && owner.startsWith(prefix) &&
+          (operationId === null || owner.startsWith(`${prefix}${hash(operationId)}-`)), 'OPERATION_LOCKED');
+        await this.retireOperationMutex({ path, owner });
+      } else {
+        // Legacy empty mutexes carry no identity; only the current write owner can recover them.
+        check(ownsWriteLock, 'OPERATION_LOCKED');
+        await rmdir(path);
+      }
+    });
   }
   private canReleaseWriteLock(run: Run) {
     if (run.state === 'CANCELLED' && run.abandonment?.forced && this.store.operation(run.id, run.abandonment.operationId)?.status === 'complete') return true;
@@ -158,14 +220,17 @@ export class Engine {
   }
   private async releaseRunLock(run: Run) {
     check(this.canReleaseWriteLock(run), 'WORKER_STOP_UNCONFIRMED');
-    const lock = join(run.commonDir, 'orch', 'locks', 'write.json');
-    const info = await lstat(lock).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
-    if (!info) return;
-    check(info.isFile() && !info.isSymbolicLink() && info.size <= 4096, 'RUN_LOCK_UNSAFE');
-    const owner = JSON.parse(await readFile(lock, 'utf8')) as { runId: string; origin: string };
-    if (owner.runId !== run.id) return;
-    check(owner.origin === run.origin, 'RUN_LOCK_OWNERSHIP_MISMATCH');
-    await rm(lock);
+    const path = join(run.commonDir, 'orch', 'locks', 'operation');
+    return this.withOperationMutexGuard(path, async () => {
+      const lock = join(run.commonDir, 'orch', 'locks', 'write.json');
+      const info = await lstat(lock).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+      if (!info) return;
+      check(info.isFile() && !info.isSymbolicLink() && info.size <= 4096, 'RUN_LOCK_UNSAFE');
+      const owner = JSON.parse(await readFile(lock, 'utf8')) as { runId: string; origin: string };
+      if (owner.runId !== run.id) return;
+      check(owner.origin === run.origin, 'RUN_LOCK_OWNERSHIP_MISMATCH');
+      await rm(lock);
+    }, true);
   }
   async abandon(runId: string, operation: string, expected: number, input: unknown) {
     const approval = runAbandonmentSchema.parse(input);
@@ -182,8 +247,7 @@ export class Engine {
       check(info.isFile() && !info.isSymbolicLink() && info.size <= 4096, 'RUN_LOCK_UNSAFE');
       const owner = JSON.parse(await readFile(lock, 'utf8')) as { runId: string; origin: string };
       check(owner.runId === runId && owner.origin === this.origin && snapshot.data.origin === this.origin, 'RUN_LOCK_OWNERSHIP_MISMATCH');
-      // Explicit coordinator-stop confirmation permits breaking only this run's empty operation mutex.
-      await rmdir(join(snapshot.data.commonDir, 'orch', 'locks', 'operation')).catch(error => { if (error.code !== 'ENOENT') throw error; });
+      await this.recoverOperationMutex(snapshot.data, null, true);
     }
     return this.change(runId, operation, expected, { tool: 'orch_run_abandon', input: approval }, run => this.markAbandoned(run, operation, approval), true);
   }
@@ -216,17 +280,24 @@ export class Engine {
   async reconcile(runId: string, operationId: string, previousCoordinatorStopped: boolean) {
     check(previousCoordinatorStopped, 'COORDINATOR_STOP_UNCONFIRMED');
     const current = this.status(runId);
-    const mutex = join(current.data.commonDir, 'orch', 'locks', 'operation');
-    const pendingRecord = this.store.pending(runId).find(item => item.id === operationId); check(pendingRecord, 'OPERATION_NOT_PENDING');
-    const pendingTool = (pendingRecord.input as { tool?: string } | null)?.tool;
-    check(current.data.runtimeRoot === this.runtimeRoot || pendingTool === 'orch_run_abandon', 'RUNTIME_VERSION_PINNED');
+    const pendingRecord = this.store.pending(runId).find(item => item.id === operationId);
+    const completed = this.store.operation(runId, operationId);
+    const completedOperation = completed?.status === 'complete';
+    const completedTerminal = completedOperation && this.canReleaseWriteLock(current.data);
+    check(pendingRecord || completedOperation, 'OPERATION_NOT_PENDING');
+    const pendingTool = (pendingRecord?.input as { tool?: string } | null)?.tool;
+    const administrative = pendingTool === 'orch_run_abandon' || completedOperation;
+    check(current.data.runtimeRoot === this.runtimeRoot || administrative, 'RUNTIME_VERSION_PINNED');
     const lockText = await readFile(join(current.data.commonDir, 'orch', 'locks', 'write.json'), 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
     const owner = lockText ? JSON.parse(lockText) as { runId: string } : null;
-    check(owner?.runId === runId || pendingTool === 'orch_cleanup' && current.data.state === 'COMPLETED', 'LOCK_OWNERSHIP_MISMATCH');
-    // Explicit host confirmation permits removing only this empty operation mutex.
-    await rmdir(mutex).catch(error => { if (error.code !== 'ENOENT') throw error; });
-    await mkdir(mutex);
+    check(owner?.runId === runId || completedTerminal || pendingTool === 'orch_cleanup' && current.data.state === 'COMPLETED', 'LOCK_OWNERSHIP_MISMATCH');
+    await this.recoverOperationMutex(current.data, operationId, owner?.runId === runId);
+    const mutex = await this.acquireOperationMutex(current.data, operationId);
     try {
+      if (completedOperation) {
+        if (this.canReleaseWriteLock(current.data)) await this.releaseRunLock(current.data);
+        return JSON.parse(completed.result as string) as { version: number; result: unknown };
+      }
       const pending = this.store.pending(runId).find(item => item.id === operationId); check(pending, 'OPERATION_NOT_PENDING');
       const prior = pending.snapshot as { version: number; data: Run } | null;
       check(prior && prior.version === current.version, 'RECONCILIATION_STATE_DIVERGED');
@@ -294,7 +365,7 @@ export class Engine {
       const saved = this.store.save(runId, current.version, run, 'run.reconciled', operationId, { version: current.version + 1, result });
       if (this.canReleaseWriteLock(run)) await this.releaseRunLock(run);
       return saved;
-    } finally { await rmdir(mutex); }
+    } finally { await this.releaseOperationMutex(mutex); }
   }
   async gate(run: Run, stage: string, path: string, task: string | null = null) {
     enforceRunBudget(run);

@@ -9,7 +9,7 @@ For duplicate requests, reuse the original operation ID and inputs. After a comm
 | Condition | Action |
 |---|---|
 | BLOCKED_CAPABILITY / NEEDS_RELOAD | Keep state; report missing adapter proof or reload requirement; no silent fallback |
-| RUNTIME_VERSION_PINNED | Reopen with the run’s original immutable runtimeRoot; a new installed version may read status but cannot mutate that run |
+| RUNTIME_VERSION_PINNED | Use the original immutable runtimeRoot for pending execution. Pure completed-operation response/lock housekeeping and approved administrative disposal do not execute old code and may cross versions; stored runtimeRoot stays unchanged |
 | STATE_CONFLICT / CONFIG_CONFLICT | Reread state/config, retain concurrent changes, re-evaluate |
 | BASE_SHA_MISMATCH / ownership violation | Stop writes; preserve changes and repair assignment/base deliberately |
 | ORPHANED_UNKNOWN / stop unconfirmed | Preserve worktree and determine real native lifecycle |
@@ -26,7 +26,7 @@ The write lock represents write ownership, not retained files. A durably complet
 
 Only when the user chooses to discard the old run, call authenticated CAS `orch_run_abandon` with `input:{approved:true,reason,previous_coordinator_stopped:true,stopped_agents,never_started_tasks,never_started_reviews}`. It can administratively retire a pinned older run without executing old code or changing runtimeRoot. Dirty/unmerged files, worktrees, branches and evidence are preserved; the state becomes CANCELLED and only its own write lock is released. A normal cancellation with unknown workers does not establish safe disposal.
 
-Explicit `force:true` additionally permits unresolved worker/pending-operation evidence and breaking that run's empty operation mutex after confirmed coordinator stop. It records forced disposal, preserves pending journal entries and marks unconfirmed agents unknown. It fences subsequent ORCH management writes; it neither kills a native process nor prevents an already-running process from writing directly to disk. Never use force for a continuation request or infer stop from timeout alone. Retry an interrupted disposal with its original operation ID/inputs; reconcile a pending disposal using `orch_reconcile` after actual coordinator stop. Neither route may delete another run's lock.
+Explicit `force:true` additionally permits unresolved worker/pending-operation evidence and breaking that run's empty operation mutex after confirmed coordinator stop. It records forced disposal, preserves pending journal entries and marks unconfirmed agents unknown. It fences subsequent ORCH management writes; it neither kills a native process nor prevents an already-running process from writing directly to disk. Never use force for a continuation request or infer stop from timeout alone. If a process exit leaves an operation mutex, call `orch_reconcile` for that original operation after actual coordinator stop, even when the operation was already durably complete. Completed operations return their cached response without replaying effects or changing state/version; a nonterminal run retains its write lock and continues from saved work. Then retry with the original ID/inputs if needed. Neither route may delete another run's lock.
 
 Begin `orch_cleanup` with `dry_run=true`; inspect every proposed removal. Unknown ownership, dirty/unmerged content, live worker or failed deletion remains explicit. Retain reports and unresolved data. Uninstall preserves run data by default and does not replace recovery.
 

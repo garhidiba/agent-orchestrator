@@ -221,6 +221,8 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
   mutation('orch_repair_plan_submit', { plan: planSchema, finding_ids: z.array(id), analysis: z.string().min(1).max(8192).optional() }, (run, data) => runtime().repair(run, data.plan, data.finding_ids, data.analysis));
   register('orch_run_abandon', { ...envelopeSchema.shape, ...auth, input: runAbandonmentSchema }, async data => {
     authenticate(data.coordinator_token);
+    const { coordinator_token: _authorization, ...request } = data;
+    envelopeSchema.parse(request);
     return runtime().abandon(data.run_id, data.operation_id, data.expected_state_version, data.input);
   });
   mutation('orch_run_control', { action: z.enum(['pause', 'cancel', 'resume']), stopped_agents: z.array(nativeAgentId).default([]), never_started_tasks: z.array(id).default([]) }, (run, data) => runtime().control(run, data.action, data.stopped_agents, data.never_started_tasks));

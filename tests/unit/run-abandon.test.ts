@@ -179,3 +179,21 @@ test('force never releases a foreign run lock or breaks its operation mutex', as
     assert.equal(f.engine.status(f.created.runId).data.abandonment, undefined);
   } finally { await f.close(); }
 });
+
+test('authenticated MCP abandonment validates the full envelope before changing state', async () => {
+  const f = await runtimeFixture();
+  const { createServer } = await import('../../packages/mcp-server/src/server.ts');
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { InMemoryTransport } = await import('@modelcontextprotocol/sdk/inMemory.js');
+  const tokenPath = join(f.dir, 'coordinator.token');
+  const server = await createServer(f.root, 'codex', join(f.dir, 'managed'), tokenPath);
+  const client = new Client({ name: 'abandon-envelope-regression', version: '1' });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(a); await client.connect(b);
+    const before = f.engine.status(f.created.runId);
+    const result = await client.callTool({ name: 'orch_run_abandon', arguments: { protocol_version: 1, run_id: f.created.runId, operation_id: 'malformed-abandon', expected_state_version: before.version, coordinator_token: await readFile(tokenPath, 'utf8'), lease_id: 'unpaired', input: confirmation } });
+    assert.equal(result.isError, true);
+    assert.deepEqual(f.engine.status(f.created.runId), before);
+  } finally { await client.close(); await server.close(); await f.close(); }
+});

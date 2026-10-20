@@ -44,7 +44,7 @@ Optional: `./scripts/install.sh --target codex` selects just Codex (`claude` sel
 
 The file visibly includes all eight roles for both hosts, model/effort policies, and execution, Git, review, quality and other defaults. Missing fields are seeded from global settings and shipped defaults; existing values and comments are preserved. Initialization configures the project without starting a run or an AI worker. Concrete role-model setup uses supported current-host metadata through `agent-orch-configure`; unresolved `auto` values remain explicit when that metadata is unavailable. A full file alone does not mean workers are ready.
 
-For a read-only preview use `$agent-orch init 설정 파일 변경안을 보여줘. 아직 쓰지 마.` An ordinary first invocation also creates a missing full config, while preserving existing files. Explicit no-write requests and direct configuration explanations remain read-only. Commit the generated project file according to your project policy before a write run that requires a clean checkout; agent-orch does not silently commit it.
+For a read-only preview use `$agent-orch init 설정 파일 변경안을 보여줘. 아직 쓰지 마.` An ordinary first invocation also creates a missing full config, while preserving existing files. Explicit no-write requests and direct configuration explanations remain read-only. Keep the generated project file ignored or commit it according to your project policy before a write run that requires a clean checkout; agent-orch does not silently commit it.
 
 The entry names are now `$agent-orch` / `$agent-orch-configure` (Codex) and `/agent-orch` / `/agent-orch-configure` (Claude). Internal `orch_*` MCP tools and `.orch` data paths retain their names for compatibility. Updating moves only installer-owned old skills; edited/user-owned files block migration rather than being overwritten.
 
@@ -201,6 +201,82 @@ Current Codex or Claude conversation (coordinator)
 ```
 
 The core is deterministic; it does not launch an alternative AI controller. It preserves unknown model/access/usage information and user-owned changes. Worktrees isolate file changes, not OS permissions.
+
+## How a run works
+
+One write run per repository goes through the stages below. The coordinator is your current conversation; ORCH MCP records every state change, so an interrupted run can be inspected and resumed. Diamonds show checks or approvals; approval nodes need **you**.
+
+```mermaid
+flowchart TD
+  A["1. Init once<br/>agent-orch init writes .orch/config.yaml"] --> B["2. Start request in the client project"]
+  B --> C["3. Environment check<br/>MCP origin must equal the Git root"]
+  C --> D["4. Native handshake<br/>probe Agent echoes a challenge, valid about 5 min"]
+  D --> E["5. Role definitions loaded<br/>Claude: named agent per role, else NEEDS_RELOAD"]
+  E --> F{"6. Preflight<br/>clean checkout, no other active run,<br/>git identity, trusted commands"}
+  F -- "fails" --> F1["Run is not created<br/>fix the reported code and retry"]
+  F -- "passes" --> G["7. Requirements saved<br/>goal, scope, acceptance"]
+  G --> H["8. Plan: task DAG with file ownership"]
+  H --> I{"You approve plan<br/>and verification commands"}
+  I -- "no" --> H
+  I -- "yes" --> J["9. Baseline gate on the target SHA"]
+
+  J --> K
+  subgraph TASK ["10. Per task, parallel up to max_parallel_workers"]
+    direction TB
+    K["prepare<br/>worktree, branch, lease, port"] --> L["worker bootstrap, read-only<br/>reports cwd, Git root, branch, HEAD"]
+    L --> M["bind<br/>MCP checks the identity receipt"]
+    M --> N["worker edits only its write_paths"]
+    N --> O["validate: task gate"]
+    O --> P["commit one unit"]
+    P --> Q["validate again on the commit SHA"]
+    Q --> R["complete<br/>state MERGE_QUEUED"]
+  end
+
+  R --> S["11. Integrate one task at a time<br/>conflicts are resolved against fixed SHAs"]
+  S --> T["12. Integration gate"]
+  T --> U["13. Independent reviewer, read-only<br/>findings are bound to the SHA"]
+  U --> V{"Blocking findings?"}
+  V -- "yes" --> W["Repair plan, repair workers,<br/>then review again"]
+  W --> T
+  V -- "no" --> X["14. Final auditor, read-only<br/>current SHA only"]
+  X --> Y{"You approve finalize<br/>for the target branch"}
+  Y -- "yes" --> Z["15. Finalize: merge into target branch<br/>durable completion releases the write lock<br/>no remote push by default"]
+  Z --> AA["16. Cleanup: dry run first,<br/>owned, merged, clean resources only"]
+```
+
+Each worker follows the same task lifecycle:
+
+```mermaid
+stateDiagram-v2
+  [*] --> PENDING
+  PENDING --> LEASED: prepare
+  LEASED --> RUNNING: bind succeeds
+  RUNNING --> MERGE_QUEUED: validate, commit, validate, complete
+  RUNNING --> ORPHANED_UNKNOWN: lease expired, worker state unknown
+  ORPHANED_UNKNOWN --> RETRYABLE_FAILED: retry after confirmed stop
+  RETRYABLE_FAILED --> LEASED: prepare next attempt
+  MERGE_QUEUED --> [*]: integrated
+```
+
+### What you need to know
+
+| Topic | Behavior |
+|---|---|
+| Your approvals | The plan with its verification commands, any gate waiver, and finalize. A config value is never an approval. |
+| Preconditions | The checkout must be clean. This checkout keeps `.orch/config.yaml` local and git-ignored; older tracked copies must be untracked with `git rm --cached .orch/config.yaml` to preserve the local file. Commit signing, submodules and active LFS block run creation. |
+| One run per repository | An active run owns `.git/orch/locks/write.json`. Durable finalization releases its write lock before cleanup; cancellation releases it after workers/reviews are confirmed stopped. Unknown workers retain it for recovery. Explicit `orch_run_abandon` disposes of a run while preserving files; `force:true` preserves uncertain evidence and does not kill processes. Never remove another run's lock by hand. |
+| Parallelism | `execution.max_parallel_workers` caps concurrent workers (default 4). `max_parallel_test_jobs` (default 1) runs gates one at a time. Tasks that share a file are serialized; dependencies start from the SHA where their prerequisites were integrated. |
+| Models and effort | Each role resolves its own model and effort. The pin reaches the worker through the Agent parameter or a generated `.claude/agents/orch-*.md` definition that is git-excluded locally. If it cannot be applied the run is blocked, never silently downgraded. Observed model and effort stay `null` when the host does not report them. |
+| Gates | Required verification commands must pass at their configured stages; each task uses its assigned verification IDs. A task gate is rerun after its commit. A waiver is recorded as `waived`, never `passed`. |
+| Limits | Defaults: 3 attempts per task, 30 minutes per attempt, 3 review rounds, 180 minutes per run. Findings of `critical` and `high` severity block. A repeated finding needs an explicit analysis before more repairs. |
+| Retrying a call | Every mutation carries an operation ID and the expected state version. Repeating an operation ID replays the first result; use a new ID for a genuinely new attempt, and reread the state after a `STATE_CONFLICT`. |
+| Interruption | Pause, cancel and resume go through the run control. A host disconnect does not prove a worker stopped, so unknown workers and their worktrees are preserved. |
+| Where things live | State and logs: `.orch/state/runs/RUN_ID/` in the project (git-ignored). Worktrees: `~/.local/share/orch/worktrees/RUN_ID/`. Coordinator token: `~/.local/state/orch/coordinators/`; never put it in a prompt. |
+| Safety | Worktrees isolate file changes, not OS permissions. Staged files are scanned for credentials before each commit, and remote push is off unless you enable it. |
+
+In the same conversation, ordinary prompts continue the current workflow. After a forced exit, invoke `$agent-orch 기존 run을 복구해서 이어서 진행해. 새 run은 만들지 마.` (Claude: `/agent-orch` with the same request). Recovery uses the saved database, worktrees, commits and pinned runtime; a transcript or lock alone does not prove a resumable worker. The conversation must remain running to drive the workflow; there is no independent background controller. Use explicit disposal only when abandoning the old work.
+
+See [workflow](references/workflow.md) for the exact tool sequence and [recovery](references/recovery.md) for failure handling.
 
 ## Guides
 

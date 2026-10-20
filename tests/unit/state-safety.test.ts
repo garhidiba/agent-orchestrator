@@ -63,3 +63,21 @@ for (const [name, table, definition] of [
     assert.deepEqual(await readFile(file), before);
   } finally { opened?.close(); await rm(dir, { recursive: true, force: true }); }
 });
+
+test('state database symlinks are rejected before creating or changing their targets', { skip: process.platform === 'win32' }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'orch-linked-database-'));
+  let opened: Store | undefined;
+  try {
+    const dangling = join(dir, 'not-created.db'), link = join(dir, 'state.db');
+    await symlink(dangling, link);
+    assert.throws(() => { opened = new Store(link); }, /STATE_PATH_UNSAFE/);
+    await assert.rejects(readFile(dangling), { code: 'ENOENT' });
+    await rm(link);
+    const external = join(dir, 'external.db');
+    const db = new DatabaseSync(external); db.exec('CREATE TABLE retained(value TEXT)'); db.close();
+    const before = await readFile(external);
+    await symlink(external, link);
+    assert.throws(() => { opened = new Store(link); }, /STATE_PATH_UNSAFE/);
+    assert.deepEqual(await readFile(external), before);
+  } finally { opened?.close(); await rm(dir, { recursive: true, force: true }); }
+});

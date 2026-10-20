@@ -3,7 +3,7 @@ import { transitionEvents } from './events.ts';
 import type { SemanticEvent } from './events.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync } from 'node:fs';
+import { lstatSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { id, requireCondition } from '../../../protocol/src/runtime.ts';
 
@@ -40,9 +40,12 @@ export class Store {
   db: DatabaseSync;
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
-    if (existsSync(path)) {
-      requireCondition(lstatSync(path).isFile() && !lstatSync(path).isSymbolicLink(), 'STATE_PATH_UNSAFE');
-      if (lstatSync(path).size > 0) {
+    let file: ReturnType<typeof lstatSync> | undefined;
+    try { file = lstatSync(path); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    if (file) {
+      requireCondition(file.isFile() && !file.isSymbolicLink(), 'STATE_PATH_UNSAFE');
+      if (file.size > 0) {
         const probe = new DatabaseSync(path, { readOnly: true });
         try {
           requireCondition(probe.prepare('PRAGMA application_id').get()?.application_id === 0x4f524348, 'STATE_DATABASE_UNOWNED');
