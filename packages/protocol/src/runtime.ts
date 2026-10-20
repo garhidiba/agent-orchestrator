@@ -20,6 +20,11 @@ export const planSchema = z.strictObject({
 export const planAmendmentSchema = z.strictObject({
   plan: planSchema, approved: z.literal(true), reason: z.string().trim().min(1).max(4096),
 });
+export const runAbandonmentSchema = z.strictObject({
+  approved: z.literal(true), reason: z.string().trim().min(1).max(4096), previous_coordinator_stopped: z.literal(true), force: z.boolean().default(false),
+  stopped_agents: z.array(nativeAgentId).max(1024).default([]),
+  never_started_tasks: z.array(id).max(1024).default([]), never_started_reviews: z.array(id).max(1024).default([]),
+});
 export const findingSchema = z.strictObject({
   id, severity: z.enum(['critical', 'high', 'medium', 'low']), category: z.string().min(1),
   path: relativePath, symbol: z.string().min(1), line_start: z.int().positive(), line_end: z.int().positive(),

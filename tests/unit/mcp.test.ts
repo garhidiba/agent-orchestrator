@@ -15,9 +15,11 @@ test('MCP handshake exposes schema-validated tools and blocks fabricated Coordin
   try {
     await server.connect(a); await client.connect(b);
     const tools = await client.listTools();
-    for (const name of ['orch_environment', 'orch_task_prepare', 'orch_task_bind', 'orch_task_commit', 'orch_review_submit', 'orch_finalize', 'orch_cleanup']) assert.equal(tools.tools.some(tool => tool.name === name), true);
+    for (const name of ['orch_environment', 'orch_task_prepare', 'orch_task_bind', 'orch_task_commit', 'orch_review_submit', 'orch_finalize', 'orch_cleanup', 'orch_run_abandon']) assert.equal(tools.tools.some(tool => tool.name === name), true);
     const result = await client.callTool({ name: 'orch_run_create', arguments: { coordinator_token: 'wrong', trusted_commands_hash: 'fake' } });
     assert.equal(result.isError, true); assert.match(JSON.stringify(result), /COORDINATOR_RELAY_REQUIRED/);
+    const abandon = await client.callTool({ name: 'orch_run_abandon', arguments: { coordinator_token: 'wrong', protocol_version: 1, run_id: 'run', operation_id: 'abandon', expected_state_version: 0, input: { approved: true, reason: 'Discard stopped run', previous_coordinator_stopped: true } } });
+    assert.equal(abandon.isError, true); assert.match(JSON.stringify(abandon), /COORDINATOR_RELAY_REQUIRED/);
     const role = await client.callTool({ name: 'orch_run_create', arguments: { role: 'coordinator', trusted_commands_hash: 'fake' } });
     assert.equal(role.isError, true);
     const wrongVersion = await client.callTool({ name: 'orch_finalize', arguments: { protocol_version: 2, run_id: 'run', operation_id: 'op', expected_state_version: 0, input: { approved: true, expected_target_sha: 'fake' } } });

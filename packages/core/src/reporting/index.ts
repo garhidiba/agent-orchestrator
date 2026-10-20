@@ -41,11 +41,11 @@ export function buildReport(run: Run, version: number, actualFinalSha: string | 
     gates: run.gates.map((gate: Run['gates'][number] & { details?: GateResult[] }) => ({ stage: gate.stage, task: gate.task, sha: gate.sha, source: gate.source, commands: gate.commands, status: gate.status, results: gate.results.map(result => ({ ...result })), details: gate.details ?? null, logRefs: gate.details?.map(detail => detail.logRef) ?? null })),
     reviewDispatches: run.reviewDispatches ?? {},
     reviews: reviews.map(review => ({ sha: review.sha, reviewer: review.reviewer, final: review.final, decision: review.decision ?? null, acceptanceIds: review.acceptanceIds ?? null, limitations: review.limitations ?? null })),
-    cleanup, blockers, nextActions, waivers: run.waivers ?? [], missingTestsWaiver: run.missingTestsWaiver ?? null, repairAnalyses: run.repairAnalyses ?? [], usage: null, cost: null,
+    cleanup, blockers, nextActions, abandonment: run.abandonment ?? null, waivers: run.waivers ?? [], missingTestsWaiver: run.missingTestsWaiver ?? null, repairAnalyses: run.repairAnalyses ?? [], usage: null, cost: null,
     limitations: ['Native receipts are authenticated coordinator attestations, not signed host, account or model evidence.', 'Unrecorded model selection, observations, changed paths, duration, logs, usage and billing remain unknown.', 'Gate command IDs reference configured commands; raw arguments, prompts, environment and transcripts are not collected.'],
   };
   const sections = [
-    ['Result', { state: report.state, completionVerified, finalizedWithApprovedExceptions, blockers, nextActions }],
+    ['Result', { state: report.state, completionVerified, finalizedWithApprovedExceptions, abandonment: report.abandonment, blockers, nextActions }],
     ['Acceptance', acceptance], ['Code', { targetBranch: run.target, targetBase: run.targetBase, integrationSha: currentSha, actualFinalSha, tasks }],
     ['Models and execution', { host: run.host, models: report.models, tasks, createdAt: run.createdAt, durationMs: run.finalizedAt ? Date.parse(run.finalizedAt) - Date.parse(run.createdAt) : null, activeTimeMs: run.activeTimeMs ?? null, pauseTimeMs: run.pauseTimeMs ?? null, reviewRound: run.reviewRound, usage: null, cost: null }],
     ['Verification', { gates: report.gates, waivers: report.waivers, missingTestsWaiver: report.missingTestsWaiver }], ['Review and findings', { reviews: report.reviews, dispatches: report.reviewDispatches, findings: report.findings }], ['Cleanup', cleanup], ['Limitations', report.limitations],

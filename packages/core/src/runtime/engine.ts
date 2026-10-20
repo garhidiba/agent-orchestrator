@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdir, readFile, realpath, rm, rmdir, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, realpath, rm, rmdir, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { redact } from '../quality/redact.ts';
 import { assertNoStagedSecrets } from '../quality/secrets.ts';
@@ -13,7 +13,7 @@ import { Store, hash } from '../state/store.ts';
 import { git, inspectRepository, preflightRepository, within, owns, overlaps, changedPaths, sourceFingerprint } from '../git/repository.ts';
 import { configSchema } from '../../../protocol/src/config.ts';
 import type { Config } from '../../../protocol/src/config.ts';
-import { id, nativeAgentId, requirementsSchema, requireCondition as check, validatePlan, planAmendmentSchema, reviewSchema, taskResultSchema, gateResultSchema } from '../../../protocol/src/runtime.ts';
+import { id, nativeAgentId, requirementsSchema, requireCondition as check, validatePlan, planAmendmentSchema, runAbandonmentSchema, reviewSchema, taskResultSchema, gateResultSchema } from '../../../protocol/src/runtime.ts';
 import type { Task, Plan, Review, GateResult, Requirements } from '../../../protocol/src/runtime.ts';
 
 import { completionEvidence, findingBlocks } from './completion.ts';
@@ -29,6 +29,7 @@ type Work = { dependencySetup?: DependencySetup | null; nativeContext?: NativeCa
 type Finding = Review['findings'][number] & { fingerprint: string; lifecycle: string; seenRounds?: number[]; dispositions?: { status: 'ACCEPTED_RISK' | 'NOT_A_BUG' | 'DEFERRED'; reason: string; actor: 'user'; approvedAt: string; sha: string | null }[] };
 const attemptKey = (taskId: string, attempt: number) => { const key = `${taskId}-${attempt}`; return key.length <= 80 ? key : `attempt-${hash([taskId, attempt])}`; };
 const acceptedGate = (gate: { status: string }) => ['passed', 'waived'].includes(gate.status);
+const activeWriterStates = new Set(['LEASED', 'RUNNING', 'VALIDATING', 'ORPHANED_UNKNOWN']);
 const activePhases = new Set(['ANALYZING', 'EXECUTING', 'INTEGRATING', 'VERIFYING', 'REVIEWING', 'REPAIR_PLANNING', 'FINAL_AUDIT', 'FINALIZING', 'CLEANING']);
 export type Run = {
   id: string; host: 'codex' | 'claude'; origin: string; commonDir: string; target: string; targetBase: string;
@@ -43,6 +44,7 @@ export type Run = {
   candidates?: { path: string; branch: string }[];
   targetConflict?: { path: string; branch: string; expected: string; target: string };
   runtimeRoot?: string; configRevision?: number; configRevisions?: { revision: number; hash: string; roles: Config['hosts']; timestamp: string }[];
+  abandonment?: { forced: boolean; operationId: string; unresolvedOperations: string[]; actor: 'user'; reason: string; approvedAt: string; previousCoordinatorStopped: true; stoppedAgents: string[]; neverStartedTasks: string[]; neverStartedReviews: string[] };
   finalizationApproval?: { actor: 'user'; target: string; runId: string; approvedAt: string };
   activeTimeMs?: number; activeSince?: number | null; pauseTimeMs?: number; pauseStartedAt?: number; finalizedAt?: string;
   repairAnalyses?: { round: number; analysis: string }[];
@@ -102,17 +104,25 @@ export class Engine {
     if (this.native) this.store.snapshot(runId, 'catalog', `host-${hash(this.native)}`, this.native);
     return { runId, version: 0 };
   }
-  async change<T>(runId: string, operation: string, expected: number, input: unknown, fn: (run: Run) => Promise<T>) {
+  async change<T>(runId: string, operation: string, expected: number, input: unknown, fn: (run: Run) => Promise<T>, administrativeAbandon = false) {
     id.parse(operation);
     const snapshot = this.status(runId);
     const mutex = join(snapshot.data.commonDir, 'orch', 'locks', 'operation');
     await mkdir(mutex).catch(() => { throw new Error('OPERATION_LOCKED'); });
     try {
       const current = this.status(runId);
-      check(current.data.runtimeRoot === this.runtimeRoot, 'RUNTIME_VERSION_PINNED');
+      // Disposal is administrative; it never executes or upgrades a pinned runtime.
+      check(current.data.runtimeRoot === this.runtimeRoot || administrativeAbandon, 'RUNTIME_VERSION_PINNED');
+      const completedOperation = this.canReleaseWriteLock(current.data) && this.store.operation(runId, operation)?.status === 'complete';
+      if (completedOperation) {
+        const previous = this.store.intent(runId, operation, input, current)!;
+        await this.releaseRunLock(current.data);
+        return previous.result as { version: number; result: T };
+      }
       const lockText = await readFile(join(current.data.commonDir, 'orch', 'locks', 'write.json'), 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
       const owner = lockText ? JSON.parse(lockText) as { runId: string } : null;
-      check(owner ? owner.runId === runId : current.data.state === 'COMPLETED', 'RUN_LOCK_OWNERSHIP_MISMATCH');
+      const oldCleanup = current.data.state === 'COMPLETED' && (input as { tool?: string }).tool === 'orch_cleanup';
+      check(owner ? owner.runId === runId || oldCleanup : current.data.state === 'COMPLETED', 'RUN_LOCK_OWNERSHIP_MISMATCH');
       const prior = this.store.operation(runId, operation);
       if (!prior) check(current.version === expected, 'STATE_CONFLICT');
       const previous = this.store.intent(runId, operation, input, current);
@@ -135,9 +145,69 @@ export class Engine {
       current.data.activeTimeMs += Math.max(0, finished - started);
       current.data.activeSince = activePhases.has(current.data.state) ? finished : null;
       const response = { version: current.version + 1, result };
-      return this.store.save(runId, current.version, current.data, 'run.changed', operation, response);
+      const saved = this.store.save(runId, current.version, current.data, 'run.changed', operation, response);
+      if (this.canReleaseWriteLock(current.data)) await this.releaseRunLock(current.data);
+      return saved;
     } finally { this.activeOperation = null; await rmdir(mutex); }
   }
+  private canReleaseWriteLock(run: Run) {
+    if (run.state === 'CANCELLED' && run.abandonment?.forced && this.store.operation(run.id, run.abandonment.operationId)?.status === 'complete') return true;
+    return ['COMPLETED', 'CANCELLED'].includes(run.state) &&
+      Object.values(run.tasks).every(task => !activeWriterStates.has(task.state)) &&
+      Object.values(run.reviewDispatches ?? {}).every(dispatch => ['COMPLETED', 'STOPPED'].includes(dispatch.state)) && this.store.pending(run.id).length === 0;
+  }
+  private async releaseRunLock(run: Run) {
+    check(this.canReleaseWriteLock(run), 'WORKER_STOP_UNCONFIRMED');
+    const lock = join(run.commonDir, 'orch', 'locks', 'write.json');
+    const info = await lstat(lock).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+    if (!info) return;
+    check(info.isFile() && !info.isSymbolicLink() && info.size <= 4096, 'RUN_LOCK_UNSAFE');
+    const owner = JSON.parse(await readFile(lock, 'utf8')) as { runId: string; origin: string };
+    if (owner.runId !== run.id) return;
+    check(owner.origin === run.origin, 'RUN_LOCK_OWNERSHIP_MISMATCH');
+    await rm(lock);
+  }
+  async abandon(runId: string, operation: string, expected: number, input: unknown) {
+    const approval = runAbandonmentSchema.parse(input);
+    id.parse(operation);
+    const prior = this.store.operation(runId, operation);
+    check(!prior || prior.fingerprint === hash({ tool: 'orch_run_abandon', input: approval }), 'IDEMPOTENCY_CONFLICT');
+    if (approval.force && this.store.operation(runId, operation)?.status !== 'complete') {
+      const snapshot = this.status(runId);
+      check(snapshot.version === expected, 'STATE_CONFLICT');
+      check(snapshot.data.state !== 'COMPLETED' && !snapshot.data.abandonment, 'INVALID_RUN_STATE');
+      check(snapshot.data.origin === this.origin && (await inspectRepository(this.origin)).commonDir === snapshot.data.commonDir, 'STATE_ORIGIN_MISMATCH');
+      const lock = join(snapshot.data.commonDir, 'orch', 'locks', 'write.json');
+      const info = await lstat(lock);
+      check(info.isFile() && !info.isSymbolicLink() && info.size <= 4096, 'RUN_LOCK_UNSAFE');
+      const owner = JSON.parse(await readFile(lock, 'utf8')) as { runId: string; origin: string };
+      check(owner.runId === runId && owner.origin === this.origin && snapshot.data.origin === this.origin, 'RUN_LOCK_OWNERSHIP_MISMATCH');
+      // Explicit coordinator-stop confirmation permits breaking only this run's empty operation mutex.
+      await rmdir(join(snapshot.data.commonDir, 'orch', 'locks', 'operation')).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    }
+    return this.change(runId, operation, expected, { tool: 'orch_run_abandon', input: approval }, run => this.markAbandoned(run, operation, approval), true);
+  }
+  private async markAbandoned(run: Run, operation: string, approval: ReturnType<typeof runAbandonmentSchema.parse>) {
+    check(run.origin === this.origin && (await inspectRepository(this.origin)).commonDir === run.commonDir, 'STATE_ORIGIN_MISMATCH');
+    check(run.state !== 'COMPLETED' && !run.abandonment, 'INVALID_RUN_STATE');
+    const unresolvedOperations = this.store.pending(run.id).filter(item => item.id !== operation).map(item => item.id);
+    check(approval.force || unresolvedOperations.length === 0, 'RECONCILIATION_REQUIRED');
+    for (const [key, task] of Object.entries(run.tasks)) {
+      if (!activeWriterStates.has(task.state)) continue;
+      const neverStarted = !task.nativeId && (task.state === 'LEASED' || task.pausedState === 'LEASED') && approval.never_started_tasks.includes(key);
+      check(approval.force || (task.nativeId ? approval.stopped_agents.includes(task.nativeId) : neverStarted), 'WORKER_STOP_UNCONFIRMED');
+    }
+    for (const [key, dispatch] of Object.entries(run.reviewDispatches ?? {})) {
+      if (['COMPLETED', 'STOPPED'].includes(dispatch.state)) continue;
+      check(approval.force || (dispatch.nativeId ? approval.stopped_agents.includes(dispatch.nativeId) : approval.never_started_reviews.includes(key)), 'REVIEW_STOP_UNCONFIRMED');
+    }
+    run.abandonment = { forced: approval.force, operationId: operation, unresolvedOperations, actor: 'user', reason: approval.reason, approvedAt: new Date().toISOString(), previousCoordinatorStopped: true, stoppedAgents: approval.stopped_agents, neverStartedTasks: approval.never_started_tasks, neverStartedReviews: approval.never_started_reviews };
+    for (const task of Object.values(run.tasks)) if (activeWriterStates.has(task.state)) { task.pausedState = task.state; task.state = approval.force ? 'ORPHANED_UNKNOWN' : 'STOPPED'; }
+    for (const dispatch of Object.values(run.reviewDispatches ?? {})) if (!['COMPLETED', 'STOPPED'].includes(dispatch.state)) dispatch.state = approval.force ? 'ORPHANED_UNKNOWN' : 'STOPPED';
+    run.state = 'CANCELLED'; run.finalizationApproval = undefined;
+    return { state: run.state, abandoned: true, preserved: true };
+  }
+
   checkpointIntent(run: Run) {
     check(this.activeOperation, 'OPERATION_REQUIRED'); this.effectPrepared = true;
     const version = this.status(run.id).version;
@@ -147,12 +217,12 @@ export class Engine {
     check(previousCoordinatorStopped, 'COORDINATOR_STOP_UNCONFIRMED');
     const current = this.status(runId);
     const mutex = join(current.data.commonDir, 'orch', 'locks', 'operation');
-    check(current.data.runtimeRoot === this.runtimeRoot, 'RUNTIME_VERSION_PINNED');
     const pendingRecord = this.store.pending(runId).find(item => item.id === operationId); check(pendingRecord, 'OPERATION_NOT_PENDING');
     const pendingTool = (pendingRecord.input as { tool?: string } | null)?.tool;
+    check(current.data.runtimeRoot === this.runtimeRoot || pendingTool === 'orch_run_abandon', 'RUNTIME_VERSION_PINNED');
     const lockText = await readFile(join(current.data.commonDir, 'orch', 'locks', 'write.json'), 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
     const owner = lockText ? JSON.parse(lockText) as { runId: string } : null;
-    check(owner ? owner.runId === runId : pendingTool === 'orch_cleanup' && current.data.state === 'COMPLETED', 'LOCK_OWNERSHIP_MISMATCH');
+    check(owner?.runId === runId || pendingTool === 'orch_cleanup' && current.data.state === 'COMPLETED', 'LOCK_OWNERSHIP_MISMATCH');
     // Explicit host confirmation permits removing only this empty operation mutex.
     await rmdir(mutex).catch(error => { if (error.code !== 'ENOENT') throw error; });
     await mkdir(mutex);
@@ -163,7 +233,9 @@ export class Engine {
       const request = pending.input as { tool?: string; input?: { task_id?: string; unit_id?: string; expected_integration_sha?: string; expected_target_sha?: string } };
       const run = prior.data, task = request.input?.task_id ? run.tasks[request.input.task_id] : null;
       let result: unknown;
-      if (request.tool === 'orch_plan_submit') {
+      if (request.tool === 'orch_run_abandon') {
+        result = await this.markAbandoned(run, operationId, runAbandonmentSchema.parse(request.input));
+      } else if (request.tool === 'orch_plan_submit') {
         const repo = await inspectRepository(run.integrationPath);
         check(run.state === 'EXECUTING' && run.plan && repo.commonDir === run.commonDir && repo.branch === run.integration && repo.head === run.targetBase && !repo.dirty, 'RECOVERY_PLAN_NOT_PROVEN');
         result = { state: run.state, recovered: true };
@@ -219,7 +291,9 @@ export class Engine {
           run.finalizedAt ??= new Date().toISOString(); run.state = 'COMPLETED'; result = { sha: head, recovered: true };
         }
       } else throw new Error('RECOVERY_REQUIRES_MANUAL_RECONCILIATION');
-      return this.store.save(runId, current.version, run, 'run.reconciled', operationId, { version: current.version + 1, result });
+      const saved = this.store.save(runId, current.version, run, 'run.reconciled', operationId, { version: current.version + 1, result });
+      if (this.canReleaseWriteLock(run)) await this.releaseRunLock(run);
+      return saved;
     } finally { await rmdir(mutex); }
   }
   async gate(run: Run, stage: string, path: string, task: string | null = null) {
@@ -846,24 +920,26 @@ export class Engine {
     }
     if (!dryRun) {
       if (run.state === 'COMPLETED') for (const [taskId, task] of Object.entries(run.tasks)) {
-        if (!['LEASED', 'RUNNING', 'VALIDATING', 'ORPHANED_UNKNOWN'].includes(task.state)) await this.releaseTaskPort(run, taskId);
+        if (!activeWriterStates.has(task.state)) await this.releaseTaskPort(run, taskId);
       }
       run.cleanup = results;
-      if (results.every(item => ['removed', 'absent'].includes(item.status))) {
-        const lock = join(run.commonDir, 'orch', 'locks', 'write.json');
-        const text = await readFile(lock, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
-        const owner = text ? JSON.parse(text) as { runId: string } : null;
-        if (owner?.runId === run.id) await rm(lock);
-      }
     }
     return results;
   }
   async control(run: Run, action: 'pause' | 'cancel' | 'resume', stoppedAgents: string[] = [], neverStartedTasks: string[] = []) {
     if (action === 'pause' || action === 'cancel') {
-      check(!['COMPLETED', 'CANCELLED', 'PAUSED'].includes(run.state), 'INVALID_RUN_STATE');
-      run.pauseStartedAt = Date.now(); run.pausedFrom = run.state;
+      check(run.state !== 'COMPLETED' && !run.abandonment && (action === 'cancel' || !['CANCELLED', 'PAUSED'].includes(run.state)), 'INVALID_RUN_STATE');
+      if (run.state !== 'CANCELLED') { run.pauseStartedAt = Date.now(); run.pausedFrom = run.state; }
       run.state = action === 'pause' ? 'PAUSED' : 'CANCELLED';
-      for (const task of Object.values(run.tasks)) if (['LEASED', 'RUNNING'].includes(task.state)) { task.pausedState = task.state; task.state = 'ORPHANED_UNKNOWN'; }
+      for (const [key, task] of Object.entries(run.tasks)) if (activeWriterStates.has(task.state)) {
+        const neverStarted = !task.nativeId && (task.state === 'LEASED' || task.pausedState === 'LEASED') && neverStartedTasks.includes(key);
+        const stopped = task.nativeId ? stoppedAgents.includes(task.nativeId) : neverStarted;
+        if (task.state !== 'ORPHANED_UNKNOWN') task.pausedState = task.state;
+        task.state = action === 'cancel' && stopped ? 'STOPPED' : 'ORPHANED_UNKNOWN';
+      }
+      if (action === 'cancel') for (const dispatch of Object.values(run.reviewDispatches ?? {})) {
+        if (!['COMPLETED', 'STOPPED'].includes(dispatch.state) && dispatch.nativeId && stoppedAgents.includes(dispatch.nativeId)) dispatch.state = 'STOPPED';
+      }
     } else {
       check(['PAUSED', 'CANCELLED'].includes(run.state), 'INVALID_RUN_STATE');
       for (const task of Object.values(run.tasks)) if (task.state === 'ORPHANED_UNKNOWN') {

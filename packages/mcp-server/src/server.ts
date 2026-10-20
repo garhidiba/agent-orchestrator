@@ -18,7 +18,7 @@ import { exportRunEvidence } from '../../core/src/runtime/snapshots.ts';
 import { buildReport, writeReport } from '../../core/src/reporting/index.ts';
 import { git, inspectRepository } from '../../core/src/git/repository.ts';
 import { roleIds } from '../../protocol/src/config.ts';
-import { envelopeSchema, id, nativeAgentId, sha, requirementsSchema, planSchema, planAmendmentSchema, reviewSchema, taskResultSchema, hostHeartbeatSchema, findingDispositionSchema, requireCondition as check } from '../../protocol/src/runtime.ts';
+import { envelopeSchema, id, nativeAgentId, sha, requirementsSchema, planSchema, planAmendmentSchema, runAbandonmentSchema, reviewSchema, taskResultSchema, hostHeartbeatSchema, findingDispositionSchema, requireCondition as check } from '../../protocol/src/runtime.ts';
 import type { NativeCapability, Run } from '../../core/src/runtime/engine.ts';
 
 export async function createServer(origin: string | null, host: 'codex' | 'claude', managedRoot: string, tokenPath: string) {
@@ -219,6 +219,10 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
   mutation('orch_reintegrate', { expected_target_sha: sha }, (run, data) => runtime().reintegrateTarget(run, data.expected_target_sha));
   mutation('orch_review_submit', { review: reviewSchema, final: z.boolean().default(false), native_stopped: z.boolean().default(false) }, (run, data) => runtime().review(run, data.review, data.final, data.native_stopped));
   mutation('orch_repair_plan_submit', { plan: planSchema, finding_ids: z.array(id), analysis: z.string().min(1).max(8192).optional() }, (run, data) => runtime().repair(run, data.plan, data.finding_ids, data.analysis));
+  register('orch_run_abandon', { ...envelopeSchema.shape, ...auth, input: runAbandonmentSchema }, async data => {
+    authenticate(data.coordinator_token);
+    return runtime().abandon(data.run_id, data.operation_id, data.expected_state_version, data.input);
+  });
   mutation('orch_run_control', { action: z.enum(['pause', 'cancel', 'resume']), stopped_agents: z.array(nativeAgentId).default([]), never_started_tasks: z.array(id).default([]) }, (run, data) => runtime().control(run, data.action, data.stopped_agents, data.never_started_tasks));
   mutation('orch_gate_waive', { stage: z.enum(['baseline', 'task', 'integration', 'final']), gate_id: id, task_id: id.nullable(), reason: z.string().min(1).max(4096), approved: z.literal(true) }, (run, data) => runtime().waiveGate(run, data.stage, data.gate_id, data.task_id, data.reason, data.approved));
   mutation('orch_finalize_approve', { approved: z.literal(true), target_branch: z.string().min(1) }, (run, data) => runtime().preapproveFinalization(run, data.target_branch, data.approved));
