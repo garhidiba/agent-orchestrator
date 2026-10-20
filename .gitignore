@@ -1,4 +1,4 @@
-node_modules/
+node_modules
 dist/
 coverage/
 *.tsbuildinfo
@@ -10,3 +10,4 @@ coverage/
 .orch/state/
 .orch/generated/
 *.log
+.orch/installation/

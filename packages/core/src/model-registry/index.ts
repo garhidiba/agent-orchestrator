@@ -11,9 +11,11 @@ export const modelSchema = z.strictObject({
   evidence: z.array(z.strictObject({ kind: z.string(), ref: z.string() })),
 });
 export type Model = z.infer<typeof modelSchema>;
-export function validateModels(config: Config, catalog: Model[]) {
+export function validateModels(config: Config, catalog: Model[], previous?: Config) {
   const models = catalog.map(model => modelSchema.parse(model));
-  for (const host of ['codex', 'claude'] as const) for (const policy of Object.values(config.hosts[host].roles)) {
+  for (const host of ['codex', 'claude'] as const) for (const [role, policy] of Object.entries(config.hosts[host].roles)) {
+    const prior = previous?.hosts[host].roles[role as keyof Config['hosts']['codex']['roles']];
+    if (prior?.model === policy.model && prior?.effort === policy.effort) continue;
     if (['auto', 'inherit'].includes(policy.model)) {
       check(['auto', 'inherit'].includes(policy.effort), 'MODEL_RESOLUTION_REQUIRED');
       continue;

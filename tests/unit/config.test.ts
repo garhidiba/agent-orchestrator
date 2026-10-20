@@ -57,3 +57,16 @@ test('configured gate paths stay relative and duplicate IDs cannot hide commands
   }
   assert.throws(() => resolveConfig({ project: { quality: { commands: [command, command] } } }), /duplicate quality command IDs/);
 });
+
+test('layer inputs accept prototype-free data and reject inherited values and accessors', () => {
+  const clean = Object.assign(Object.create(null), { model_selection: Object.assign(Object.create(null), { profile: 'economy' }) });
+  assert.equal(resolveConfig({ global: clean }).config.model_selection.profile, 'economy');
+  assert.throws(() => resolveConfig({ global: Object.create({ model_selection: { profile: 'economy' } }) }), /CONFIG_INVALID/);
+  assert.throws(() => resolveConfig({ global: { model_selection: Object.create({ profile: 'economy' }) } }), /CONFIG_INVALID/);
+  let invoked = false;
+  const accessor = Object.defineProperty({}, 'model_selection', { enumerable: true, get() { invoked = true; return {}; } });
+  assert.throws(() => resolveConfig({ global: accessor }), /CONFIG_INVALID/); assert.equal(invoked, false);
+  for (const value of [null, [], { model_selection: { profile: 'private-invalid-value' } }]) {
+    assert.throws(() => resolveConfig({ global: value }), error => error instanceof Error && error.message.includes('CONFIG_INVALID') && !error.message.includes('private-invalid-value'));
+  }
+});

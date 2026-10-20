@@ -2,25 +2,39 @@ import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdir, readFile, realpath, rm, rmdir, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { redact } from '../quality/redact.ts';
+import { existsSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
+import { writeRequirements } from '../requirements/index.ts';
+import { writeStateArtifact } from '../state/artifacts.ts';
 import { Store, hash } from '../state/store.ts';
 import { git, inspectRepository, within, owns, overlaps, changedPaths, sourceFingerprint } from '../git/repository.ts';
 import { configSchema } from '../../../protocol/src/config.ts';
 import type { Config } from '../../../protocol/src/config.ts';
-import { id, requireCondition as check, validatePlan, reviewSchema } from '../../../protocol/src/runtime.ts';
-import type { Task, Plan, Review } from '../../../protocol/src/runtime.ts';
+import { id, requirementsSchema, requireCondition as check, validatePlan, reviewSchema, taskResultSchema, gateResultSchema } from '../../../protocol/src/runtime.ts';
+import type { Task, Plan, Review, GateResult, Requirements } from '../../../protocol/src/runtime.ts';
 
 const exec = promisify(execFile);
-type Gate = { stage: string; task: string | null; sha: string; source: string; commands: string; status: string; results: { id: string; status: string; exitCode: number | null }[] };
-type Work = { spec: Task; state: string; base: string; path: string; branch: string; attempt: number; lease: string; expires: number; nativeId: string | null; units: Record<string, string>; validated: string | null };
-type Finding = Review['findings'][number] & { fingerprint: string; lifecycle: string };
+type Gate = { id?: string; details?: GateResult[]; stage: string; task: string | null; sha: string; source: string; commands: string; status: string; results: { id: string; status: string; exitCode: number | null }[] };
+type Work = { spec: Task; state: string; base: string; path: string; branch: string; attempt: number; lease: string; expires: number; nativeId: string | null; units: Record<string, string>; validated: string | null; pausedState?: string; dispatchBase?: string; configRevision?: number; observedModel?: string | null; observedEffort?: string | null; modelResolution?: { requestedModel: string; requestedEffort: string; resolvedModel: string; resolvedEffort: string | null }; acceptanceEvidence?: { acceptanceId: string; evidenceRefs: string[] }[]; changedPaths?: string[]; reportedModel?: string | null; recoveryHead?: string; lastCommitSha?: string; attempts?: { number: number; path: string; branch: string; nativeId: string | null; stopped: boolean; reason: string }[] };
+type Finding = Review['findings'][number] & { fingerprint: string; lifecycle: string; seenRounds?: number[] };
+const acceptedGate = (gate: { status: string }) => ['passed', 'waived'].includes(gate.status);
+const activePhases = new Set(['ANALYZING', 'EXECUTING', 'INTEGRATING', 'VERIFYING', 'REVIEWING', 'REPAIR_PLANNING', 'FINAL_AUDIT', 'FINALIZING', 'CLEANING']);
 export type Run = {
   id: string; host: 'codex' | 'claude'; origin: string; commonDir: string; target: string; targetBase: string;
   integration: string; integrationPath: string; managedRoot: string; state: string; config: Config;
+  requirements?: Requirements; requirementRefs?: { json: string; markdown: string };
   plan: Plan | null; tasks: Record<string, Work>; gates: Gate[]; findings: Finding[];
-  reviews: { sha: string; reviewer: string; final: boolean }[]; reviewRound: number;
+  reviews: { sha: string; reviewer: string; final: boolean; acceptanceIds?: string[]; decision?: string; limitations?: string[] }[]; reviewRound: number; implementers?: string[]; integrationSha?: string;
   conflict?: { path: string; branch: string; taskId: string; expected: string; taskHead: string };
   candidates?: { path: string; branch: string }[];
+  runtimeRoot?: string; configRevision?: number; configRevisions?: { revision: number; hash: string; roles: Config['hosts']; timestamp: string }[];
+  finalizationApproval?: { actor: 'user'; target: string; runId: string; approvedAt: string };
+  activeTimeMs?: number; activeSince?: number | null; pauseTimeMs?: number; pauseStartedAt?: number; finalizedAt?: string;
+  repairAnalyses?: { round: number; analysis: string }[];
+  missingTestsWaiver?: { actor: 'user'; reason: string; approvedAt: string };
+  waivers?: { stage: string; taskId: string | null; gateId: string; sha: string; source: string; command: string; reason: string; actor: 'user'; approvedAt: string }[];
   createdAt: string; pausedFrom?: string; cleanup: { path: string; status: string; reason: string | null }[];
 };
 export type NativeCapability = {
@@ -32,13 +46,31 @@ export class Engine {
   store: Store;
   readonly native: NativeCapability | null;
   activeOperation: string | null = null;
-  constructor(statePath: string, native: NativeCapability | null = null) { this.store = new Store(statePath); this.native = native; }
+  effectPrepared = false;
+  runtimeRoot = fileURLToPath(new URL('../../../../', import.meta.url));
+  readConfig: (() => Promise<Config>) | null;
+  origin: string;
+  constructor(statePath: string, native: NativeCapability | null = null, readConfig: (() => Promise<Config>) | null = null) {
+    const path = resolve(statePath);
+    check(basename(path) === 'state.db' && basename(dirname(path)) === 'state' && basename(dirname(dirname(path))) === '.orch', 'STATE_PATH_UNSAFE');
+    this.origin = realpathSync(dirname(dirname(dirname(path))));
+    let directory = this.origin;
+    for (const part of ['.orch', 'state']) {
+      directory = join(directory, part);
+      if (!existsSync(directory)) mkdirSync(directory, { mode: 0o700 });
+      check(lstatSync(directory).isDirectory() && !lstatSync(directory).isSymbolicLink() && realpathSync(directory) === directory, 'STATE_PATH_UNSAFE');
+    }
+    this.store = new Store(join(directory, 'state.db')); this.native = native; this.readConfig = readConfig;
+  }
   status(run: string) { return this.store.get<Run>(id.parse(run)); }
-  async create(origin: string, configInput: unknown, host: 'codex' | 'claude', managedRoot: string, trustedCommandsHash: string) {
+  async create(origin: string, configInput: unknown, host: 'codex' | 'claude', managedRoot: string, trustedCommandsHash: string, options: { missingTestsWaiver?: { approved: boolean; reason: string } } = {}) {
     const repo = await inspectRepository(origin), config = configSchema.parse(configInput);
+    check(repo.root === this.origin, 'STATE_ORIGIN_MISMATCH');
     check(!repo.dirty, 'DIRTY_CHECKOUT');
-    check(config.quality.commands.length > 0 && hash(config.quality.commands) === trustedCommandsHash, 'TRUST_APPROVAL_REQUIRED');
-    check(config.quality.commands.some(command => command.required && command.stages.includes('baseline')) &&
+    const missingWaiver = options.missingTestsWaiver;
+    check(!missingWaiver || missingWaiver.approved && missingWaiver.reason.trim(), 'APPROVAL_REQUIRED');
+    check((config.quality.commands.length > 0 || missingWaiver) && hash(config.quality.commands) === trustedCommandsHash, 'TRUST_APPROVAL_REQUIRED');
+    check(missingWaiver && config.quality.commands.length === 0 || config.quality.commands.some(command => command.required && command.stages.includes('baseline')) &&
       config.quality.commands.some(command => command.required && command.stages.includes('final')), 'REQUIRED_GATES_MISSING');
     check(!config.git.target_branch || config.git.target_branch === repo.branch, 'TARGET_BRANCH_MISMATCH');
     await git(repo.root, 'check-ignore', '.orch/state/probe').catch(() => { throw new Error('STATE_IGNORE_REQUIRED'); });
@@ -51,7 +83,7 @@ export class Engine {
     const integration = `orch/${runId}/integration`, integrationPath = join(managed, runId, 'integration');
     const run: Run = { id: runId, host, origin: repo.root, commonDir: repo.commonDir, target: repo.branch, targetBase: repo.head,
       integration, integrationPath, managedRoot: managed, state: 'PREFLIGHT', config, plan: null, tasks: {}, gates: [], findings: [], reviews: [], reviewRound: 0,
-      createdAt: new Date().toISOString(), cleanup: [] };
+      activeTimeMs: 0, activeSince: null, pauseTimeMs: 0, missingTestsWaiver: missingWaiver && config.quality.commands.length === 0 ? { actor: 'user', reason: missingWaiver.reason, approvedAt: new Date().toISOString() } : undefined, runtimeRoot: this.runtimeRoot, configRevision: 1, configRevisions: [{ revision: 1, hash: hash(config), roles: structuredClone(config.hosts), timestamp: new Date().toISOString() }], integrationSha: repo.head, createdAt: new Date().toISOString(), cleanup: [] };
     this.store.create(runId, run);
     return { runId, version: 0 };
   }
@@ -62,21 +94,37 @@ export class Engine {
     await mkdir(mutex).catch(() => { throw new Error('OPERATION_LOCKED'); });
     try {
       const current = this.status(runId);
+      check(current.data.runtimeRoot === this.runtimeRoot, 'RUNTIME_VERSION_PINNED');
+      const lockText = await readFile(join(current.data.commonDir, 'orch', 'locks', 'write.json'), 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+      const owner = lockText ? JSON.parse(lockText) as { runId: string } : null;
+      check(owner ? owner.runId === runId : current.data.state === 'COMPLETED', 'RUN_LOCK_OWNERSHIP_MISMATCH');
       const prior = this.store.operation(runId, operation);
       if (!prior) check(current.version === expected, 'STATE_CONFLICT');
       const previous = this.store.intent(runId, operation, input, current);
       if (previous) {
+        if (previous.status === 'rejected') throw new Error((previous.result as { code: string }).code);
         check(previous.status === 'complete', 'RECONCILIATION_REQUIRED');
         return previous.result;
       }
-      this.activeOperation = operation;
-      const result = await fn(current.data);
+      const started = Date.now();
+      current.data.activeTimeMs = (current.data.activeTimeMs ?? 0) + (current.data.activeSince == null ? 0 : Math.max(0, started - current.data.activeSince));
+      current.data.activeSince = null;
+      this.activeOperation = operation; this.effectPrepared = false;
+      let result: unknown;
+      try { result = await fn(current.data); }
+      catch (error) {
+        if (!this.effectPrepared) this.store.reject(runId, operation, error instanceof Error && /^[A-Z][A-Z0-9_]+$/.test(error.message) ? error.message : 'ORCH_OPERATION_FAILED');
+        throw error;
+      }
+      const finished = Date.now();
+      current.data.activeTimeMs += Math.max(0, finished - started);
+      current.data.activeSince = activePhases.has(current.data.state) ? finished : null;
       const response = { version: current.version + 1, result };
       return this.store.save(runId, current.version, current.data, 'run.changed', operation, response);
     } finally { this.activeOperation = null; await rmdir(mutex); }
   }
   checkpointIntent(run: Run) {
-    check(this.activeOperation, 'OPERATION_REQUIRED');
+    check(this.activeOperation, 'OPERATION_REQUIRED'); this.effectPrepared = true;
     const version = this.status(run.id).version;
     this.store.db.prepare('UPDATE operations SET snapshot=? WHERE run_id=? AND id=?').run(JSON.stringify({ version, data: run }), run.id, this.activeOperation);
   }
@@ -84,8 +132,12 @@ export class Engine {
     check(previousCoordinatorStopped, 'COORDINATOR_STOP_UNCONFIRMED');
     const current = this.status(runId);
     const mutex = join(current.data.commonDir, 'orch', 'locks', 'operation');
-    const owner = JSON.parse(await readFile(join(current.data.commonDir, 'orch', 'locks', 'write.json'), 'utf8')) as { runId: string };
-    check(owner.runId === runId, 'LOCK_OWNERSHIP_MISMATCH');
+    check(current.data.runtimeRoot === this.runtimeRoot, 'RUNTIME_VERSION_PINNED');
+    const pendingRecord = this.store.pending(runId).find(item => item.id === operationId); check(pendingRecord, 'OPERATION_NOT_PENDING');
+    const pendingTool = (pendingRecord.input as { tool?: string } | null)?.tool;
+    const lockText = await readFile(join(current.data.commonDir, 'orch', 'locks', 'write.json'), 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+    const owner = lockText ? JSON.parse(lockText) as { runId: string } : null;
+    check(owner ? owner.runId === runId : pendingTool === 'orch_cleanup' && current.data.state === 'COMPLETED', 'LOCK_OWNERSHIP_MISMATCH');
     // Explicit host confirmation permits removing only this empty operation mutex.
     await rmdir(mutex).catch(error => { if (error.code !== 'ENOENT') throw error; });
     await mkdir(mutex);
@@ -96,61 +148,94 @@ export class Engine {
       const request = pending.input as { tool?: string; input?: { task_id?: string; unit_id?: string; expected_integration_sha?: string } };
       const run = prior.data, task = request.input?.task_id ? run.tasks[request.input.task_id] : null;
       let result: unknown;
-      if (request.tool === 'orch_task_commit' && task) {
+      if (request.tool === 'orch_plan_submit') {
+        const repo = await inspectRepository(run.integrationPath);
+        check(run.state === 'EXECUTING' && run.plan && repo.commonDir === run.commonDir && repo.branch === run.integration && repo.head === run.targetBase && !repo.dirty, 'RECOVERY_PLAN_NOT_PROVEN');
+        result = { state: run.state, recovered: true };
+      } else if (request.tool === 'orch_cleanup') {
+        check(run.state === 'COMPLETED', 'RECOVERY_CLEANUP_NOT_PROVEN');
+        result = await this.cleanup(run, false);
+      } else if (request.tool === 'orch_task_commit' && task) {
         const unit = request.input?.unit_id; check(unit && task.spec.commit_units.some(item => item.id === unit), 'UNKNOWN_UNIT');
         const head = await git(task.path, 'rev-parse', 'HEAD'), message = await git(task.path, 'show', '-s', '--format=%B', head);
         check(message.includes(`Orch-Run: ${run.id}\n`) && message.includes(`Orch-Task: ${task.spec.id}\n`) && `${message}\n`.includes(`Orch-Unit: ${unit}\n`), 'RECOVERY_COMMIT_NOT_PROVEN');
         check((await changedPaths(task.path, task.base)).every(path => owns(task.spec.write_paths, path)), 'OWNERSHIP_VIOLATION');
-        task.units[unit] = head; task.validated = null; result = { sha: head, recovered: true };
+        task.units[unit] = head; task.lastCommitSha = head; task.validated = null; result = { sha: head, recovered: true };
       } else if (request.tool === 'orch_integrate' && task) {
         const head = await git(run.integrationPath, 'rev-parse', 'HEAD'), parents = (await git(run.integrationPath, 'show', '-s', '--format=%P', head)).split(' ');
         check(parents.length === 2 && parents[0] === request.input?.expected_integration_sha && parents[1] === await git(task.path, 'rev-parse', 'HEAD'), 'RECOVERY_MERGE_NOT_PROVEN');
-        task.state = 'INTEGRATED'; run.reviews = [];
+        task.state = 'INTEGRATED'; run.integrationSha = await git(run.integrationPath, 'rev-parse', 'HEAD'); run.reviews = [];
         run.state = Object.values(run.tasks).every(item => item.state === 'INTEGRATED') ? 'VERIFYING' : 'EXECUTING'; result = { sha: head, recovered: true };
       } else if (request.tool === 'orch_task_prepare' && task) {
         const repo = await inspectRepository(task.path);
-        check(repo.commonDir === run.commonDir && repo.branch === task.branch && repo.head === task.base && !repo.dirty && task.state === 'LEASED', 'RECOVERY_WORKTREE_NOT_PROVEN');
+        check(repo.commonDir === run.commonDir && repo.branch === task.branch && repo.head === (task.dispatchBase ?? task.base) && !repo.dirty && task.state === 'LEASED', 'RECOVERY_WORKTREE_NOT_PROVEN');
         // The caller never received the lost dispatch; retain its lease, do not start another worker.
         result = { recovered: true, task, requiresNativeStateCheck: true };
       } else if (request.tool === 'orch_finalize') {
         const head = await git(run.integrationPath, 'rev-parse', 'HEAD');
-        check(await git(run.origin, 'rev-parse', 'HEAD') === head && run.gates.some(gate => gate.stage === 'final' && gate.sha === head && gate.status === 'passed'), 'RECOVERY_FINALIZE_NOT_PROVEN');
+        check(await git(run.origin, 'rev-parse', 'HEAD') === head && run.gates.some(gate => gate.stage === 'final' && gate.sha === head && acceptedGate(gate)), 'RECOVERY_FINALIZE_NOT_PROVEN');
         run.state = 'COMPLETED'; result = { sha: head, recovered: true };
       } else throw new Error('RECOVERY_REQUIRES_MANUAL_RECONCILIATION');
       return this.store.save(runId, current.version, run, 'run.reconciled', operationId, { version: current.version + 1, result });
     } finally { await rmdir(mutex); }
   }
   async gate(run: Run, stage: string, path: string, task: string | null = null) {
-    const commands = run.config.quality.commands.filter(command => command.stages.includes(stage as 'baseline'));
+    let commands = run.config.quality.commands.filter(command => command.stages.includes(stage as 'baseline') && (task === null || run.tasks[task].spec.verification_ids.includes(command.id)));
+    if (!commands.length && run.missingTestsWaiver) commands = [{ id: 'missing-tests', executable: process.execPath, args: [], cwd: '.', stages: ['baseline', 'task', 'integration', 'final'], required: true, timeout_seconds: 1 }];
     check(commands.some(command => command.required), 'REQUIRED_GATES_MISSING');
     const fingerprint = await sourceFingerprint(path);
-    const result: Gate = { stage, task, sha: await git(path, 'rev-parse', 'HEAD'), source: fingerprint,
+    const result: Gate = { id: `gate-${randomUUID()}`, details: [], stage, task, sha: await git(path, 'rev-parse', 'HEAD'), source: fingerprint,
       commands: hash(run.config.quality.commands), status: 'passed', results: [] };
     for (const command of commands) {
       const cwd = await realpath(resolve(path, command.cwd));
       check(cwd === await realpath(path) || within(await realpath(path), cwd), 'GATE_CWD_OUTSIDE_ROOT');
-      let status = 'passed', exitCode: number | null = 0;
-      try { await exec(command.executable, command.args, { cwd, timeout: command.timeout_seconds * 1000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 }); }
-      catch (error) {
-        const failure = error as { killed?: boolean; code?: number };
+      this.checkpointIntent(run);
+      const startedAt = new Date().toISOString();
+      let status: GateResult['status'] = 'passed', exitCode: number | null = 0, output = '';
+      const waiver = (run.waivers ?? []).find(item => item.stage === stage && item.taskId === task && item.gateId === command.id && item.sha === result.sha && item.source === fingerprint && item.command === hash(command)) ?? (command.id === 'missing-tests' ? run.missingTestsWaiver : undefined);
+      if (waiver) { status = 'waived'; exitCode = null; output = `User waiver: ${waiver.reason}`; if (result.status === 'passed') result.status = 'waived'; }
+      else try {
+        const response = await exec(command.executable, command.args, { cwd, timeout: command.timeout_seconds * 1000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 });
+        output = `${response.stdout}\n${response.stderr}`;
+      } catch (error) {
+        const failure = error as { killed?: boolean; code?: number; stdout?: string; stderr?: string };
         status = failure.killed ? 'timed_out' : 'failed'; exitCode = typeof failure.code === 'number' ? failure.code : null;
+        output = `${failure.stdout ?? ''}\n${failure.stderr ?? ''}`;
         if (command.required) result.status = status;
       }
+      const recordId = `quality-${randomUUID()}`;
+      const logRef = await writeStateArtifact(run.origin, run.id, `${recordId}.log`, redact(output), 'logs');
+      result.details!.push(gateResultSchema.parse({ id: recordId, runId: run.id, taskId: task, gateId: command.id,
+        stage, commitSha: result.sha, sourceFingerprint: fingerprint, commandFingerprint: hash(command),
+        environmentFingerprint: hash({ node: process.version, platform: process.platform, arch: process.arch, env: process.env }),
+        status, exitCode, startedAt, finishedAt: new Date().toISOString(), logRef, waiverReason: waiver?.reason ?? null }));
       result.results.push({ id: command.id, status, exitCode });
     }
     if (await sourceFingerprint(path) !== fingerprint) result.status = 'source_changed';
     run.gates.push(result);
     return result;
   }
+  async submitRequirements(run: Run, input: unknown) {
+    check(['PREFLIGHT', 'PLAN_READY'].includes(run.state) && Object.keys(run.tasks).length === 0, 'INVALID_RUN_STATE');
+    const requirements = requirementsSchema.parse(input);
+    this.checkpointIntent(run);
+    const saved = await writeRequirements(run.origin, run.id, requirements);
+    run.requirements = saved.requirements; run.requirementRefs = saved.refs;
+    run.plan = null; run.state = 'PREFLIGHT';
+    return { state: run.state, ...saved };
+  }
   async plan(run: Run, input: unknown, approved: boolean) {
     check(run.state === 'PREFLIGHT' || run.state === 'PLAN_READY', 'INVALID_RUN_STATE');
     const plan = validatePlan(input);
+    check(run.requirements, 'REQUIREMENTS_REQUIRED');
+    check(plan.acceptance.length === run.requirements.acceptance.length && plan.acceptance.every(item => run.requirements!.acceptance.some(required => required.id === item.id && required.text === item.text)), 'REQUIREMENTS_PLAN_MISMATCH');
     const gateIds = new Set(run.config.quality.commands.map(command => command.id));
+    if (run.missingTestsWaiver) gateIds.add('missing-tests');
     check(plan.tasks.every(task => task.verification_ids.every(key => gateIds.has(key))), 'UNKNOWN_VERIFICATION');
     run.plan = plan;
     if (!approved) { run.state = 'PLAN_READY'; return { state: run.state }; }
     const baseline = await this.gate(run, 'baseline', run.origin);
-    if (baseline.status !== 'passed') { run.state = 'BLOCKED_BASELINE'; return baseline; }
+    if (!acceptedGate(baseline)) { run.state = 'BLOCKED_BASELINE'; return baseline; }
     for (const task of plan.tasks) run.tasks[task.id] = { spec: task, state: 'PENDING', base: '', path: '', branch: '', attempt: 0, lease: '', expires: 0, nativeId: null, units: {}, validated: null };
     run.state = 'EXECUTING'; this.checkpointIntent(run);
     await git(run.origin, 'worktree', 'add', '-b', run.integration, run.integrationPath, run.targetBase);
@@ -159,27 +244,86 @@ export class Engine {
   async prepare(run: Run, taskId: string) {
     check(run.state === 'EXECUTING', 'INVALID_RUN_STATE');
     check(this.native?.verified && this.native.contextMatches && this.native.host === run.host && this.native.evidence.length, 'BLOCKED_CAPABILITY');
-    check(Date.now() - Date.parse(run.createdAt) < run.config.execution.run_timeout_minutes * 60000, 'RUN_TIMEOUT');
+    check((run.activeTimeMs ?? Math.max(0, Date.now() - Date.parse(run.createdAt))) < run.config.execution.run_timeout_minutes * 60000, 'RUN_TIMEOUT');
     const task = run.tasks[taskId]; check(task, 'TASK_NOT_FOUND');
     check(['PENDING', 'RETRYABLE_FAILED'].includes(task.state), 'TASK_NOT_READY');
     check(task.attempt < run.config.execution.max_task_attempts, 'TASK_ATTEMPT_LIMIT');
     check(task.spec.depends_on.every(key => run.tasks[key].state === 'INTEGRATED'), 'DEPENDENCY_NOT_INTEGRATED');
-    const active = Object.values(run.tasks).filter(work => ['LEASED', 'RUNNING', 'VALIDATING', 'ORPHANED_UNKNOWN'].includes(work.state));
-    check(active.length < run.config.execution.max_parallel_workers, 'WORKER_LIMIT');
+    const active = Object.values(run.tasks).filter(work => ['LEASED', 'RUNNING', 'VALIDATING', 'ORPHANED_UNKNOWN', 'MERGE_QUEUED'].includes(work.state));
+    check(active.filter(work => work.state !== 'MERGE_QUEUED').length < run.config.execution.max_parallel_workers, 'WORKER_LIMIT');
     check(!active.some(work => overlaps(work.spec.write_paths, task.spec.write_paths) || work.spec.exclusive_resources.some(resource => task.spec.exclusive_resources.includes(resource))), 'OWNERSHIP_CONFLICT');
+    if (this.readConfig) {
+      const next = configSchema.parse(await this.readConfig());
+      const policies = (value: Config) => ({ ...value, hosts: undefined, model_selection: undefined });
+      check(hash(policies(next)) === hash(policies(run.config)) && hash(next.hosts[run.host === 'codex' ? 'claude' : 'codex']) === hash(run.config.hosts[run.host === 'codex' ? 'claude' : 'codex']), 'RUN_POLICY_CHANGE_REQUIRES_NEW_RUN');
+      if (hash(next) !== hash(run.config)) {
+        run.config = next; run.configRevision = (run.configRevision ?? 1) + 1; run.configRevisions ??= [];
+        run.configRevisions.push({ revision: run.configRevision, hash: hash(next), roles: structuredClone(next.hosts), timestamp: new Date().toISOString() });
+      }
+    }
     const requested = run.config.hosts[run.host].roles[task.spec.role];
     check(['auto', 'inherit', this.native.model].includes(requested.model), 'MODEL_NOT_SUPPORTED');
     check(['auto', 'inherit', this.native.effort].includes(requested.effort), 'EFFORT_NOT_SUPPORTED');
+    check(await git(run.integrationPath, 'rev-parse', 'HEAD') === (run.integrationSha ?? run.targetBase), 'INTEGRATION_DRIFT');
+    const reuse = Object.keys(task.units).length > 0;
+    const createRecovered = reuse && !!task.recoveryHead;
+    if (reuse && task.recoveryHead) {
+      run.candidates ??= []; run.candidates.push({ path: task.path, branch: task.branch });
+      task.dispatchBase = task.recoveryHead; task.recoveryHead = undefined;
+      task.branch = `orch/${run.id}/task/${taskId}-${task.attempt + 1}`;
+      task.path = join(run.managedRoot, run.id, `${taskId}-${task.attempt + 1}`);
+    } else if (reuse) {
+      const existing = await inspectRepository(task.path);
+      check(existing.commonDir === run.commonDir && existing.branch === task.branch && !existing.dirty, 'DIRTY_RECOVERY_PRESERVED');
+      task.dispatchBase = existing.head;
+    } else {
+      if (task.path) { run.candidates ??= []; run.candidates.push({ path: task.path, branch: task.branch }); }
+      task.base = await git(run.integrationPath, 'rev-parse', 'HEAD'); task.dispatchBase = task.base;
+      task.branch = `orch/${run.id}/task/${taskId}-${task.attempt + 1}`;
+      task.path = join(run.managedRoot, run.id, `${taskId}-${task.attempt + 1}`);
+    }
     task.attempt++; task.lease = randomUUID(); task.expires = Date.now() + run.config.execution.task_timeout_minutes * 60000;
-    task.base = await git(run.integrationPath, 'rev-parse', 'HEAD');
-    task.branch = `orch/${run.id}/task/${taskId}-${task.attempt}`;
-    task.path = join(run.managedRoot, run.id, `${taskId}-${task.attempt}`);
     check(within(run.managedRoot, task.path), 'WORKTREE_ROOT_UNSAFE');
-    task.state = 'LEASED'; this.checkpointIntent(run);
-    await git(run.origin, 'worktree', 'add', '-b', task.branch, task.path, task.base);
+    task.configRevision = run.configRevision ?? 1; task.modelResolution = { requestedModel: requested.model, requestedEffort: requested.effort, resolvedModel: this.native.model, resolvedEffort: this.native.effort };
+    task.validated = null; task.observedModel = null; task.observedEffort = null;
+    task.state = 'LEASED'; task.nativeId = null; this.checkpointIntent(run);
+    if (!reuse || createRecovered) await git(run.origin, 'worktree', 'add', '-b', task.branch, task.path, task.dispatchBase ?? task.base);
     return { runId: run.id, taskId, attemptId: `${taskId}-${task.attempt}`, host: run.host, role: task.spec.role,
-      modelId: this.native.model, effort: this.native.effort, baseSha: task.base, worktreePath: task.path,
+      modelId: this.native.model, effort: this.native.effort, configRevision: task.configRevision, baseSha: task.dispatchBase ?? task.base, lineageBaseSha: task.base, worktreePath: task.path,
       isolation: 'core_managed', leaseId: task.lease, fencingToken: task.attempt, expiresAt: new Date(task.expires).toISOString(), taskBrief: task.spec };
+  }
+  ready(run: Run) {
+    if (run.state !== 'EXECUTING') return [];
+    const tasks = Object.values(run.tasks);
+    const active = tasks.filter(task => ['LEASED', 'RUNNING', 'ORPHANED_UNKNOWN', 'MERGE_QUEUED'].includes(task.state));
+    const slots = run.config.execution.max_parallel_workers - active.filter(task => task.state !== 'MERGE_QUEUED').length;
+    const children = new Map<string, Work[]>(), distances = new Map<string, number>();
+    for (const task of tasks) for (const parent of task.spec.depends_on) children.set(parent, [...(children.get(parent) ?? []), task]);
+    const distance = (task: Work): number => {
+      if (!distances.has(task.spec.id)) distances.set(task.spec.id, 1 + Math.max(0, ...(children.get(task.spec.id) ?? []).map(distance)));
+      return distances.get(task.spec.id)!;
+    };
+    const candidates = tasks.filter(task => ['PENDING', 'RETRYABLE_FAILED'].includes(task.state) && task.attempt < run.config.execution.max_task_attempts && task.spec.depends_on.every(key => run.tasks[key].state === 'INTEGRATED'));
+    candidates.sort((a, b) => distance(b) - distance(a));
+    const selected: Work[] = [];
+    for (const task of candidates) {
+      if (selected.length >= slots) break;
+      if (![...active, ...selected].some(other => overlaps(other.spec.write_paths, task.spec.write_paths) || other.spec.exclusive_resources.some(key => task.spec.exclusive_resources.includes(key)))) selected.push(task);
+    }
+    return selected.map(task => task.spec.id);
+  }
+  async retry(run: Run, taskId: string, lease: string, generation: number, nativeStopped: boolean, reason: string) {
+    const task = run.tasks[taskId]; check(task, 'TASK_NOT_FOUND');
+    check(task.lease === lease && task.attempt === generation, 'STALE_LEASE');
+    check(nativeStopped && reason.trim().length > 0, 'WORKER_STOP_UNCONFIRMED');
+    check(['RUNNING', 'LEASED', 'ORPHANED_UNKNOWN'].includes(task.state), 'INVALID_TASK_STATE');
+    await this.taskIdentity(run, task);
+    task.attempts ??= []; task.attempts.push({ number: task.attempt, path: task.path, branch: task.branch, nativeId: task.nativeId, stopped: true, reason });
+    task.recoveryHead = Object.keys(task.units).length ? await git(task.path, 'rev-parse', 'HEAD') : undefined;
+    task.validated = null; task.expires = 0;
+    task.state = task.attempt < run.config.execution.max_task_attempts ? 'RETRYABLE_FAILED' : 'BLOCKED_ATTEMPT_LIMIT';
+    if (task.state === 'BLOCKED_ATTEMPT_LIMIT') run.state = 'BLOCKED_TASK_ATTEMPT_LIMIT';
+    return { state: task.state, preservedWorktree: task.path, attempt: task.attempt };
   }
   leased(run: Run, taskId: string, lease: string, generation: number) {
     const task = run.tasks[taskId]; check(task, 'TASK_NOT_FOUND');
@@ -188,30 +332,41 @@ export class Engine {
   }
   async bind(run: Run, taskId: string, lease: string, generation: number, nativeId: string, observedModel: string | null, observedEffort: string | null) {
     const task = this.leased(run, taskId, lease, generation);
+    check(this.native?.verified && this.native.contextMatches && this.native.host === run.host, 'BLOCKED_CAPABILITY');
     check(task.state === 'LEASED', 'INVALID_TASK_STATE');
     const repo = await inspectRepository(task.path);
-    check(repo.root === await realpath(task.path) && repo.commonDir === run.commonDir && repo.branch === task.branch && repo.head === task.base && !repo.dirty, 'BASE_SHA_MISMATCH');
-    check(observedModel === this.native?.model && observedEffort === this.native?.effort, 'MODEL_OBSERVATION_MISMATCH');
-    task.nativeId = id.parse(nativeId); task.state = 'RUNNING';
+    check(repo.root === await realpath(task.path) && repo.commonDir === run.commonDir && repo.branch === task.branch && repo.head === (task.dispatchBase ?? task.base) && !repo.dirty, 'BASE_SHA_MISMATCH');
+    check((observedModel === null || observedModel === task.modelResolution?.resolvedModel) && (observedEffort === null || observedEffort === task.modelResolution?.resolvedEffort), 'MODEL_OBSERVATION_MISMATCH');
+    task.observedModel = observedModel; task.observedEffort = observedEffort;
+    task.nativeId = id.parse(nativeId); run.implementers ??= []; run.implementers.push(task.nativeId); task.state = 'RUNNING';
     return { state: task.state };
+  }
+  async taskIdentity(run: Run, task: Work) {
+    const repo = await inspectRepository(task.path);
+    check(repo.root === await realpath(task.path) && repo.commonDir === run.commonDir && repo.branch === task.branch, 'WORKTREE_IDENTITY_MISMATCH');
+    return repo;
   }
   async validate(run: Run, taskId: string, lease: string, generation: number) {
     check(run.state === 'EXECUTING', 'INVALID_RUN_STATE');
     const task = this.leased(run, taskId, lease, generation);
     check(task.state === 'RUNNING', 'INVALID_TASK_STATE');
+    await this.taskIdentity(run, task);
     const paths = await changedPaths(task.path, task.base);
     check(paths.every(path => owns(task.spec.write_paths, path)), 'OWNERSHIP_VIOLATION');
     const gate = await this.gate(run, 'task', task.path, taskId);
-    task.validated = gate.status === 'passed' ? gate.source : null;
+    task.validated = acceptedGate(gate) ? gate.source : null;
     return gate;
   }
   async commit(run: Run, taskId: string, lease: string, generation: number, unit: string) {
     check(run.state === 'EXECUTING', 'INVALID_RUN_STATE');
     const task = this.leased(run, taskId, lease, generation);
     check(task.state === 'RUNNING', 'INVALID_TASK_STATE');
+    await this.taskIdentity(run, task);
     const spec = task.spec.commit_units.find(candidate => candidate.id === unit); check(spec, 'UNKNOWN_UNIT');
     if (task.units[unit]) return { sha: task.units[unit] };
     check(task.validated && task.validated === await sourceFingerprint(task.path), 'VALIDATION_STALE');
+    const expectedHead = task.lastCommitSha ?? task.dispatchBase ?? task.base;
+    check(await git(task.path, 'rev-parse', 'HEAD') === expectedHead, 'COMMIT_HEAD_MISMATCH');
     const paths = await changedPaths(task.path);
     check(paths.length && paths.every(path => owns(task.spec.write_paths, path)), 'OWNERSHIP_VIOLATION');
     check((await changedPaths(task.path, task.base)).every(path => owns(task.spec.write_paths, path)), 'OWNERSHIP_VIOLATION');
@@ -219,23 +374,50 @@ export class Engine {
     await git(task.path, 'diff', '--cached', '--check');
     this.checkpointIntent(run);
     await git(task.path, 'commit', '-m', `${spec.purpose}\n\nOrch-Run: ${run.id}\nOrch-Task: ${taskId}\nOrch-Unit: ${unit}`);
-    const sha = await git(task.path, 'rev-parse', 'HEAD'); task.units[unit] = sha; task.validated = null;
+    const sha = await git(task.path, 'rev-parse', 'HEAD');
+    check(await git(task.path, 'show', '-s', '--format=%P', sha) === expectedHead && (await changedPaths(task.path, task.base)).every(path => owns(task.spec.write_paths, path)), 'COMMIT_RESULT_MISMATCH');
+    task.units[unit] = sha; task.lastCommitSha = sha; task.validated = null;
     return { sha };
   }
-  async complete(run: Run, taskId: string, lease: string, generation: number, nativeStopped: boolean) {
-    const task = this.leased(run, taskId, lease, generation);
-    check(nativeStopped, 'WORKER_STOP_UNCONFIRMED');
-    check(task.state === 'RUNNING' && task.spec.commit_units.every(unit => task.units[unit.id]), 'UNITS_INCOMPLETE');
-    check(!(await inspectRepository(task.path)).dirty, 'DIRTY_CHECKOUT');
+  async verifySubmission(run: Run, task: Work) {
+    check(task.spec.commit_units.every(unit => task.units[unit.id]), 'UNITS_INCOMPLETE');
+    const repo = await inspectRepository(task.path);
+    check(repo.commonDir === run.commonDir && repo.branch === task.branch && !repo.dirty, 'DIRTY_CHECKOUT');
+    check((await changedPaths(task.path, task.base)).every(path => owns(task.spec.write_paths, path)), 'OWNERSHIP_VIOLATION');
     await git(task.path, 'merge-base', '--is-ancestor', task.base, 'HEAD');
     const submitted = (await git(task.path, 'rev-list', `${task.base}..HEAD`)).split('\n').filter(Boolean);
     check(submitted.length === Object.keys(task.units).length && submitted.every(sha => Object.values(task.units).includes(sha)), 'UNTRACKED_COMMIT');
+    for (const unit of task.spec.commit_units) {
+      const sha = task.units[unit.id], message = `${await git(task.path, 'show', '-s', '--format=%B', sha)}\n`;
+      const parents = (await git(task.path, 'show', '-s', '--format=%P', sha)).split(' ');
+      check(parents.length === 1 && message.includes(`Orch-Run: ${run.id}\n`) && message.includes(`Orch-Task: ${task.spec.id}\n`) && message.includes(`Orch-Unit: ${unit.id}\n`), 'UNTRACKED_COMMIT');
+    }
+    const gate = run.gates.filter(item => item.task === task.spec.id && item.stage === 'task').at(-1);
+    check(gate && acceptedGate(gate) && gate.commands === hash(run.config.quality.commands) && gate.source === await sourceFingerprint(task.path), 'VALIDATION_STALE');
+  }
+  async complete(run: Run, taskId: string, lease: string, generation: number, nativeStopped: boolean, submittedResult: unknown = null) {
+    const task = this.leased(run, taskId, lease, generation);
+    check(nativeStopped, 'WORKER_STOP_UNCONFIRMED');
+    check(task.state === 'RUNNING', 'INVALID_TASK_STATE');
+    await this.verifySubmission(run, task);
+    if (submittedResult !== null) {
+      const result = taskResultSchema.parse(submittedResult);
+      check(result.runId === run.id && result.taskId === taskId && result.attemptId === `${taskId}-${task.attempt}` && result.baseSha === (task.dispatchBase ?? task.base) && await realpath(result.worktreePath) === await realpath(task.path), 'TASK_RESULT_IDENTITY_MISMATCH');
+      check(result.status === 'ready_for_validation' && result.completedUnits.length === Object.keys(task.units).length && result.completedUnits.every(unit => task.units[unit.unitId] === unit.commitSha), 'TASK_RESULT_MISMATCH');
+      const actual = await changedPaths(task.path, task.dispatchBase ?? task.base);
+      check(result.changedPaths.length === actual.length && result.changedPaths.every(path => actual.includes(path)), 'TASK_RESULT_MISMATCH');
+      const gateIds = run.gates.filter(gate => gate.task === taskId).flatMap(gate => gate.details?.map(detail => detail.id) ?? []);
+      check(task.spec.verification_ids.every(command => run.gates.filter(gate => gate.task === taskId).at(-1)?.details?.some(detail => detail.gateId === command && acceptedGate(detail) && result.gateResultIds.includes(detail.id))), 'TASK_RESULT_EVIDENCE_MISSING');
+      check(result.gateResultIds.every(key => gateIds.includes(key)) && task.spec.acceptance_ids.every(key => result.acceptanceEvidence.some(item => item.acceptanceId === key)), 'TASK_RESULT_EVIDENCE_MISSING');
+      task.acceptanceEvidence = result.acceptanceEvidence; task.changedPaths = result.changedPaths; task.reportedModel = result.reportedModel;
+    }
     task.state = 'MERGE_QUEUED'; return { state: task.state };
   }
   async integrate(run: Run, taskId: string, expectedSha: string) {
     check(run.state === 'EXECUTING', 'INVALID_RUN_STATE');
     const task = run.tasks[taskId]; check(task?.state === 'MERGE_QUEUED', 'TASK_NOT_READY');
-    check(await git(run.integrationPath, 'rev-parse', 'HEAD') === expectedSha, 'INTEGRATION_DRIFT');
+    await this.verifySubmission(run, task);
+    check(expectedSha === (run.integrationSha ?? run.targetBase) && await git(run.integrationPath, 'rev-parse', 'HEAD') === expectedSha, 'INTEGRATION_DRIFT');
     check(!(await inspectRepository(run.integrationPath)).dirty, 'DIRTY_CHECKOUT');
     const taskHead = await git(task.path, 'rev-parse', 'HEAD');
     const candidate = { path: join(run.managedRoot, run.id, `conflict-${this.activeOperation}`), branch: `orch/${run.id}/conflict/${this.activeOperation}` };
@@ -250,7 +432,7 @@ export class Engine {
     await git(run.integrationPath, 'merge', '--ff-only', candidate.branch);
     const parents = (await git(run.integrationPath, 'show', '-s', '--format=%P', 'HEAD')).split(' ');
     check(parents.includes(expectedSha) && parents.includes(await git(task.path, 'rev-parse', 'HEAD')), 'MERGE_PARENTS_MISMATCH');
-    task.state = 'INTEGRATED'; run.reviews = [];
+    task.state = 'INTEGRATED'; run.integrationSha = await git(run.integrationPath, 'rev-parse', 'HEAD'); run.reviews = [];
     if (Object.values(run.tasks).every(work => work.state === 'INTEGRATED')) run.state = 'VERIFYING';
     return { sha: await git(run.integrationPath, 'rev-parse', 'HEAD'), state: run.state };
   }
@@ -268,48 +450,54 @@ export class Engine {
     await git(conflict.path, 'diff', '--cached', '--check');
     check(await git(conflict.path, 'diff', '--name-only', '--diff-filter=U') === '', 'CONFLICT_UNRESOLVED');
     const gate = await this.gate(run, 'integration', conflict.path);
-    if (gate.status !== 'passed') return gate;
+    if (!acceptedGate(gate)) return gate;
     this.checkpointIntent(run);
     await git(conflict.path, 'commit', '--no-edit');
     const parents = (await git(conflict.path, 'show', '-s', '--format=%P', 'HEAD')).split(' ');
     check(parents.length === 2 && parents[0] === conflict.expected && parents[1] === conflict.taskHead, 'MERGE_PARENTS_MISMATCH');
     await git(run.integrationPath, 'merge', '--ff-only', conflict.branch);
-    task.state = 'INTEGRATED'; run.conflict = undefined; run.reviews = [];
+    task.state = 'INTEGRATED'; run.integrationSha = await git(run.integrationPath, 'rev-parse', 'HEAD'); run.conflict = undefined; run.reviews = [];
     run.state = Object.values(run.tasks).every(work => work.state === 'INTEGRATED') ? 'VERIFYING' : 'EXECUTING';
     return { state: run.state, sha: await git(run.integrationPath, 'rev-parse', 'HEAD') };
   }
   async verify(run: Run) {
     check(run.state === 'VERIFYING' || run.state === 'REVIEWING', 'INVALID_RUN_STATE');
     const gate = await this.gate(run, 'integration', run.integrationPath);
-    run.state = gate.status === 'passed' ? 'REVIEWING' : 'BLOCKED_TESTS'; return gate;
+    run.state = acceptedGate(gate) ? 'REVIEWING' : 'BLOCKED_TESTS'; return gate;
   }
   async review(run: Run, input: unknown, final = false) {
     check(run.state === (final ? 'FINAL_AUDIT' : 'REVIEWING'), 'INVALID_RUN_STATE');
     const review = reviewSchema.parse(input), current = await git(run.integrationPath, 'rev-parse', 'HEAD');
     check(review.reviewed_sha === current, 'REVIEW_STALE');
-    check(run.gates.some(gate => gate.stage === 'integration' && gate.sha === current && gate.status === 'passed' && gate.commands === hash(run.config.quality.commands)), 'VALIDATION_STALE');
+    check(run.gates.some(gate => gate.stage === 'integration' && gate.sha === current && acceptedGate(gate) && gate.commands === hash(run.config.quality.commands)), 'VALIDATION_STALE');
     check(run.gates.filter(gate => gate.stage === 'integration').at(-1)?.source === await sourceFingerprint(run.integrationPath), 'VALIDATION_STALE');
-    check(!Object.values(run.tasks).some(task => task.nativeId === review.reviewer_id), 'REVIEW_NOT_INDEPENDENT');
+    check(!run.implementers?.includes(review.reviewer_id) && !Object.values(run.tasks).some(task => task.nativeId === review.reviewer_id), 'REVIEW_NOT_INDEPENDENT');
     check(!final || !run.reviews.some(item => item.reviewer === review.reviewer_id), 'AUDIT_NOT_INDEPENDENT');
     check(run.plan?.acceptance.every(item => review.acceptance_ids.includes(item.id)), 'UNMAPPED_ACCEPTANCE');
-    check(review.findings.every(finding => run.plan?.acceptance.some(item => finding.acceptance_ids.includes(item.id))), 'UNKNOWN_ACCEPTANCE');
-    const incoming = review.findings.map(finding => ({ ...finding, fingerprint: hash([finding.path, finding.symbol, finding.category, finding.acceptance]), lifecycle: 'OPEN' }));
+    check(new Set(review.findings.map(finding => finding.id)).size === review.findings.length, 'DUPLICATE_FINDING');
+    check(review.findings.every(finding => finding.line_end >= finding.line_start && finding.acceptance_ids.every(key => run.plan?.acceptance.some(item => item.id === key))), 'UNKNOWN_ACCEPTANCE');
+    const incoming = review.findings.map(finding => ({ ...finding, fingerprint: hash([finding.path, finding.symbol, finding.category, finding.acceptance]), lifecycle: 'OPEN', seenRounds: [run.reviewRound] }));
     for (const finding of incoming) {
       const old = run.findings.find(item => item.id === finding.id || item.fingerprint === finding.fingerprint);
-      if (old) Object.assign(old, finding, { id: old.id, lifecycle: old.lifecycle === 'VERIFIED_FIXED' ? 'REOPENED' : 'OPEN' });
-      else run.findings.push(finding);
+      if (old) {
+        const rank = { low: 0, medium: 1, high: 2, critical: 3 };
+        check(rank[finding.severity] >= rank[old.severity], 'FINDING_SEVERITY_DOWNGRADE');
+        Object.assign(old, finding, { seenRounds: [...new Set([...(old.seenRounds ?? [0]), run.reviewRound])], id: old.id, lifecycle: old.lifecycle === 'VERIFIED_FIXED' ? 'REOPENED' : 'OPEN' });
+      } else run.findings.push(finding);
     }
     // Absence is only accepted after an independent full review of the same verified SHA.
     for (const finding of run.findings) if (finding.lifecycle === 'FIX_PROPOSED' && !incoming.some(item => item.fingerprint === finding.fingerprint || item.id === finding.id)) finding.lifecycle = 'VERIFIED_FIXED';
     const blocking = run.findings.some(finding => finding.lifecycle !== 'VERIFIED_FIXED' && run.config.review.block_on.includes(finding.severity));
-    run.reviews.push({ sha: current, reviewer: review.reviewer_id, final });
-    if (blocking || review.decision === 'changes_requested') run.state = run.reviewRound >= run.config.execution.max_review_rounds ? 'BLOCKED_REVIEW_LIMIT' : 'REPAIR_PLANNING';
+    run.reviews.push({ sha: current, reviewer: review.reviewer_id, final, acceptanceIds: review.acceptance_ids, decision: review.decision, limitations: review.limitations });
+    if (blocking || review.decision === 'changes_requested') run.state = run.reviewRound >= run.config.execution.max_review_rounds ? 'BLOCKED_REVIEW_LIMIT' : run.findings.some(finding => finding.lifecycle !== 'VERIFIED_FIXED' && (finding.seenRounds?.length ?? 1) >= run.config.execution.max_repeated_finding_rounds) ? 'BLOCKED_REPEATED_FINDING' : 'REPAIR_PLANNING';
     else run.state = final ? 'READY_TO_FINALIZE' : 'FINAL_AUDIT';
     return { state: run.state, findings: run.findings };
   }
-  async repair(run: Run, input: unknown, findingIds: string[]) {
-    check(run.state === 'REPAIR_PLANNING' && run.reviewRound < run.config.execution.max_review_rounds, 'BLOCKED_REVIEW_LIMIT');
+  async repair(run: Run, input: unknown, findingIds: string[], analysis?: string) {
+    check(['REPAIR_PLANNING', 'BLOCKED_REPEATED_FINDING'].includes(run.state) && run.reviewRound < run.config.execution.max_review_rounds, 'BLOCKED_REVIEW_LIMIT');
+    if (run.state === 'BLOCKED_REPEATED_FINDING') { check(typeof analysis === 'string' && analysis.trim(), 'REANALYSIS_REQUIRED'); run.repairAnalyses ??= []; run.repairAnalyses.push({ round: run.reviewRound, analysis }); }
     const plan = validatePlan(input);
+    check(run.requirements && plan.acceptance.every(item => run.requirements!.acceptance.some(required => required.id === item.id && required.text === item.text)), 'REQUIREMENTS_PLAN_MISMATCH');
     check(plan.tasks.every(task => !run.tasks[task.id]), 'DUPLICATE_ID');
     const unresolved = run.findings.filter(finding => finding.lifecycle !== 'VERIFIED_FIXED' && run.config.review.block_on.includes(finding.severity));
     check(unresolved.every(finding => findingIds.includes(finding.id) && plan.tasks.some(task => owns(task.write_paths, finding.path))), 'FINDING_UNMAPPED');
@@ -317,19 +505,36 @@ export class Engine {
     for (const spec of plan.tasks) run.tasks[spec.id] = { spec, state: 'PENDING', base: '', path: '', branch: '', attempt: 0, lease: '', expires: 0, nativeId: null, units: {}, validated: null };
     run.reviewRound++; run.state = 'EXECUTING'; return { state: run.state, round: run.reviewRound };
   }
+  async waiveGate(run: Run, stage: 'baseline' | 'task' | 'integration' | 'final', gateId: string, taskId: string | null, reason: string, approved: boolean) {
+    check(approved && reason.trim(), 'APPROVAL_REQUIRED');
+    const command = run.config.quality.commands.find(item => item.id === gateId && item.stages.includes(stage)); check(command, 'GATE_NOT_FOUND');
+    check(stage === 'task' ? taskId && run.tasks[taskId] : taskId === null, 'GATE_SCOPE_MISMATCH');
+    const path = stage === 'baseline' ? run.origin : stage === 'task' ? run.tasks[taskId!].path : run.integrationPath;
+    const waiver = { stage, taskId, gateId, sha: await git(path, 'rev-parse', 'HEAD'), source: await sourceFingerprint(path), command: hash(command), reason, actor: 'user' as const, approvedAt: new Date().toISOString() };
+    run.waivers ??= []; run.waivers.push(waiver);
+    if (run.state === 'BLOCKED_BASELINE') run.state = 'PREFLIGHT';
+    if (run.state === 'BLOCKED_TESTS') run.state = stage === 'final' ? 'READY_TO_FINALIZE' : 'VERIFYING';
+    return waiver;
+  }
+  async preapproveFinalization(run: Run, target: string, approved: boolean) {
+    check(approved, 'APPROVAL_REQUIRED');
+    check(!['COMPLETED', 'CANCELLED', 'FAILED'].includes(run.state) && target === run.target, 'APPROVAL_SCOPE_MISMATCH');
+    run.finalizationApproval = { actor: 'user', target, runId: run.id, approvedAt: new Date().toISOString() };
+    return { policy: 'auto_on_success', approval: run.finalizationApproval };
+  }
   async finalize(run: Run, approved: boolean, expectedTarget: string) {
     check(run.state === 'READY_TO_FINALIZE', 'INVALID_RUN_STATE');
-    check(approved, 'APPROVAL_REQUIRED');
+    check(approved || run.finalizationApproval?.actor === 'user' && run.finalizationApproval.runId === run.id && run.finalizationApproval.target === run.target, 'APPROVAL_REQUIRED');
     const repo = await inspectRepository(run.origin), head = await git(run.integrationPath, 'rev-parse', 'HEAD');
     check(repo.branch === run.target && repo.head === run.targetBase && repo.head === expectedTarget, 'TARGET_DRIFT');
     check(!repo.dirty && !(await inspectRepository(run.integrationPath)).dirty, 'DIRTY_CHECKOUT');
     check(run.reviews.some(review => review.sha === head && review.final), 'REVIEW_STALE');
     const gate = await this.gate(run, 'final', run.integrationPath);
-    if (gate.status !== 'passed') { run.state = 'BLOCKED_TESTS'; return gate; }
+    if (!acceptedGate(gate)) { run.state = 'BLOCKED_TESTS'; return gate; }
     this.checkpointIntent(run);
     await git(run.origin, 'merge', '--ff-only', run.integration);
     check(await git(run.origin, 'rev-parse', 'HEAD') === head, 'FINALIZE_MISMATCH');
-    run.state = 'COMPLETED'; return { sha: head, cleanupStatus: 'not_requested' };
+    run.finalizedAt = new Date().toISOString(); run.state = 'COMPLETED'; return { sha: head, cleanupStatus: 'not_requested' };
   }
   async cleanup(run: Run, dryRun = true) {
     const resources = [...(run.candidates ?? []).map(candidate => ({ ...candidate, active: false })), ...Object.values(run.tasks).filter(task => task.path).map(task => ({ path: task.path, branch: task.branch, active: ['LEASED', 'RUNNING', 'ORPHANED_UNKNOWN'].includes(task.state) })), { path: run.integrationPath, branch: run.integration, active: false }];
@@ -354,26 +559,29 @@ export class Engine {
       run.cleanup = results;
       if (results.every(item => ['removed', 'absent'].includes(item.status))) {
         const lock = join(run.commonDir, 'orch', 'locks', 'write.json');
-        const owner = JSON.parse(await readFile(lock, 'utf8')) as { runId: string };
-        check(owner.runId === run.id, 'LOCK_OWNERSHIP_MISMATCH'); await rm(lock);
+        const text = await readFile(lock, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+        const owner = text ? JSON.parse(text) as { runId: string } : null;
+        if (owner?.runId === run.id) await rm(lock);
       }
     }
     return results;
   }
-  async control(run: Run, action: 'pause' | 'cancel' | 'resume', stoppedAgents: string[] = []) {
+  async control(run: Run, action: 'pause' | 'cancel' | 'resume', stoppedAgents: string[] = [], neverStartedTasks: string[] = []) {
     if (action === 'pause' || action === 'cancel') {
       check(!['COMPLETED', 'CANCELLED', 'PAUSED'].includes(run.state), 'INVALID_RUN_STATE');
-      run.pausedFrom = run.state;
+      run.pauseStartedAt = Date.now(); run.pausedFrom = run.state;
       run.state = action === 'pause' ? 'PAUSED' : 'CANCELLED';
-      for (const task of Object.values(run.tasks)) if (['LEASED', 'RUNNING'].includes(task.state)) task.state = 'ORPHANED_UNKNOWN';
+      for (const task of Object.values(run.tasks)) if (['LEASED', 'RUNNING'].includes(task.state)) { task.pausedState = task.state; task.state = 'ORPHANED_UNKNOWN'; }
     } else {
       check(['PAUSED', 'CANCELLED'].includes(run.state), 'INVALID_RUN_STATE');
       for (const task of Object.values(run.tasks)) if (task.state === 'ORPHANED_UNKNOWN') {
-        check(task.nativeId && stoppedAgents.includes(task.nativeId), 'ORPHANED_UNKNOWN');
+        check(task.nativeId ? stoppedAgents.includes(task.nativeId) : task.pausedState === 'LEASED' && neverStartedTasks.includes(task.spec.id), 'ORPHANED_UNKNOWN');
         check(!(await inspectRepository(task.path)).dirty, 'DIRTY_RECOVERY_PRESERVED');
-        task.state = Object.keys(task.units).length ? 'MERGE_QUEUED' : 'RETRYABLE_FAILED';
+        if (task.spec.commit_units.every(unit => task.units[unit.id])) { await this.verifySubmission(run, task); task.state = 'MERGE_QUEUED'; }
+        else task.state = 'RETRYABLE_FAILED';
       }
-      run.state = run.pausedFrom || 'EXECUTING';
+      run.pauseTimeMs = (run.pauseTimeMs ?? 0) + (run.pauseStartedAt === undefined ? 0 : Math.max(0, Date.now() - run.pauseStartedAt));
+      run.pauseStartedAt = undefined; run.state = run.pausedFrom || 'EXECUTING';
     }
     return { state: run.state };
   }

@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { join, win32 } from 'node:path';
 import { configSchema, configPatchSchema } from '../../../protocol/src/config.ts';
 import type { ConfigPatch } from '../../../protocol/src/config.ts';
+import { configHash } from './hash.ts';
 
 export function parseConfig(source: string): ConfigPatch {
   if (Buffer.byteLength(source) > 1024 * 1024) throw new Error('CONFIG_INVALID: file exceeds 1 MiB');
@@ -19,7 +20,21 @@ export function parseConfig(source: string): ConfigPatch {
   }
 }
 
-type Scope = 'global' | 'project' | 'session';
+function parseLayer(value: unknown): ConfigPatch {
+  function assertPlainData(item: unknown) {
+    if (item === null || typeof item !== 'object') return;
+    const prototype = Object.getPrototypeOf(item);
+    if (prototype !== null && prototype !== (Array.isArray(item) ? Array.prototype : Object.prototype)) throw new Error();
+    for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(item))) {
+      if (!('value' in descriptor)) throw new Error();
+      assertPlainData(descriptor.value);
+    }
+  }
+  try { assertPlainData(value); return configPatchSchema.parse(value); }
+  catch { throw new Error('CONFIG_INVALID: expected plain configuration data with known keys and valid types'); }
+}
+
+export type Scope = 'global' | 'project' | 'session';
 
 export function resolveConfig(layers: Partial<Record<Scope, unknown>> = {}) {
   const config: Record<string, unknown> = {};
@@ -38,7 +53,7 @@ export function resolveConfig(layers: Partial<Record<Scope, unknown>> = {}) {
   }
   merge(config, configSchema.parse(parseConfig(readFileSync(new URL('../../../../templates/defaults/config.yaml', import.meta.url), 'utf8'))), 'default');
   for (const scope of ['global', 'project', 'session'] as const) {
-    if (layers[scope] !== undefined) merge(config, configPatchSchema.parse(layers[scope]), scope);
+    if (Object.hasOwn(layers, scope) && layers[scope] !== undefined) merge(config, parseLayer(layers[scope]), scope);
   }
   const resolved = configSchema.parse(config);
   const ids = resolved.quality.commands.map(command => command.id);
@@ -59,14 +74,17 @@ export function globalConfigPath(env: NodeJS.ProcessEnv = process.env, platform 
 export async function loadConfig(originRoot: string | null, globalFile = globalConfigPath()) {
   const files = { global: globalFile, project: originRoot === null ? null : join(originRoot, '.orch', 'config.yaml') };
   const layers: Partial<Record<Scope, unknown>> = {};
+  const hashes = { global: configHash(null), project: files.project === null ? null : configHash(null) };
   for (const scope of ['global', 'project'] as const) {
     const file = files[scope];
     if (file === null) continue;
     try {
-      layers[scope] = parseConfig(await readFile(file, 'utf8'));
+      const source = await readFile(file, 'utf8');
+      layers[scope] = parseConfig(source);
+      hashes[scope] = configHash(source);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
   }
-  return { ...resolveConfig(layers), files };
+  return { ...resolveConfig(layers), files, layers, hashes };
 }

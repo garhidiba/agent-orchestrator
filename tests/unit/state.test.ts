@@ -21,3 +21,15 @@ test('state survives reopening, rejects stale writes and journals duplicate oper
     assert.equal(store.db.prepare('SELECT count(*) AS n FROM events').get()?.n, 2);
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('idempotency fingerprints ignore JSON property order and missing intents cannot commit state', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'orch-state-'));
+  const store = new Store(join(dir, 'state.db'));
+  try {
+    store.create('run', { state: 'CREATED' });
+    store.intent('run', 'op', { a: 1, nested: { b: 2, c: 3 } });
+    assert.equal(store.intent('run', 'op', { nested: { c: 3, b: 2 }, a: 1 })?.status, 'pending');
+    assert.throws(() => store.save('run', 0, { state: 'FAILED' }, 'invalid', 'unknown', {}), /OPERATION_NOT_PENDING/);
+    assert.equal(store.get<{ state: string }>('run').data.state, 'CREATED');
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});

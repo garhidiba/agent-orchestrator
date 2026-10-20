@@ -37,3 +37,30 @@ test('file loading keeps origin scope, records paths, and never changes settings
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('resolved file layers carry hashes of that read with distinct missing scope semantics', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'orch-config-hash-'));
+  try {
+    const global = join(dir, 'global.yaml'), project = join(dir, '.orch', 'config.yaml');
+    const source = '# retained bytes\nmodel_selection: {profile: economy}\n';
+    const { configHash } = await import('../../packages/core/src/config/hash.ts');
+    const { configHash: compatibilityHash, patchConfig } = await import('../../packages/core/src/config/write.ts');
+    assert.equal(configHash, compatibilityHash);
+    const missing = await loadConfig(dir, global);
+    assert.deepEqual(missing.hashes, { global: configHash(null), project: configHash(null) });
+    const outside = await loadConfig(null, global);
+    assert.equal(outside.hashes.project, null);
+    assert.equal(outside.hashes.global, configHash(null));
+    await writeFile(global, source); await mkdir(join(dir, '.orch')); await writeFile(project, '');
+    const loaded = await loadConfig(dir, global);
+    assert.deepEqual(loaded.hashes, { global: configHash(source), project: configHash('') });
+    assert.equal(loaded.config.model_selection.profile, 'economy');
+    await writeFile(global, 'model_selection: {profile: fast}\n');
+    assert.equal(loaded.hashes.global, configHash(source));
+    assert.equal(loaded.config.model_selection.profile, 'economy');
+    await assert.rejects(patchConfig(global, loaded.hashes.global, [{ path: ['model_selection', 'profile'], value: 'quality' }], [], { scope: 'global', layers: loaded.layers }), /CONFIG_CONFLICT/);
+    const changed = await loadConfig(dir, global);
+    assert.notEqual(changed.hashes.global, loaded.hashes.global);
+    assert.equal(changed.config.model_selection.profile, 'fast');
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

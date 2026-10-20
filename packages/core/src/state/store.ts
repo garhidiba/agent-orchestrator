@@ -1,16 +1,28 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { requireCondition } from '../../../protocol/src/runtime.ts';
 
-export const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+export const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value, (_key, item: unknown) =>
+  item !== null && typeof item === 'object' && !Array.isArray(item) ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item)).digest('hex');
 
 export class Store {
   db: DatabaseSync;
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
+    if (existsSync(path)) {
+      requireCondition(lstatSync(path).isFile() && !lstatSync(path).isSymbolicLink(), 'STATE_PATH_UNSAFE');
+      if (lstatSync(path).size > 0) {
+        const probe = new DatabaseSync(path, { readOnly: true });
+        try {
+          requireCondition(probe.prepare('PRAGMA application_id').get()?.application_id === 0x4f524348, 'STATE_DATABASE_UNOWNED');
+          requireCondition((probe.prepare('SELECT version FROM metadata').get() as { version: number }).version <= 2, 'STATE_VERSION_UNSUPPORTED');
+        } finally { probe.close(); }
+      }
+    }
     this.db = new DatabaseSync(path);
+    this.db.exec('PRAGMA application_id=0x4f524348');
     const existing = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='metadata'").get();
     if (existing) requireCondition((this.db.prepare('SELECT version FROM metadata').get() as { version: number }).version <= 2, 'STATE_VERSION_UNSUPPORTED');
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
@@ -59,13 +71,21 @@ export class Store {
       snapshot: row.snapshot ? JSON.parse(row.snapshot as string) as unknown : null,
     }));
   }
+  reject(run: string, operation: string, code: string) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare("UPDATE operations SET status='rejected',result=? WHERE run_id=? AND id=? AND status='pending'").run(JSON.stringify({ code }), run, operation);
+      this.event(run, 'operation.rejected', { operation, code }); this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
   save<T>(run: string, version: number, data: T, type: string, operation: string, result: unknown) {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const change = this.db.prepare('UPDATE runs SET version=version+1,data=? WHERE id=? AND version=?').run(JSON.stringify(data), run, version);
       requireCondition(change.changes === 1, 'STATE_CONFLICT');
-      this.event(run, type, { operation });
-      this.db.prepare('UPDATE operations SET status=\'complete\',result=? WHERE run_id=? AND id=?').run(JSON.stringify(result), run, operation);
+      this.event(run, type, { operation, state: (data as { state?: string }).state ?? null });
+      const completion = this.db.prepare('UPDATE operations SET status=\'complete\',result=? WHERE run_id=? AND id=? AND status=\'pending\'').run(JSON.stringify(result), run, operation);
+      requireCondition(completion.changes === 1, 'OPERATION_NOT_PENDING');
       this.db.exec('COMMIT');
       return result;
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }

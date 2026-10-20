@@ -28,3 +28,15 @@ createInterface({input:process.stdin}).on('line',line=>{
     await assert.rejects(discoverCodexModels(join(dir, 'absent')), /CATALOG_PROCESS_FAILED/);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test('Codex rejects malformed advertised fields and preserves split UTF-8', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'orch-catalog-')), file = join(dir, 'host.mjs');
+  try {
+    for (const entry of [{ id: 'x', hidden: 'false' }, { id: 'x', supportedReasoningEfforts: {} }, { id: 'x', model: 1 }]) {
+      await writeFile(file, `#!${process.execPath}\nimport{createInterface}from'node:readline';createInterface({input:process.stdin}).on('line',l=>{const m=JSON.parse(l);if(m.id)console.log(JSON.stringify({id:m.id,result:m.method==='initialize'?{}:{data:[${JSON.stringify(entry)}]}}))});`, { mode: 0o700 });
+      await assert.rejects(discoverCodexModels(file), /CATALOG_INVALID/);
+    }
+    await writeFile(file, `#!${process.execPath}\nimport{createInterface}from'node:readline';createInterface({input:process.stdin}).on('line',l=>{const m=JSON.parse(l);if(!m.id)return;const b=Buffer.from(JSON.stringify({id:m.id,result:m.method==='initialize'?{}:{data:[{id:'한글'}]}})+'\\n');let i=b.indexOf(Buffer.from('한'));if(i<0)i=1;process.stdout.write(b.subarray(0,i+1));setTimeout(()=>process.stdout.write(b.subarray(i+1)),5)});`, { mode: 0o700 });
+    assert.equal((await discoverCodexModels(file)).models[0].id, '한글');
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

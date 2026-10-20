@@ -2,6 +2,11 @@ import { writeFile } from 'node:fs/promises';
 import { z } from 'zod';
 import { configPatchSchema, configSchema } from './config.ts';
 
-for (const [name, schema] of [['config', configPatchSchema], ['effective-config', configSchema]] as const) {
+import { requirementsSchema, taskSchema, planSchema, taskResultSchema, gateResultSchema, reviewSchema, recommendationSchema, envelopeSchema } from './runtime.ts';
+
+for (const [name, schema] of [['config', configPatchSchema], ['effective-config', configSchema],
+  ['requirements', requirementsSchema], ['task', taskSchema], ['plan', planSchema],
+  ['task-result', taskResultSchema], ['gate-result', gateResultSchema], ['review', reviewSchema],
+  ['recommendation', recommendationSchema], ['write-envelope', envelopeSchema]] as const) {
   await writeFile(new URL(`../schemas/${name}.schema.json`, import.meta.url), `${JSON.stringify(z.toJSONSchema(schema), null, 2)}\n`);
 }

@@ -1,26 +1,37 @@
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { readFile, mkdir, writeFile } from 'node:fs/promises';
+import { lstat, readFile, mkdir, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { Engine } from '../../core/src/runtime/engine.ts';
 import { loadConfig, globalConfigPath } from '../../core/src/config/index.ts';
+import { createSessionConfig } from '../../core/src/config/session.ts';
 import { patchConfig } from '../../core/src/config/write.ts';
 import { detectHost } from '../../installer/src/detection/host.ts';
-import { discoverCodexModels } from '../../host-codex/src/catalog.ts';
-import { discoverClaudeModels } from '../../host-claude/src/catalog.ts';
-import { envelopeSchema, id, planSchema, reviewSchema, requireCondition as check } from '../../protocol/src/runtime.ts';
+import { getCatalogForHost } from '../../core/src/model-registry/service.ts';
+import { inspectCodexNativeControl } from '../../host-codex/src/capabilities.ts';
+import { buildReport, writeReport } from '../../core/src/reporting/index.ts';
+import { git } from '../../core/src/git/repository.ts';
+import { envelopeSchema, id, requirementsSchema, planSchema, reviewSchema, taskResultSchema, requireCondition as check } from '../../protocol/src/runtime.ts';
 import type { Run } from '../../core/src/runtime/engine.ts';
 
-export async function createServer(origin: string, host: 'codex' | 'claude', managedRoot: string, tokenPath: string) {
+export async function createServer(origin: string | null, host: 'codex' | 'claude', managedRoot: string, tokenPath: string) {
   await mkdir(join(tokenPath, '..'), { recursive: true });
   try { await writeFile(tokenPath, randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o600 }); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+  const tokenFile = await lstat(tokenPath);
+  check(tokenFile.isFile() && !tokenFile.isSymbolicLink() && tokenFile.size <= 128 && (process.platform === 'win32' || (tokenFile.mode & 0o077) === 0), 'COORDINATOR_TOKEN_UNSAFE');
   const token = (await readFile(tokenPath, 'utf8')).trim();
-  check(token.length >= 32, 'COORDINATOR_TOKEN_INVALID');
+  check(/^[a-f0-9]{64}$/.test(token), 'COORDINATOR_TOKEN_INVALID');
   const server = new McpServer({ name: 'orch', version: '0.1.0' }, { maxToolInputElements: 20000 });
   let engine: Engine | null = null;
-  const runtime = () => engine ??= new Engine(join(origin, '.orch', 'state', 'state.db'));
+  const session = createSessionConfig();
+  const configuration = async () => {
+    const loaded = await loadConfig(origin), snapshot = session.snapshot(loaded.layers);
+    return { ...loaded, config: snapshot.effective, sources: snapshot.sources, layers: { ...loaded.layers, session: snapshot.config }, hashes: { ...loaded.hashes, session: snapshot.hash }, sessionRevision: snapshot.revision };
+  };
+  const runtime = (readOnly = false) => { check(origin, 'PROJECT_REQUIRED'); const path = join(origin, '.orch', 'state', 'state.db'); check(!readOnly || engine || existsSync(path), 'RUN_NOT_FOUND'); return engine ??= new Engine(path, null, async () => (await configuration()).config); };
   const authenticate = (value: string) => {
     const incoming = Buffer.from(value), expected = Buffer.from(token);
     check(incoming.length === expected.length && timingSafeEqual(incoming, expected), 'COORDINATOR_RELAY_REQUIRED');
@@ -44,26 +55,33 @@ export async function createServer(origin: string, host: 'codex' | 'claude', man
   function mutation<S extends z.ZodRawShape>(name: string, input: S, fn: (run: Run, data: z.infer<z.ZodObject<S>>) => Promise<unknown>) {
     register(name, { ...envelopeSchema.shape, ...auth, input: z.strictObject(input) }, async data => {
       authenticate(data.coordinator_token);
+      const { coordinator_token: _authorization, ...request } = data;
+      envelopeSchema.parse(request);
       return runtime().change(data.run_id, data.operation_id, data.expected_state_version, { tool: name, input: data.input }, run => fn(run, data.input as z.infer<z.ZodObject<S>>));
     });
   }
-  register('orch_environment', {}, async () => ({ installation: 'development', host: await detectHost(host), coordinatorTokenRef: tokenPath, nativeDispatch: 'BLOCKED_CAPABILITY', originRoot: origin }));
-  register('orch_models', { refresh: z.boolean().default(false) }, async () => host === 'codex' ? discoverCodexModels() : discoverClaudeModels());
+  register('orch_environment', {}, async () => ({ installation: 'development', host: await detectHost(host), coordinatorTokenRef: tokenPath, nativeDispatch: 'BLOCKED_CAPABILITY', nativeControl: host === 'codex' ? await inspectCodexNativeControl() : { reason: 'CURRENT_SESSION_NATIVE_CONTROL_UNVERIFIED', executionReady: false }, originRoot: origin }));
+  register('orch_models', { refresh: z.boolean().default(false) }, async data => getCatalogForHost(origin, host, { refresh: data.refresh }));
   register('orch_config', { action: z.enum(['effective', 'patch', 'unset']), ...auth,
-    scope: z.enum(['project', 'global']).default('project'), expected_hash: z.string().optional(),
+    scope: z.enum(['project', 'global', 'session']).default('project'), dry_run: z.boolean().default(false), expected_hash: z.string().optional(),
     patches: z.array(z.strictObject({ path: z.array(z.string()).min(1), value: z.unknown().optional(), remove: z.boolean().optional() })).default([]),
   }, async data => {
-    if (data.action === 'effective') return loadConfig(origin);
+    if (data.action === 'effective') return configuration();
     authenticate(data.coordinator_token); check(data.expected_hash, 'CONFIG_HASH_REQUIRED');
-    // Concrete model edits remain blocked until a same-context, provider-verified catalog exists.
-    return patchConfig(data.scope === 'global' ? globalConfigPath() : join(origin, '.orch', 'config.yaml'), data.expected_hash,
-      data.patches.map(patch => ({ ...patch, remove: data.action === 'unset' || patch.remove })));
+    if (data.scope === 'project') check(origin, 'PROJECT_REQUIRED');
+    const loaded = await configuration();
+    const catalog = await getCatalogForHost(origin, host);
+    const patches = data.patches.map(patch => ({ ...patch, remove: data.action === 'unset' || patch.remove }));
+    if (data.scope === 'session') return session.patch(data.expected_hash, patches, catalog.models, { layers: loaded.layers, dryRun: data.dry_run });
+    return patchConfig(data.scope === 'global' ? globalConfigPath() : join(origin!, '.orch', 'config.yaml'), data.expected_hash,
+      patches, catalog.models, { scope: data.scope, layers: loaded.layers, dryRun: data.dry_run });
   });
-  register('orch_run_create', { ...auth, trusted_commands_hash: z.string() }, async data => {
-    authenticate(data.coordinator_token); const config = await loadConfig(origin);
-    return runtime().create(origin, config.config, host, managedRoot, data.trusted_commands_hash);
+  register('orch_run_create', { ...auth, trusted_commands_hash: z.string(), missing_tests_waiver: z.strictObject({ approved: z.literal(true), reason: z.string().min(1).max(4096) }).optional() }, async data => {
+    authenticate(data.coordinator_token); check(origin, 'PROJECT_REQUIRED'); const config = await configuration();
+    return runtime().create(origin, config.config, host, managedRoot, data.trusted_commands_hash, { missingTestsWaiver: data.missing_tests_waiver });
   });
-  register('orch_run_status', scoped, async data => runtime().status(data.run_id));
+  register('orch_run_status', scoped, async data => { const snapshot = runtime(true).status(data.run_id); return { ...snapshot, readyTasks: runtime().ready(snapshot.data), dispatchBlocked: 'BLOCKED_CAPABILITY', pendingOperations: runtime().store.pending(data.run_id).map(item => item.id) }; });
+  mutation('orch_requirements_submit', { requirements: requirementsSchema }, (run, data) => runtime().submitRequirements(run, data.requirements));
   mutation('orch_plan_submit', { plan: planSchema, approved: z.boolean() }, (run, data) => runtime().plan(run, data.plan, data.approved));
   mutation('orch_task_prepare', { task_id: id }, (run, data) => runtime().prepare(run, data.task_id));
   const lease = { task_id: id, lease_id: z.string(), fencing_token: z.int().positive() };
@@ -72,27 +90,33 @@ export async function createServer(origin: string, host: 'codex' | 'claude', man
     const task = runtime().leased(run, data.task_id, data.lease_id, data.fencing_token);
     return { state: task.state, summary: data.summary, leaseRenewed: false };
   });
+  mutation('orch_task_retry', { ...lease, native_stopped: z.boolean(), reason: z.string().min(1).max(4096) }, (run, data) => runtime().retry(run, data.task_id, data.lease_id, data.fencing_token, data.native_stopped, data.reason));
   mutation('orch_task_validate', lease, (run, data) => runtime().validate(run, data.task_id, data.lease_id, data.fencing_token));
   mutation('orch_task_commit', { ...lease, unit_id: id }, (run, data) => runtime().commit(run, data.task_id, data.lease_id, data.fencing_token, data.unit_id));
-  mutation('orch_task_complete', { ...lease, native_stopped: z.boolean() }, (run, data) => runtime().complete(run, data.task_id, data.lease_id, data.fencing_token, data.native_stopped));
+  mutation('orch_task_complete', { ...lease, native_stopped: z.boolean(), result: taskResultSchema }, (run, data) => runtime().complete(run, data.task_id, data.lease_id, data.fencing_token, data.native_stopped, data.result ?? null));
   mutation('orch_integrate', { task_id: id, expected_integration_sha: z.string() }, (run, data) => runtime().integrate(run, data.task_id, data.expected_integration_sha));
   mutation('orch_conflict_resolve', { native_stopped: z.boolean() }, (run, data) => runtime().resolveConflict(run, data.native_stopped));
   register('orch_reconcile', { ...auth, run_id: id, operation_id: id, previous_coordinator_stopped: z.boolean() }, async data => { authenticate(data.coordinator_token); return runtime().reconcile(data.run_id, data.operation_id, data.previous_coordinator_stopped); });
   mutation('orch_verify', {}, run => runtime().verify(run));
   register('orch_review_snapshot', scoped, async data => {
-    const snapshot = runtime().status(data.run_id); return { version: snapshot.version, plan: snapshot.data.plan, gates: snapshot.data.gates, findings: snapshot.data.findings, integrationPath: snapshot.data.integrationPath };
+    const snapshot = runtime(true).status(data.run_id); return { reviewedSha: await git(snapshot.data.integrationPath, 'rev-parse', 'HEAD'), version: snapshot.version, plan: snapshot.data.plan, gates: snapshot.data.gates, findings: snapshot.data.findings, integrationPath: snapshot.data.integrationPath };
   });
   mutation('orch_review_submit', { review: reviewSchema, final: z.boolean().default(false) }, (run, data) => runtime().review(run, data.review, data.final));
-  mutation('orch_repair_plan_submit', { plan: planSchema, finding_ids: z.array(id) }, (run, data) => runtime().repair(run, data.plan, data.finding_ids));
-  mutation('orch_run_control', { action: z.enum(['pause', 'cancel', 'resume']), stopped_agents: z.array(id).default([]) }, (run, data) => runtime().control(run, data.action, data.stopped_agents));
+  mutation('orch_repair_plan_submit', { plan: planSchema, finding_ids: z.array(id), analysis: z.string().min(1).max(8192).optional() }, (run, data) => runtime().repair(run, data.plan, data.finding_ids, data.analysis));
+  mutation('orch_run_control', { action: z.enum(['pause', 'cancel', 'resume']), stopped_agents: z.array(id).default([]), never_started_tasks: z.array(id).default([]) }, (run, data) => runtime().control(run, data.action, data.stopped_agents, data.never_started_tasks));
+  mutation('orch_gate_waive', { stage: z.enum(['baseline', 'task', 'integration', 'final']), gate_id: id, task_id: id.nullable(), reason: z.string().min(1).max(4096), approved: z.literal(true) }, (run, data) => runtime().waiveGate(run, data.stage, data.gate_id, data.task_id, data.reason, data.approved));
+  mutation('orch_finalize_approve', { approved: z.literal(true), target_branch: z.string().min(1) }, (run, data) => runtime().preapproveFinalization(run, data.target_branch, data.approved));
   mutation('orch_finalize', { approved: z.boolean(), expected_target_sha: z.string() }, (run, data) => runtime().finalize(run, data.approved, data.expected_target_sha));
   mutation('orch_cleanup', { dry_run: z.boolean().default(true) }, (run, data) => runtime().cleanup(run, data.dry_run));
-  register('orch_report', scoped, async data => {
-    const { version, data: run } = runtime().status(data.run_id);
-    return { version, state: run.state, host: run.host, target: run.target, base: run.targetBase, findings: run.findings, gates: run.gates, cleanup: run.cleanup, observedUsage: null, cost: null };
+  register('orch_report', { ...scoped, ...auth, persist: z.boolean().default(false) }, async data => {
+    const { version, data: run } = runtime(true).status(data.run_id);
+    const actual = await git(run.origin, 'rev-parse', '--verify', `refs/heads/${run.target}`).catch(() => null);
+    const report = buildReport(run, version, actual);
+    if (data.persist) { authenticate(data.coordinator_token); return { report, artifacts: await writeReport(run, report) }; }
+    return report;
   });
   server.registerResource('run', new ResourceTemplate('orch://runs/{runId}', { list: undefined }), { mimeType: 'application/json' }, async (uri, vars) => {
-    const runId = id.parse(vars.runId); return { contents: [{ uri: uri.href, text: JSON.stringify(runtime().status(runId)) }] };
+    const runId = id.parse(vars.runId); return { contents: [{ uri: uri.href, text: JSON.stringify(runtime(true).status(runId)) }] };
   });
   server.server.onclose = () => { engine?.store.close(); };
   return server;

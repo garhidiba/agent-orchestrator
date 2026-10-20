@@ -2,14 +2,27 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { realpath } from 'node:fs/promises';
 import { resolve, relative, isAbsolute } from 'node:path';
+import { resolveExecutable } from '../process/executable.ts';
 import { requireCondition } from '../../../protocol/src/runtime.ts';
 const exec = promisify(execFile);
+let executable: { path: string; identity: string } | null = null;
+async function trustedGit(cwd: string) {
+  const resolved = await resolveExecutable('git', { cwd });
+  if (executable) requireCondition(resolved.path === executable.path && resolved.identity === executable.identity, 'GIT_EXECUTABLE_CHANGED');
+  else {
+    const response = await exec(resolved.command, [...resolved.args, '--version'], { env: resolved.env, timeout: 5000, maxBuffer: 16 * 1024, windowsHide: true });
+    requireCondition(/^git version \d/.test(response.stdout), 'GIT_EXECUTABLE_UNAVAILABLE');
+    executable = { path: resolved.path, identity: resolved.identity };
+  }
+  return resolved;
+}
 export async function git(cwd: string, ...args: string[]) {
-  const { stdout } = await exec('git', ['-C', cwd, ...args], {
+  const resolved = await trustedGit(cwd);
+  const { stdout } = await exec(resolved.command, [...resolved.args, '-C', cwd, ...args], {
     encoding: 'utf8', timeout: 30000, maxBuffer: 4 * 1024 * 1024,
-    env: { ...process.env, GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C' },
+    env: { ...resolved.env, GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C' },
   });
-  return stdout.trimEnd();
+  return stdout.endsWith('\n') ? stdout.slice(0, -1) : stdout;
 }
 export async function inspectRepository(cwd: string) {
   const root = await realpath(await git(cwd, 'rev-parse', '--show-toplevel'));
@@ -19,7 +32,7 @@ export async function inspectRepository(cwd: string) {
   const branch = await git(root, 'symbolic-ref', '--short', 'HEAD').catch(() => '');
   requireCondition(branch, 'DETACHED_HEAD');
   const head = await git(root, 'rev-parse', '--verify', 'HEAD').catch(() => '');
-  requireCondition(/^[a-f0-9]{40,64}$/.test(head), 'EMPTY_REPOSITORY');
+  requireCondition(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head), 'EMPTY_REPOSITORY');
   return { root, commonDir, branch, head, dirty: (await git(root, 'status', '--porcelain=v1', '--untracked-files=all')).length > 0 };
 }
 export function within(root: string, path: string) {
