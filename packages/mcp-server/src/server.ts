@@ -11,11 +11,13 @@ import { initializeProjectConfig, patchConfig } from '../../core/src/config/writ
 import { doctor } from '../../installer/src/diagnostics/index.ts';
 import { detectHost } from '../../installer/src/detection/host.ts';
 import { getCatalogForHost } from '../../core/src/model-registry/service.ts';
-import { nativeModelContextSchema, recommendModels } from '../../core/src/runtime/models.ts';
+import { prepareClaudeRoleDefinition, verifyClaudeRoleDefinitions } from '../../core/src/runtime/host-claude.ts';
+import { nativeModelContextSchema, recommendModels, supportedModel } from '../../core/src/runtime/models.ts';
 import { hash } from '../../core/src/state/store.ts';
 import { exportRunEvidence } from '../../core/src/runtime/snapshots.ts';
 import { buildReport, writeReport } from '../../core/src/reporting/index.ts';
 import { git, inspectRepository } from '../../core/src/git/repository.ts';
+import { roleIds } from '../../protocol/src/config.ts';
 import { envelopeSchema, id, nativeAgentId, sha, requirementsSchema, planSchema, reviewSchema, taskResultSchema, hostHeartbeatSchema, findingDispositionSchema, requireCondition as check } from '../../protocol/src/runtime.ts';
 import type { NativeCapability, Run } from '../../core/src/runtime/engine.ts';
 
@@ -84,7 +86,10 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
     check(data.probe.cwd === repo.root && data.probe.origin_root === repo.root && data.probe.branch === repo.branch && data.probe.head === repo.head, 'HOST_CONTEXT_MISMATCH');
     // Trust the authenticated parent's native-tool receipt, not a worker's JSON role or a daemon probe.
     check(!data.native_context?.models || data.native_context.models.every(model => model.host === host) && new Set(data.native_context.models.map(model => model.id)).size === data.native_context.models.length, 'HOST_MODEL_METADATA_MISMATCH');
-    native = { host, model: null, effort: null, ...data.native_context, verified: true, contextMatches: true, source: 'coordinator_native_receipt', evidence: [data.native_tool, data.native_agent_id, repo.root, repo.head] };
+    check(!data.native_context?.claudeRoleDefinitions?.length || host === 'claude', 'HOST_MODEL_METADATA_MISMATCH');
+    const claudeRoleDefinitions = data.native_context?.claudeRoleDefinitions;
+    if (claudeRoleDefinitions?.length) verifyClaudeRoleDefinitions(repo.root, claudeRoleDefinitions);
+    native = { host, model: null, effort: null, ...data.native_context, claudeDefinitionRoot: host === 'claude' ? repo.root : undefined, verified: true, contextMatches: true, source: 'coordinator_native_receipt', evidence: [data.native_tool, data.native_agent_id, repo.root, repo.head] };
     if (engine) engine.native = native;
     return { state: 'READY', source: native.source, host, model: native.model, effort: native.effort, perInvocationModel: native.perInvocationModel ?? false, perInvocationEffort: native.perInvocationEffort ?? false, evidence: native.evidence };
   });
@@ -96,7 +101,10 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
     const repo = await inspectRepository(origin);
     check(data.probe.cwd === repo.root && data.probe.origin_root === repo.root && data.probe.branch === repo.branch && data.probe.head === repo.head, 'HOST_CONTEXT_MISMATCH');
     check(!data.native_context.models || data.native_context.models.every(model => model.host === host) && new Set(data.native_context.models.map(model => model.id)).size === data.native_context.models.length, 'HOST_MODEL_METADATA_MISMATCH');
-    native = { ...native, ...data.native_context, evidence: [...native.evidence.slice(0, 2), repo.root, repo.head] };
+    check(!data.native_context.claudeRoleDefinitions?.length || host === 'claude', 'HOST_MODEL_METADATA_MISMATCH');
+    const claudeRoleDefinitions = data.native_context.claudeRoleDefinitions;
+    if (claudeRoleDefinitions?.length) verifyClaudeRoleDefinitions(repo.root, claudeRoleDefinitions);
+    native = { ...native, ...data.native_context, claudeRoleDefinitions, claudeDefinitionRoot: host === 'claude' ? repo.root : undefined, evidence: [...native.evidence.slice(0, 2), repo.root, repo.head] };
     if (engine) engine.native = native;
     return { state: 'READY', source: native.source, model: native.model, effort: native.effort };
   });
@@ -109,8 +117,20 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
     }
     return [...models.values()];
   };
+  register('orch_claude_role_prepare', { ...auth, role: z.enum(roleIds), expected_hash: z.string(), dry_run: z.boolean().default(false) }, async data => {
+    authenticate(data.coordinator_token); check(origin && native, 'NEEDS_HOST_HANDSHAKE'); check(host === 'claude', 'HOST_TOOL_MISMATCH');
+    const loaded = await configuration(); check(data.expected_hash === loaded.hashes.project, 'CONFIG_CONFLICT');
+    const policy = loaded.config.hosts.claude.roles[data.role];
+    const modelId = ['auto', 'inherit'].includes(policy.model) ? native.model : policy.model;
+    const descriptor = native.models?.find(model => model.id === modelId); check(descriptor, 'MODEL_NOT_SUPPORTED');
+    const model = supportedModel(host, descriptor, Date.now());
+    const effort = policy.effort === 'auto' ? model.defaultEffort : policy.effort === 'inherit' ? native.effort : policy.effort;
+    if (effort !== null) check(model.efforts?.includes(effort), 'EFFORT_NOT_SUPPORTED');
+    const repo = await inspectRepository(origin);
+    return prepareClaudeRoleDefinition({originRoot: repo.root, commonDir: repo.commonDir, role: data.role, model: model.id, effort, dryRun: data.dry_run});
+  });
   register('orch_models', { refresh: z.boolean().default(false) }, async data => ({ ...await getCatalogForHost(origin, host, { refresh: data.refresh }),
-    authenticatedNative: native ? { source: native.source, model: native.model, effort: native.effort, models: native.models ?? [], evidence: native.evidence } : null }));
+    authenticatedNative: native ? { source: native.source, model: native.model, effort: native.effort, models: native.models ?? [], claudeRoleDefinitions: native.claudeRoleDefinitions ?? [], evidence: native.evidence } : null }));
   register('orch_project_init', { ...auth, complete: z.boolean().default(false), dry_run: z.boolean().default(false), profile: z.enum(['balanced', 'quality', 'economy', 'fast']).optional() }, async data => {
     authenticate(data.coordinator_token); check(origin, 'PROJECT_REQUIRED');
     const root = await git(origin, 'rev-parse', '--show-toplevel');

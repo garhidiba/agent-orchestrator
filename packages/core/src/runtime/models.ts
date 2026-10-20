@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { roleIds, type Config } from '../../../protocol/src/config.ts';
 import { requireCondition as check, recommendationSchema } from '../../../protocol/src/runtime.ts';
+import { claudeRoleDefinitionSchema, verifyClaudeRoleDefinitions } from './host-claude.ts';
 import { modelSchema, type Model } from '../model-registry/index.ts';
 export type RoleId = typeof roleIds[number];
 // Only the authenticated coordinator may construct this from the current host tool receipt.
@@ -8,10 +9,11 @@ export const nativeModelContextSchema = z.strictObject({
  host:z.enum(['codex','claude']),verified:z.boolean(),contextMatches:z.boolean(),evidence:z.array(z.string().min(1)),
  perInvocationModel:z.boolean().optional(),perInvocationEffort:z.boolean().optional(),
  model:z.string().min(1).nullable(),effort:z.string().min(1).nullable(),models:z.array(modelSchema).optional(),
+ claudeRoleDefinitions:z.array(claudeRoleDefinitionSchema).max(roleIds.length).optional(),
 });
-export type NativeModelContext = z.infer<typeof nativeModelContextSchema>;
+export type NativeModelContext = z.infer<typeof nativeModelContextSchema> & {claudeDefinitionRoot?:string};
 const automatic = (value: string) => value === 'auto' || value === 'inherit';
-function supported(host: NativeModelContext['host'], value: Model, now: number) {
+export function supportedModel(host: NativeModelContext['host'], value: Model, now: number) {
  const model=modelSchema.parse(value);
  check(model.host===host && model.family===(host==='codex'?'openai':'claude') && model.support!=='unsupported','MODEL_NOT_SUPPORTED');
  check(model.access!=='denied','MODEL_ACCESS_DENIED');
@@ -25,19 +27,28 @@ export function resolveRoleModel(input: {config:Config;host:NativeModelContext['
  check(config.hosts[host].enabled && native.verified && native.contextMatches && native.host===host && native.evidence.length>0,'BLOCKED_CAPABILITY');
  const modelId=automatic(requested.model)?native.model:requested.model;
  const descriptor=modelId===null?undefined:native.models?.find(model=>model.id===modelId);
- // Inheritance needs no invented catalog entry; concrete pins require a current-host descriptor.
- if(!automatic(requested.model)) check(descriptor,'MODEL_NOT_SUPPORTED');
- const model=descriptor?supported(host,descriptor,input.now??Date.now()):undefined;
+ const model=descriptor?supportedModel(host,descriptor,input.now??Date.now()):undefined;
  let effort=requested.effort==='inherit'?native.effort:requested.effort==='auto'?(model?.defaultEffort??null):requested.effort;
  const inheritedEffortMatch=automatic(requested.model) && native.effort!==null && requested.effort===native.effort;
- if(!automatic(requested.effort) && !inheritedEffortMatch) check(model?.efforts?.includes(requested.effort),'EFFORT_NOT_SUPPORTED');
- if(model?.efforts?.length===0) effort=null;
- const nativeArguments:{model?:string;reasoning_effort?:string}={};
- if(!automatic(requested.model)) {check(native.perInvocationModel,'BLOCKED_CAPABILITY');nativeArguments.model=requested.model;}
- if(effort!==null && requested.effort!=='inherit' && !inheritedEffortMatch) {check(native.perInvocationEffort,'BLOCKED_CAPABILITY');nativeArguments.reasoning_effort=effort;}
+ const needsModel=!automatic(requested.model), needsEffort=effort!==null && requested.effort!=='inherit' && !inheritedEffortMatch;
+ const nativeArguments:{model?:string;reasoning_effort?:string;subagent_type?:string}={};
+ const definitionRoute=host==='claude' && (needsModel&&!native.perInvocationModel || needsEffort&&!native.perInvocationEffort || needsModel&&!descriptor);
+ if(definitionRoute) {
+  check(native.claudeDefinitionRoot && native.claudeRoleDefinitions?.length,'CLAUDE_ROLE_DEFINITION_REQUIRED');
+  const definition=verifyClaudeRoleDefinitions(native.claudeDefinitionRoot,native.claudeRoleDefinitions).find(value=>value.role===role);
+  check(definition && definition.model===modelId && definition.effort===effort,'CLAUDE_ROLE_DEFINITION_MISMATCH');
+  nativeArguments.subagent_type=definition.name;
+ } else {
+  // Inheritance needs no invented catalog entry; direct pins need current-host metadata.
+  if(needsModel) check(descriptor,'MODEL_NOT_SUPPORTED');
+  if(!automatic(requested.effort) && !inheritedEffortMatch) check(model?.efforts?.includes(requested.effort),'EFFORT_NOT_SUPPORTED');
+  if(model?.efforts?.length===0) effort=null;
+  if(needsModel) {check(native.perInvocationModel,'BLOCKED_CAPABILITY');nativeArguments.model=requested.model;}
+  if(needsEffort && effort!==null) {check(native.perInvocationEffort,'BLOCKED_CAPABILITY');nativeArguments.reasoning_effort=effort;}
+ }
  return {requestedModel:requested.model,requestedEffort:requested.effort,resolvedModel:modelId,resolvedEffort:effort,
  observedModel:null,observedEffort:null,nativeArguments,status:'pending_observation' as const,
- reasons:[automatic(requested.model)?'Parent model inherited; undisclosed identity remains unknown':'Current-host model option selected', 'Actual application requires host observation']};
+ reasons:[automatic(requested.model)?'Parent model inherited; undisclosed identity remains unknown':definitionRoute?'Verified named Claude project definition selected':'Current-host model option selected', 'Actual application requires host observation']};
 }
 
 export type ModelAssessment={modelId:string;quality?:number;latencyMs?:number;usage?:number;evidenceRefs:string[]};
@@ -46,7 +57,7 @@ export function recommendModels(config:Config,host:NativeModelContext['host'],ca
  defaultModelId?:string|null;assessments?:ModelAssessment[];now?:number;
 }={}) {
  const profile=options.profile??config.model_selection.profile, now=options.now??Date.now();
- const candidates=catalog.filter(value=>{try{supported(host,value,now);return !value.hidden}catch{return false}});
+ const candidates=catalog.filter(value=>{try{supportedModel(host,value,now);return !value.hidden}catch{return false}});
  const assessments=(options.assessments??[]).filter(a=>a.evidenceRefs.length && [a.quality,a.latencyMs,a.usage].every(n=>n===undefined || Number.isFinite(n)&&n>=0));
  const metric=profile==='quality'?'quality':profile==='fast'?'latencyMs':profile==='economy'?'usage':null;
  const measured=metric?assessments.filter(a=>a[metric]!==undefined && candidates.some(m=>m.id===a.modelId)).sort((a,b)=>metric==='quality'?b[metric]!-a[metric]!:a[metric]!-b[metric]!):[];
