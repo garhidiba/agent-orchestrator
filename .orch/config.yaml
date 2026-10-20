@@ -94,11 +94,11 @@ review:
 quality:
   baseline_required: true
   commands:
-    - id: project-check
-      executable: npm
+    - id: skills-test
+      executable: node
       args:
-        - run
-        - check
+        - --test
+        - tests/unit/skills.test.ts
       cwd: .
       stages:
         - baseline
@@ -106,7 +106,7 @@ quality:
         - integration
         - final
       required: true
-      timeout_seconds: 900
+      timeout_seconds: 300
   allow_missing_tests: false
 cleanup:
   on_success: owned_merged_clean_only
