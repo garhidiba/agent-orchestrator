@@ -1,0 +1,10 @@
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { parseArgs } from 'node:util';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { createServer } from './server.ts';
+const { values } = parseArgs({ options: { host: { type: 'string' }, origin: { type: 'string' } } });
+if ((values.host !== 'codex' && values.host !== 'claude') || !values.origin) throw new Error('HOST_AND_ORIGIN_REQUIRED');
+const origin = resolve(values.origin);
+const server = await createServer(origin, values.host, join(homedir(), '.local', 'share', 'orch', 'worktrees'), join(origin, '.orch', 'state', 'coordinator.token'));
+await server.connect(new StdioServerTransport());
