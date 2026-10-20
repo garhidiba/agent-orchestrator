@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { link, lstat, mkdir, realpath, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { parseDocument } from 'yaml';
-import { parseConfig, resolveConfig } from './index.ts';
+import { loadConfig, parseConfig, resolveConfig } from './index.ts';
 import { validateModels } from '../model-registry/index.ts';
 import type { Scope } from './index.ts';
 import type { Model } from '../model-registry/index.ts';
@@ -52,10 +52,12 @@ export async function patchConfig(file: string, expectedHash: string, patches: C
 }
 
 
-export async function initializeProjectConfig(origin: string) {
+export async function initializeProjectConfig(origin: string, options: {
+  complete?: boolean; dryRun?: boolean; profile?: 'balanced' | 'quality' | 'economy' | 'fast';
+} = {}) {
   const directory = join(await realpath(origin), '.orch'), file = join(directory, 'config.yaml');
-  await mkdir(directory).catch(error => { if (error.code !== 'EEXIST') throw error; });
-  const folder = await lstat(directory); check(folder.isDirectory() && !folder.isSymbolicLink(), 'CONFIG_PATH_UNSAFE');
+  const folder = await lstat(directory).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  check(!folder || (folder.isDirectory() && !folder.isSymbolicLink()), 'CONFIG_PATH_UNSAFE');
   async function existing() {
     const info = await lstat(file).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
     if (!info) return null;
@@ -63,14 +65,39 @@ export async function initializeProjectConfig(origin: string) {
     const text = await readFile(file, 'utf8'); parseConfig(text); return text;
   }
   const previous = await existing();
-  if (previous !== null) return { created: false, file, hash: configHash(previous) };
+  const before = parseConfig(previous ?? '');
+  if (previous !== null && !options.complete) return { created: false, updated: false, file, hash: configHash(previous), config: before };
+  const loaded = await loadConfig(await realpath(origin));
+  check(previous === null || loaded.hashes.project === configHash(previous), 'CONFIG_CONFLICT');
+  const config = resolveConfig({ global: loaded.layers.global, project: { ...before,
+    ...(options.profile === undefined ? {} : { model_selection: { ...before.model_selection, profile: options.profile } }) } }).config;
+  const doc = parseDocument(previous ?? '');
+  const patches: ConfigMutation[] = [];
+  function fill(value: unknown, path: string[] = []) {
+    if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+      for (const [key, child] of Object.entries(value)) fill(child, [...path, key]);
+    } else if (!doc.hasIn(path) || (options.profile !== undefined && path.join('.') === 'model_selection.profile' && doc.getIn(path) !== value)) {
+      patches.push({ path, value }); doc.setIn(path, value);
+    }
+  }
+  fill(config);
+  const text = previous !== null && !patches.length ? previous : doc.toString();
+  if (options.dryRun) return { created: previous === null, updated: previous !== null && text !== previous, file, hash: configHash(text), config, dryRun: true };
+  if (previous !== null) {
+    if (!patches.length) return { created: false, updated: false, file, hash: configHash(previous), config };
+    const result = await patchConfig(file, configHash(previous), patches, [], { layers: loaded.layers });
+    return { ...result, created: false, updated: true, file };
+  }
+  await mkdir(directory).catch(error => { if (error.code !== 'EEXIST') throw error; });
+  const createdFolder = await lstat(directory); check(createdFolder.isDirectory() && !createdFolder.isSymbolicLink(), 'CONFIG_PATH_UNSAFE');
   const temporary = join(directory, `.init-${randomUUID()}.tmp`);
   let created = false;
   try {
-    await writeFile(temporary, '# Project overrides; omitted fields inherit user settings.\nschema_version: 1\n', { flag: 'wx', mode: 0o600 });
+    await writeFile(temporary, text, { flag: 'wx', mode: 0o600 });
     try { await link(temporary, file); created = true; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
-    const text = await existing(); check(text !== null, 'CONFIG_READBACK_FAILED');
-    return { created, file, hash: configHash(text) };
+    const saved = await existing(); check(saved !== null && (!created || saved === text), 'CONFIG_READBACK_FAILED');
+    check(created || !options.complete || saved === text, 'CONFIG_CONFLICT');
+    return { created, updated: false, file, hash: configHash(saved), config: parseConfig(saved) };
   } finally { await rm(temporary, { force: true }); }
 }

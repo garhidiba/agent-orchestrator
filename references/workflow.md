@@ -2,6 +2,10 @@
 
 The current conversation dispatches native Agents; MCP prepares leases/worktrees and verifies Git/results. Installation readies the MCP. A native connection readies this conversation's worker relay; it is not an independent AI controller.
 
+## Project setup
+
+Use the installed conversation's init route before execution when project setup is requested; [project initialization](configuration.md#project-initialization) owns its root checks, full configuration and preview semantics. This config-only route starts no run or worker and requires no native connection. A complete configuration file is separate from verified native execution readiness.
+
 ## Native connection
 
 For execution requests, complete `NEEDS_HOST_HANDSHAKE` automatically before creating a run:

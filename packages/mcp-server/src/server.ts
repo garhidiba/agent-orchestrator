@@ -111,10 +111,10 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
   };
   register('orch_models', { refresh: z.boolean().default(false) }, async data => ({ ...await getCatalogForHost(origin, host, { refresh: data.refresh }),
     authenticatedNative: native ? { source: native.source, model: native.model, effort: native.effort, models: native.models ?? [], evidence: native.evidence } : null }));
-  register('orch_project_init', auth, async data => {
+  register('orch_project_init', { ...auth, complete: z.boolean().default(false), dry_run: z.boolean().default(false), profile: z.enum(['balanced', 'quality', 'economy', 'fast']).optional() }, async data => {
     authenticate(data.coordinator_token); check(origin, 'PROJECT_REQUIRED');
     const root = await git(origin, 'rev-parse', '--show-toplevel');
-    const initialized = await initializeProjectConfig(root);
+    const initialized = await initializeProjectConfig(root, { complete: data.complete, dryRun: data.dry_run, profile: data.profile });
     return { ...initialized, configuration: await configuration() };
   });
   register('orch_config', { action: z.enum(['effective', 'patch', 'unset']), ...auth,

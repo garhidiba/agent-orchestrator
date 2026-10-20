@@ -22,9 +22,17 @@ MCP `orch_config` accepts `action=effective|patch|unset`, `scope=project|global|
 
 At each new attempt the engine rereads allowed model/profile changes, records config revision and requested/resolved model policy, and keeps prepared attempts unchanged. Other run policy changes require a new run. No setting change establishes a production native adapter.
 
-## Automatic project initialization
+## Project initialization
 
-Invoking the main `agent-orch` entry in a Git project calls authenticated `orch_project_init` unless the user explicitly requests no file writes. A missing `.orch/config.yaml` is created atomically with schema_version only, so user defaults stay inherited. Existing content is validated and preserved byte-for-byte; linked paths and invalid configuration fail closed. `orch_config action=effective` and direct `agent-orch-configure` explanations remain read-only. Initialization does not commit files or bypass the clean-checkout gate for write runs.
+After a user-wide ORCH installation, open the actual client Git project and invoke `$agent-orch init` (Codex), `/agent-orch init` (standalone Claude), or `/agent-orch:init` (formal Claude plugin). Client setup writes only `.orch/config.yaml`; it requires no client `package.json`, npm dependencies, ORCH checkout or copied runtime code. Source-checkout npm commands are developer utilities, not the public initialization route.
+
+Before a project write, compare `orch_environment.originRoot` with the physical client Git root. Stop on a mismatch and reconnect MCP from the intended client project. Read the private coordinator token from `coordinatorTokenRef` only for authenticated calls. Call `orch_project_init` with `complete:true`; an explicit profile choice adds `profile:balanced|quality|economy|fast`, and a preview adds `dry_run:true`. Plain initialization requires no native-worker handshake and creates no run or worker. Global configuration is read for inheritance and never modified.
+
+A missing file materializes the full effective global-plus-default configuration, including both hosts' eight roles with model/effort, execution, planning, Git, review, quality, cleanup and observability. Ephemeral session overrides are excluded from this persistent seed. Explicit initialization fills missing fields in an existing sparse file while preserving configured values, model/effort pins and comments; an explicit profile changes only that profile. Ordinary automatic initialization preserves existing files byte-for-byte. Unknown settings and linked paths fail closed, writes are atomic and checked by readback, and dry-run creates no directory or file. On a concurrent-write conflict, reload instead of overwriting.
+
+Report the returned file, created/updated or preview state, hash and configuration, then read `orch_config action=effective` for roles and field sources (a dry-run's proposal is not yet the effective file). Explain `auto` and `inherit` honestly. For user-authorized balanced or other role-model setup, continue through `agent-orch-configure` with actual supported current-host metadata, preserving existing pins; missing metadata leaves choices unresolved. Configuration success never proves worker readiness or actual model application. Inspect project verification-command candidates without executing them or trusting repository scripts automatically; save only commands whose meaning and trust are established with the user. Initialization does not commit files or bypass the clean-checkout gate for write runs.
+
+Direct `agent-orch-configure` explanations and `orch_config action=effective` remain read-only.
 
 ## Advisor recommendation transaction
 

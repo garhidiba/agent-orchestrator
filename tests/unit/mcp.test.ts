@@ -176,11 +176,19 @@ test('project initialization requires coordinator auth and ordinary config reads
     assert.equal((await call('orch_project_init', { coordinator_token: 'worker' })).error.code, 'COORDINATOR_RELAY_REQUIRED');
     await assert.rejects(access(file), { code: 'ENOENT' });
     const auth = { coordinator_token: await readFile(token, 'utf8') };
-    const first = await call('orch_project_init', auth); assert.equal(first.error, undefined, JSON.stringify(first)); assert.equal(first.data.created, true);
-    assert.deepEqual(first.data.configuration.layers.project, { schema_version: 1 });
+    const first = await call('orch_project_init', { ...auth, complete: true, profile: 'balanced' }); assert.equal(first.error, undefined, JSON.stringify(first)); assert.equal(first.data.created, true);
+    assert.equal(Object.keys(first.data.configuration.layers.project.hosts.codex.roles).length, 8);
+    assert.equal(first.data.configuration.layers.project.model_selection.profile, 'balanced');
+    await assert.rejects(access(join(dir, 'package.json')), { code: 'ENOENT' });
+    await assert.rejects(access(join(dir, 'node_modules')), { code: 'ENOENT' });
     const custom = '# preserve me\nmodel_selection: {profile: quality}\n'; await writeFile(file, custom);
     const again = await call('orch_project_init', auth); assert.equal(again.data.created, false); assert.equal(again.data.configuration.config.model_selection.profile, 'quality');
     assert.equal(await readFile(file, 'utf8'), custom);
+    const preview = await call('orch_project_init', { ...auth, complete: true, dry_run: true });
+    assert.equal(preview.data.updated, true); assert.equal(await readFile(file, 'utf8'), custom);
+    const complete = await call('orch_project_init', { ...auth, complete: true });
+    assert.equal(complete.data.updated, true); assert.equal(complete.data.configuration.layers.project.model_selection.profile, 'quality');
+    assert.equal(Object.keys(complete.data.configuration.layers.project.hosts.codex.roles).length, 8);
   } finally { await client.close(); await server.close(); await rm(dir, { recursive: true, force: true }); }
 });
 

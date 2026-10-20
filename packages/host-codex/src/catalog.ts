@@ -42,10 +42,11 @@ export async function discoverCodexModels(executable?: string, timeout = 10000, 
           const message = z.object({ id: z.number().optional(), error: z.unknown().optional(), result: z.unknown().optional() }).parse(JSON.parse(raw));
           if (message.id !== request) continue;
           if (stage === 'config') {
-            const config = z.object({ config: z.object({ model_provider: z.string().nullable().optional(), model_providers: z.record(z.string(), z.object({ base_url: z.string().optional() }).passthrough()).optional() }).passthrough() }).safeParse(message.result);
-            if (config.success && config.data.config.model_provider === 'openai') {
+            const config = z.object({ config: z.object({ model_provider: z.string().nullable().optional(), openai_base_url: z.string().nullable().optional(), model_providers: z.record(z.string(), z.object({ base_url: z.string().optional() }).passthrough()).optional() }).passthrough() }).safeParse(message.result);
+            if (config.success && (config.data.config.model_provider === 'openai' || config.data.config.model_provider === null)) {
               const override = config.data.config.model_providers?.openai?.base_url;
-              if (override === undefined || override === 'https://api.openai.com/v1') family = 'openai';
+              const base = config.data.config.openai_base_url;
+              if ((override === undefined || override === 'https://api.openai.com/v1') && (base == null || base === 'https://api.openai.com/v1')) family = 'openai';
             }
             stage = 'models'; send('model/list', { limit: 100, includeHidden: true }); continue;
           }

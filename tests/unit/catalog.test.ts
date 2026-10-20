@@ -51,3 +51,14 @@ test('Codex provider identity comes from effective config, never the model prefi
   }
  }finally{await rm(dir,{recursive:true,force:true})}
 });
+
+
+test('Codex explicit null provider uses its documented built-in default without trusting custom endpoints', async () => {
+ const dir=await mkdtemp(join(tmpdir(),'orch-default-provider-')), file=join(dir,'host.mjs');
+ try {
+  for(const [config, expected] of [[{model_provider:null},'openai'],[{model_provider:null,openai_base_url:'https://proxy.example/v1'},'unknown']]) {
+   await writeFile(file,`#!${process.execPath}\nimport{createInterface}from'node:readline';createInterface({input:process.stdin}).on('line',l=>{const m=JSON.parse(l);if(!m.id)return;console.log(JSON.stringify({id:m.id,result:m.method==='initialize'?{}:m.method==='config/read'?{config:${JSON.stringify(config)}}:{data:[{id:'opaque-model'}]}}))});`,{mode:0o700});
+   assert.equal((await discoverCodexModels(file)).models[0].family,expected);
+  }
+ }finally{await rm(dir,{recursive:true,force:true})}
+});

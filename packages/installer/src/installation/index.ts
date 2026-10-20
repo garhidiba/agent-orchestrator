@@ -164,6 +164,10 @@ export async function packRelease(source: string, bundle: string, version?: stri
     }
     const lock = await optional(join(source, 'package-lock.json')); if (lock) await writeFile(join(bundle, 'package-lock.json'), lock);
     const plugin = await optional(join(bundle, 'templates/claude/plugin/.claude-plugin/plugin.json'));
+    // Plugin wrappers read the canonical skill directly from the bundle.
+    if (plugin) for (const name of Object.keys(await filesAt(join(bundle, 'skills')))) {
+      if (/^[^/]+\/SKILL\.md$/.test(name)) await cp(join(bundle, 'references'), join(bundle, 'skills', dirname(name), 'references'), { recursive: true });
+    }
     const preparePlugin = async (pluginVersion: string) => {
       if (!plugin) return; // Historical releases remain installable without a plugin.
       await mkdir(join(bundle, '.claude-plugin'), { recursive: true });

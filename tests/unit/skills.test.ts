@@ -81,3 +81,20 @@ test('bilingual evaluation set covers write, read-only, unrelated and blocked re
     }
   }
 });
+
+test('formal Claude plugin entrypoints resolve canonical shipped skill targets', async () => {
+  const plugin = JSON.parse(await readFile(join(root, 'templates/claude/plugin/.claude-plugin/plugin.json'), 'utf8'));
+  const directory = resolve(root, plugin.skills);
+  const entries = await readdir(directory);
+  assert.ok(entries.includes('init'));
+  for (const name of entries) {
+    const entry = await readFile(join(directory, name, 'SKILL.md'), 'utf8');
+    assert.equal(parse(entry.split('---')[1]).name, name);
+    const targets = [...entry.matchAll(/\$\{CLAUDE_PLUGIN_ROOT\}\/(skills\/[^`]+\/SKILL\.md)/g)].map(match => match[1]);
+    assert.equal(targets.length, 1, `entrypoint must resolve one canonical skill: ${name}`);
+    const target = resolve(root, targets[0]);
+    assert.ok(target.startsWith(`${root}skills${sep}`));
+    assert.ok((await stat(target)).isFile());
+    if (name === 'init') assert.equal(target, join(root, 'skills/agent-orch/SKILL.md'));
+  }
+});

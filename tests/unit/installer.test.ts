@@ -370,7 +370,11 @@ test('packaged plugin is self-contained and deterministic after source removal',
     assert.equal(await packRelease(f.source, second, '0.3.0'), checksum);
     await rm(f.source, { recursive: true, force: true });
     const manifest = JSON.parse(await readFile(join(first, '.claude-plugin/plugin.json'), 'utf8'));
-    assert.equal(manifest.name, 'orch');
+    assert.equal(manifest.name, 'agent-orch');
+    assert.equal(await readFile(join(first, 'skills/agent-orch/references/workflow.md'), 'utf8'), '# Workflow\n');
+    const { parse } = await import('yaml');
+    const initSkill = await readFile(join(first, 'templates/claude/plugin/skills/init/SKILL.md'), 'utf8');
+    assert.equal(parse(initSkill.split('---')[1]).name, 'init');
     assert.equal(manifest.version, '0.3.0');
     const config = JSON.parse(await readFile(join(first, '.mcp.json'), 'utf8'));
     assert.deepEqual(config.mcpServers.orch.args, ['${CLAUDE_PLUGIN_ROOT}/packages/mcp-server/src/stdio.ts', '--host', 'claude']);

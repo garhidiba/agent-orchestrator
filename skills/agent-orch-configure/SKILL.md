@@ -7,6 +7,8 @@ description: Explain, configure or optimize ORCH role models, reasoning effort, 
 
 Keep the current session as coordinator and preserve the active host. Explanation requests produce guidance only; an optimization request authorizes only its stated configuration scope.
 
+For project initialization, follow the main `agent-orch` init route first; configuration explanations stay read-only.
+
 1. Read [configuration](references/configuration.md), [model selection](references/model-selection.md) and [effort](references/reasoning-effort.md). Read [project analysis](references/project-analysis.md) when recommending for a project.
 2. Obtain `orch_environment`, `orch_config` with `action=effective`, and `orch_models`. Keep `orch_models.authenticatedNative` separate from subprocess-catalog provenance; check `orch_environment.nativeControl` per-invocation support, context match, access, expiry and errors. Missing or mismatched evidence limits recommendations; never invent IDs, effort support, prices or actual usage.
 3. Use the user's goal or explain the `balanced` default. Preserve concrete model/effort overrides and change only `auto` fields unless the user explicitly changes a fixed value. Resolve only within this host's validated catalog. Distinguish a schema-valid patch from a model executable in the current host.

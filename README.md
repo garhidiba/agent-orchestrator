@@ -4,7 +4,7 @@ ORCH is a local coordination runtime for work started inside an existing Codex o
 
 **Development implementation, not a completed v1 release.** Installation readies the MCP; the current conversation connects its native Agent tool automatically before running workers. Each role resolves its own model/effort from authenticated host capabilities; unsupported pins remain blocked and actual observations stay separate. Deterministic tests alone do not prove native host execution. See [compatibility](docs/compatibility.md) and [acceptance evidence](docs/acceptance.md). The [completion audit](docs/prd-completion.md) tracks the current findings and pending evidence.
 
-## Install
+## Install once
 
 Requires **Node.js 24+** (with npm), Git, and Codex CLI or Claude Code. From this checkout, run one command:
 
@@ -24,18 +24,31 @@ cd agent-orchestrator
 
 On Windows PowerShell, run `./scripts/install.ps1` instead. Installation registers the `orch` MCP server and copies `agent-orch` / `agent-orch-configure` into each host's skills directory. Restart/reload the host afterward.
 
+The default installation is user-wide. Keep this ORCH checkout separate from the client projects you manage; installation is done once, not in every client repository.
+
 Optional: `./scripts/install.sh --target codex` selects just Codex (`claude` selects Claude Code); `--dry-run` previews host changes. Project-only installation uses `--scope project --project /absolute/path/to/git-root`. Dependency setup can still write local `node_modules` during a preview. See [installation](docs/installation.md) for paths, advanced verified-bundle options and removal.
 
 ## Use in a conversation
 
 1. Restart/reload the host after installation, then open the Git project you want ORCH to manage.
 2. Check that the `orch` MCP server and both skills are discovered. In Codex, `codex mcp get orch` checks registration; `/mcp` inside the TUI shows active servers ([official MCP guide](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)). Registration alone does not prove a successful connection.
-3. Invoke the appropriate entry point in the conversation. The first `$agent-orch` in a Git project creates `.orch/config.yaml` if it is missing; omitted settings inherit your global configuration. Existing files are preserved. Explicit no-write requests and direct configuration explanations remain read-only. The generated config is a regular project file: commit it according to your project policy before starting a write run that requires a clean checkout. Agent-orch does not silently commit your repository.
+3. Initialize the actual client Git project in that conversation:
+
+   ```text
+   $agent-orch init
+   ```
+
+   In standalone Claude Code use `/agent-orch init`; when using the formal Claude plugin use `/agent-orch:init`. The skill verifies the MCP origin against the physical client Git root before writing. Initialization creates or completes only `.orch/config.yaml`: the client needs no `package.json`, `node_modules`, ORCH checkout or copied ORCH code. Global settings remain unchanged.
+
+The file visibly includes all eight roles for both hosts, model/effort policies, and execution, Git, review, quality and other defaults. Missing fields are seeded from global settings and shipped defaults; existing values and comments are preserved. Initialization configures the project without starting a run or an AI worker. Concrete role-model setup uses supported current-host metadata through `agent-orch-configure`; unresolved `auto` values remain explicit when that metadata is unavailable. A full file alone does not mean workers are ready.
+
+For a read-only preview use `$agent-orch init 설정 파일 변경안을 보여줘. 아직 쓰지 마.` An ordinary first invocation also creates a missing full config, while preserving existing files. Explicit no-write requests and direct configuration explanations remain read-only. Commit the generated project file according to your project policy before a write run that requires a clean checkout; agent-orch does not silently commit it.
 
 The entry names are now `$agent-orch` / `$agent-orch-configure` (Codex) and `/agent-orch` / `/agent-orch-configure` (Claude). Internal `orch_*` MCP tools and `.orch` data paths retain their names for compatibility. Updating moves only installer-owned old skills; edited/user-owned files block migration rather than being overwritten.
 
 | Goal | Codex prompt | Claude Code prompt |
 |---|---|---|
+| Initialize this client project | `$agent-orch init` | `/agent-orch init` (standalone), `/agent-orch:init` (plugin) |
 | Inspect environment and capabilities | `$agent-orch 현재 환경과 실행 가능 상태를 확인해줘` | `/agent-orch 현재 환경과 실행 가능 상태를 확인해줘` |
 | Explain current settings without changing them | `$agent-orch-configure 현재 모델과 설정을 설명해줘. 변경하지 마` | `/agent-orch-configure 현재 모델과 설정을 설명해줘. 변경하지 마` |
 | Preview a project profile change | `$agent-orch-configure 이 프로젝트를 quality 프로필로 바꾸는 변경안을 보여줘` | `/agent-orch-configure 이 프로젝트를 quality 프로필로 바꾸는 변경안을 보여줘` |
@@ -45,9 +58,10 @@ The entry names are now `$agent-orch` / `$agent-orch-configure` (Codex) and `/ag
 
 Use these in the host conversation, not in a terminal. In Claude Code, replace `$agent-orch` / `$agent-orch-configure` with `/agent-orch` / `/agent-orch-configure`.
 
-First inspect the project and current settings:
+Initialize the client project, then inspect current settings:
 
 ```text
+$agent-orch init
 $agent-orch 현재 프로젝트의 환경, MCP 연결과 실행 가능 상태를 확인해줘. 파일은 변경하지 마.
 $agent-orch-configure 현재 프로필과 역할별 모델·추론 설정을 설명해줘. 설정은 바꾸지 마.
 ```
@@ -80,7 +94,7 @@ On an execution request, `$agent-orch` first connects this conversation’s nati
 
 ## CLI and development checks
 
-From the source checkout, these commands inspect settings and hosts. The role listing shows requested policy; metadata does not prove same-session model access. In the conversation, `orch_doctor` provides a separate read-only composite diagnostic; native readiness still requires the current-host handshake.
+These are developer commands run only from the ORCH source checkout, not client-project setup commands. Public initialization uses the installed conversation entry points above; there is no `npm run orch -- init` command. These source commands inspect settings and hosts. The role listing shows requested policy; metadata does not prove same-session model access. In the conversation, `orch_doctor` provides a separate read-only composite diagnostic; native readiness still requires the current-host handshake.
 
 ```sh
 npm run orch -- --help

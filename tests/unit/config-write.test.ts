@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { patchConfig, configHash } from '../../packages/core/src/config/write.ts';
@@ -97,18 +97,26 @@ test('higher layers cannot hide a new invalid model or effort in the changed sco
 test('project initialization is atomic, inherits settings and never replaces existing configuration', async () => {
   const { initializeProjectConfig } = await import('../../packages/core/src/config/write.ts');
   const dir = await mkdtemp(join(tmpdir(), 'orch-init-'));
+  const previousHome = process.env.ORCH_CONFIG_HOME; process.env.ORCH_CONFIG_HOME = join(dir, 'global');
   try {
     const results = await Promise.all([initializeProjectConfig(dir), initializeProjectConfig(dir)]);
     assert.equal(results.filter(result => result.created).length, 1);
     const file = join(dir, '.orch/config.yaml'), initial = await readFile(file, 'utf8');
-    const { parseConfig, resolveConfig } = await import('../../packages/core/src/config/index.ts');
-    assert.deepEqual(parseConfig(initial), { schema_version: 1 });
-    assert.equal(resolveConfig({ global: { model_selection: { profile: 'economy' } }, project: parseConfig(initial) }).config.model_selection.profile, 'economy');
+    const { parseConfig } = await import('../../packages/core/src/config/index.ts');
+    const config = parseConfig(initial);
+    assert.equal(config.schema_version, 1);
+    assert.equal(Object.keys(config.hosts!.codex!.roles!).length, 8);
+    assert.equal(config.hosts!.codex!.roles!.coder!.model, 'auto');
+    assert.equal(config.hosts!.codex!.roles!.coder!.effort, 'auto');
+    assert.ok(config.execution); assert.ok(config.git); assert.ok(config.review); assert.ok(config.quality);
     const custom = '# user configuration\nmodel_selection: {profile: quality}\n'; await writeFile(file, custom);
     assert.equal((await initializeProjectConfig(dir)).created, false); assert.equal(await readFile(file, 'utf8'), custom);
     await writeFile(file, 'unknown_setting: keep-me\n');
-    await assert.rejects(initializeProjectConfig(dir), /CONFIG_INVALID/); assert.equal(await readFile(file, 'utf8'), 'unknown_setting: keep-me\n');
-  } finally { await rm(dir, { recursive: true, force: true }); }
+    await assert.rejects(initializeProjectConfig(dir, { complete: true }), /CONFIG_INVALID/); assert.equal(await readFile(file, 'utf8'), 'unknown_setting: keep-me\n');
+  } finally {
+    if (previousHome === undefined) delete process.env.ORCH_CONFIG_HOME; else process.env.ORCH_CONFIG_HOME = previousHome;
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('project initialization refuses linked directories and files without changing external data', { skip: process.platform === 'win32' }, async () => {
@@ -121,5 +129,56 @@ test('project initialization refuses linked directories and files without changi
     await rm(join(project, '.orch')); await mkdir(join(project, '.orch'));
     const victim = join(outside, 'config.yaml'); await writeFile(victim, 'schema_version: 1\n'); await symlink(victim, join(project, '.orch/config.yaml'));
     await assert.rejects(initializeProjectConfig(project), /CONFIG_PATH_UNSAFE/); assert.equal(await readFile(victim, 'utf8'), 'schema_version: 1\n');
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('explicit project init completes sparse config while preserving comments and pins and seeding global settings', async () => {
+  const { initializeProjectConfig } = await import('../../packages/core/src/config/write.ts');
+  const dir = await mkdtemp(join(tmpdir(), 'orch-init-complete-')), global = join(dir, 'global'), project = join(dir, 'project');
+  const previousHome = process.env.ORCH_CONFIG_HOME; process.env.ORCH_CONFIG_HOME = global;
+  try {
+    await mkdir(global); await mkdir(project); await mkdir(join(project, '.orch'));
+    await writeFile(join(global, 'config.yaml'), 'execution: {max_parallel_workers: 2}\nhosts: {codex: {roles: {reviewer: {model: global-pin, effort: high}}}}\n');
+    const file = join(project, '.orch/config.yaml');
+    await writeFile(file, '# keep this note\nmodel_selection: {profile: quality}\nhosts: {codex: {roles: {coder: {model: project-pin, effort: low}}}}\n');
+    const result = await initializeProjectConfig(project, { complete: true });
+    assert.equal(result.updated, true); assert.equal(result.created, false);
+    assert.equal(result.config.hosts!.codex!.roles!.coder!.model, 'project-pin');
+    assert.equal(result.config.hosts!.codex!.roles!.coder!.effort, 'low');
+    assert.equal(result.config.hosts!.codex!.roles!.reviewer!.model, 'global-pin');
+    assert.equal(result.config.hosts!.codex!.roles!.reviewer!.effort, 'high');
+    assert.equal(result.config.model_selection!.profile, 'quality');
+    assert.equal(result.config.execution!.max_parallel_workers, 2);
+    assert.match(await readFile(file, 'utf8'), /# keep this note/);
+    assert.equal((await initializeProjectConfig(project, { complete: true })).updated, false);
+    const profiled = await initializeProjectConfig(project, { complete: true, profile: 'balanced' });
+    assert.equal(profiled.config.model_selection!.profile, 'balanced');
+    assert.equal(profiled.config.hosts!.codex!.roles!.coder!.model, 'project-pin');
+    const fresh = join(dir, 'fresh'); await mkdir(fresh);
+    const seeded = await initializeProjectConfig(fresh);
+    assert.equal(seeded.config.execution!.max_parallel_workers, 2);
+    assert.equal(seeded.config.hosts!.codex!.roles!.reviewer!.model, 'global-pin');
+  } finally {
+    if (previousHome === undefined) delete process.env.ORCH_CONFIG_HOME; else process.env.ORCH_CONFIG_HOME = previousHome;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('project init dry-run creates no directories and concurrent completion refuses a locked writer', async () => {
+  const { initializeProjectConfig } = await import('../../packages/core/src/config/write.ts');
+  const dir = await mkdtemp(join(tmpdir(), 'orch-init-dry-'));
+  try {
+    const dry = await initializeProjectConfig(dir, { complete: true, dryRun: true, profile: 'economy' });
+    assert.equal(dry.dryRun, true); assert.equal(dry.created, true);
+    assert.equal(dry.config.model_selection!.profile, 'economy');
+    await assert.rejects(readFile(join(dir, '.orch')), { code: 'ENOENT' });
+    await mkdir(join(dir, '.orch'));
+    const file = join(dir, '.orch/config.yaml'), source = '# preserve\nschema_version: 1\n';
+    await writeFile(file, source); await writeFile(`${file}.orch-lock`, 'other writer');
+    await assert.rejects(initializeProjectConfig(dir, { complete: true }), /CONFIG_CONFLICT/);
+    assert.equal(await readFile(file, 'utf8'), source);
+    assert.equal(await readFile(`${file}.orch-lock`, 'utf8'), 'other writer');
+    const sparseDry = await initializeProjectConfig(dir, { complete: true, dryRun: true });
+    assert.equal(sparseDry.updated, true); assert.equal(await readFile(file, 'utf8'), source);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
