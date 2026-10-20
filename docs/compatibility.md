@@ -4,7 +4,7 @@ The [completion audit tracker](prd-completion.md) records the current run's find
 
 Status date: 2026-10-20. Package version 0.1.0 is a development implementation. PRD v1 completion requires real native E2E on both hosts; it has not been established.
 
-The user's real Claude full-version/effort and managed-worktree dependency scenarios currently have [open runtime failures](prd-completion.md#reopened-runtime-failures--2026-10-20). Treat prior local-check and installation results as scoped evidence, not successful acceptance of those paths.
+The user's real Claude full-version/effort and managed-worktree dependency failures have [scoped correction evidence](prd-completion.md#runtime-readiness-correction-evidence). The corrected Node reuse path completed its original command with two actual Codex workers. Claude generated-definition syntax and deterministic dispatch contracts passed, but actual Claude named invocation/reload acceptance remains open. Installation results do not close that host gate.
 
 | Surface | Evidence | Status |
 |---|---|---|
@@ -12,7 +12,8 @@ The user's real Claude full-version/effort and managed-worktree dependency scena
 | Codex metadata | Paginated metadata plus authenticated parent native-context path; retain provider/source evidence and unknown access | Actual current role-selection evidence must be recorded separately |
 | Claude metadata | Supported current-context metadata adapter and parent relay; metadata lookup performs no inference | Actual current-session discovery/native E2E not established by fixtures |
 | Codex native Agents | Dated inherited worker/bootstrap/content/review/finalize/cleanup smoke on macOS; new per-role native arguments and read-only review receipts require current acceptance evidence | Prior single-task smoke passed; new role model/effort execution remains unverified until observed |
-| Claude native Agents | Same authenticated parent-relay protocol implemented; MCP installation/connection tested, actual Claude Agent run not exercised | Native E2E not verified |
+| Claude native Agents | Authenticated parent relay plus project/policy-specific generated definitions, loaded receipts and pre-bind hash checks; actual CLI parser accepts exact versions/high | Actual named Agent invocation and reload E2E not verified |
+| Node managed-worktree dependencies | Manifest/lock/config-matched existing dependency reuse; original skills command passed in two actual Codex task worktrees and integration | Shared directory is writable, not OS isolation. Workspace/local/external links and non-Node bootstrap need separate trusted setup. |
 | macOS source tooling | Current development environment | Not a native-host E2E certification |
 | Linux | No recorded native/installation release run | Not verified |
 | Windows native / PowerShell | Platform paths/wrappers require actual OS run | Not verified |
