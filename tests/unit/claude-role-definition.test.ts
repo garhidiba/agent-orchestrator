@@ -8,15 +8,15 @@ import { resolveConfig } from '../../packages/core/src/config/index.ts';
 import { resolveRoleModel } from '../../packages/core/src/runtime/models.ts';
 
 const digest = (value: string) => createHash('sha256').update(value).digest('hex');
-async function fixture() {
+async function fixture(effort:string|null='high',modelId='claude-opus-5-5') {
  const dir = await mkdtemp(join(tmpdir(), 'orch-role-')), root = await realpath(dir);
- const policy = { originRoot: root, role: 'coder', model: 'claude-opus-5-5', effort: 'high' };
+ const policy = { originRoot: root, role: 'coder', model: modelId, effort };
  const name = `orch-coder-p${digest(JSON.stringify(policy)).slice(0,16)}`, path = `.claude/agents/${name}.md`;
- const text = `---\nname: ${name}\ndescription: ORCH coder\nmodel: claude-opus-5-5\neffort: high\n---\nFollow the assigned handoff.\n`;
+ const text = `---\nname: ${name}\ndescription: ORCH coder\nmodel: ${modelId}${effort===null?'':`\neffort: ${effort}`}\n---\nFollow the assigned handoff.\n`;
  await mkdir(join(root, '.claude/agents'), { recursive: true }); await writeFile(join(root,path),text);
  const receipt = {role:'coder' as const,name,path,sha256:digest(text),model:policy.model,effort:policy.effort,loaded:{nativeAgentId:'fixture-named-probe',sha256:digest(text)}};
  const native = {host:'claude' as const,verified:true,contextMatches:true,evidence:['fixture:parent-relay'],model:null,effort:null,perInvocationModel:false,perInvocationEffort:false,claudeDefinitionRoot:root,claudeRoleDefinitions:[receipt]};
- const config = resolveConfig({project:{hosts:{claude:{roles:{coder:{model:policy.model,effort:policy.effort}}}}}}).config;
+ const config = resolveConfig({project:{hosts:{claude:{roles:{coder:{model:policy.model,effort:policy.effort??'auto'}}}}}}).config;
  return {root,path,text,receipt,native,config,close:()=>rm(root,{recursive:true,force:true})};
 }
 test('Claude exact model and effort dispatch through a loaded named project definition without override arguments', async()=>{
@@ -65,8 +65,13 @@ test('authenticated MCP validates named definition bytes on connect and refresh'
   assert.equal(invalid.error?.code,'CLAUDE_ROLE_DEFINITION_STALE');
   assert.equal((await call('orch_host_connect',connect)).data.state,'READY');
   assert.deepEqual((await call('orch_models')).data.authenticatedNative.claudeRoleDefinitions,[f.receipt]);
+  await call('orch_host_refresh',{...auth,probe,native_context:{model:null,effort:null}});
+  assert.deepEqual((await call('orch_models')).data.authenticatedNative.claudeRoleDefinitions,[f.receipt]);
+  await call('orch_host_refresh',{...auth,probe,native_context:{model:null,effort:null,claudeRoleDefinitions:[]}});
+  assert.deepEqual((await call('orch_models')).data.authenticatedNative.claudeRoleDefinitions,[]);
+  await call('orch_host_refresh',{...auth,probe,native_context:context});
   await writeFile(join(f.root,f.path),f.text+'stale\n');
-  assert.equal((await call('orch_host_refresh',{...auth,probe,native_context:context})).error?.code,'CLAUDE_ROLE_DEFINITION_STALE');
+  assert.equal((await call('orch_host_refresh',{...auth,probe,native_context:{model:null,effort:null}})).error?.code,'CLAUDE_ROLE_DEFINITION_STALE');
  }finally{await client.close();await server.close();await f.close()}
 });
 
@@ -103,6 +108,10 @@ test('authenticated role prepare reuses templates, ignores exact generated path 
   assert.equal((await call('orch_claude_role_prepare',args)).data.sha256,generated.sha256);
   assert.equal(await readFile(join(f.root,'.orch/config.yaml'),'utf8'),configText);
   assert.equal((await call('orch_claude_role_prepare',{...args,expected_hash:'bad'})).error?.code,'CONFIG_CONFLICT');
+  await call('orch_host_refresh',{...auth,probe:{cwd:f.root,origin_root:f.root,branch:await git(f.root,'branch','--show-current'),head:await git(f.root,'rev-parse','HEAD')},native_context:{model:model.id,effort:null,models:[model],perInvocationModel:true,perInvocationEffort:true,invocationModelIds:['opus']}});
+  assert.deepEqual((await call('orch_environment')).data.nativeControl.invocationModelIds,['opus']);
+  assert.deepEqual((await call('orch_models')).data.authenticatedNative.invocationModelIds,['opus']);
+  assert.equal((await call('orch_model_recommend')).data.recommendation.proposedPatch.length,0);
  }finally{await client.close();await server.close();await f.close()}
 });
 
@@ -110,15 +119,16 @@ test('generated reviewer definitions preserve read-only tools, dry-run purity an
  const {prepareClaudeRoleDefinition,verifyClaudeRoleDefinitions}=await import('../../packages/core/src/runtime/host-claude.ts');
  const {symlink,access,readFile}=await import('node:fs/promises');
  const f=await fixture();try{
-  const commonDir=join(f.root,'git-common');await mkdir(commonDir);
+  const {git}=await import('../../packages/core/src/git/repository.ts');await git(f.root,'init');
+  const commonDir=join(f.root,'.git');await rm(join(commonDir,'info'),{recursive:true});
   await rm(join(f.root,'.claude'),{recursive:true});
   const input={originRoot:f.root,commonDir,role:'reviewer' as const,model:'claude-opus-5-5',effort:'high',dryRun:true};
-  const preview=prepareClaudeRoleDefinition(input);assert.equal(preview.agentsDirectoryExisted,false);
+  const preview=await prepareClaudeRoleDefinition(input);assert.equal(preview.agentsDirectoryExisted,false);
   await assert.rejects(access(join(f.root,'.claude')));await assert.rejects(access(join(commonDir,'info')));
   await symlink(commonDir,join(f.root,'.claude'));
-  assert.throws(()=>prepareClaudeRoleDefinition({...input,dryRun:false}),/CLAUDE_ROLE_DEFINITION_INVALID/);
+  await assert.rejects(prepareClaudeRoleDefinition({...input,dryRun:false}),/CLAUDE_ROLE_DEFINITION_INVALID/);
   await rm(join(f.root,'.claude'));
-  const prepared=prepareClaudeRoleDefinition({...input,dryRun:false});
+  const prepared=await prepareClaudeRoleDefinition({...input,dryRun:false});
   const bytes=await readFile(join(f.root,prepared.path),'utf8');
   assert.match(bytes,/tools: Read, Grep, Glob/);assert.match(bytes,/Independently review/);
   assert.equal(await readFile(join(commonDir,'info/exclude'),'utf8'),`/${prepared.path}\n`);
@@ -143,5 +153,39 @@ test('verified definitions never override explicit current-host access or suppor
    assert.throws(()=>resolveRoleModel({config:f.config,host:'claude',role:'coder',native}),error);
   }
   assert.throws(()=>resolveRoleModel({config:f.config,host:'claude',role:'coder',native:{...f.native,claudeRoleDefinitions:[{...f.receipt,path:'../outside.md'}]}}),/CLAUDE_ROLE_DEFINITION_MISMATCH/);
+ }finally{await f.close()}
+});
+
+
+test('known effort exclusions block definition fallback while unknown supported levels permit it',async()=>{
+ const f=await fixture();try{
+  const descriptor={host:'claude' as const,id:f.receipt.model,displayName:'fixture',resolvedId:null,family:'claude' as const,support:'advertised' as const,access:'unknown' as const,availability:'unknown' as const,efforts:null as string[]|null,defaultEffort:null,hidden:false,source:'fixture',sourceVersion:null,fetchedAt:new Date().toISOString(),expiresAt:null,evidence:[{kind:'fixture',ref:'fixture:host'}]};
+  for(const efforts of [[],['low']])assert.throws(()=>resolveRoleModel({config:f.config,host:'claude',role:'coder',native:{...f.native,models:[{...descriptor,efforts}]}}),/EFFORT_NOT_SUPPORTED/);
+  assert.deepEqual(resolveRoleModel({config:f.config,host:'claude',role:'coder',native:{...f.native,models:[descriptor]}}).nativeArguments,{subagent_type:f.receipt.name});
+  f.config.hosts.claude.roles.coder.model='auto';
+  assert.throws(()=>resolveRoleModel({config:f.config,host:'claude',role:'coder',native:{...f.native,model:f.receipt.model,effort:'high',models:[{...descriptor,efforts:['low']}]}}),/EFFORT_NOT_SUPPORTED/);
+  f.config.hosts.claude.roles.coder.model=f.receipt.model;
+  assert.throws(()=>resolveRoleModel({config:f.config,host:'claude',role:'coder',native:{...f.native,claudeRoleDefinitions:[f.receipt,f.receipt]}}),/CLAUDE_ROLE_DEFINITION_MISMATCH/);
+ }finally{await f.close()}
+});
+
+test('alias-only invocation enum uses exact Sonnet definition without passing unsupported model arguments',async()=>{
+ const f=await fixture(null,'claude-sonnet-5-5');try{
+  const descriptor={host:'claude' as const,id:f.receipt.model,displayName:'fixture',resolvedId:null,family:'claude' as const,support:'advertised' as const,access:'unknown' as const,availability:'unknown' as const,efforts:null,defaultEffort:null,hidden:false,source:'fixture',sourceVersion:null,fetchedAt:new Date().toISOString(),expiresAt:null,evidence:[{kind:'fixture',ref:'fixture:host'}]};
+  const native={...f.native,models:[descriptor],perInvocationModel:true,invocationModelIds:['sonnet']};
+  assert.deepEqual(resolveRoleModel({config:f.config,host:'claude',role:'coder',native}).nativeArguments,{subagent_type:f.receipt.name});
+ }finally{await f.close()}
+});
+
+
+test('project ignore negation blocks role generation before creating an untracked source file',async()=>{
+ const {prepareClaudeRoleDefinition}=await import('../../packages/core/src/runtime/host-claude.ts');
+ const {git}=await import('../../packages/core/src/git/repository.ts');
+ const {access}=await import('node:fs/promises');
+ const f=await fixture();try{
+  await rm(join(f.root,'.claude'),{recursive:true});await git(f.root,'init');await git(f.root,'config','user.name','Fixture');await git(f.root,'config','user.email','fixture@example.invalid');
+  await writeFile(join(f.root,'.gitignore'),'!*.md\n');await git(f.root,'add','.gitignore');await git(f.root,'commit','-m','fixture');
+  await assert.rejects(async()=>prepareClaudeRoleDefinition({originRoot:f.root,commonDir:join(f.root,'.git'),role:'coder',model:f.receipt.model,effort:'high',dryRun:false}),/CLAUDE_ROLE_DEFINITION_IGNORE_REQUIRED/);
+  await assert.rejects(access(join(f.root,f.path)));assert.equal(await git(f.root,'status','--porcelain'),'');
  }finally{await f.close()}
 });

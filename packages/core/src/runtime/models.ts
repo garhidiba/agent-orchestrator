@@ -8,6 +8,7 @@ export type RoleId = typeof roleIds[number];
 export const nativeModelContextSchema = z.strictObject({
  host:z.enum(['codex','claude']),verified:z.boolean(),contextMatches:z.boolean(),evidence:z.array(z.string().min(1)),
  perInvocationModel:z.boolean().optional(),perInvocationEffort:z.boolean().optional(),
+ invocationModelIds:z.array(z.string().min(1).max(256)).max(256).optional(),
  model:z.string().min(1).nullable(),effort:z.string().min(1).nullable(),models:z.array(modelSchema).optional(),
  claudeRoleDefinitions:z.array(claudeRoleDefinitionSchema).max(roleIds.length).optional(),
 });
@@ -31,8 +32,10 @@ export function resolveRoleModel(input: {config:Config;host:NativeModelContext['
  let effort=requested.effort==='inherit'?native.effort:requested.effort==='auto'?(model?.defaultEffort??null):requested.effort;
  const inheritedEffortMatch=automatic(requested.model) && native.effort!==null && requested.effort===native.effort;
  const needsModel=!automatic(requested.model), needsEffort=effort!==null && requested.effort!=='inherit' && !inheritedEffortMatch;
+ if(!automatic(requested.effort) && model?.efforts!==null && model?.efforts!==undefined) check(model.efforts.includes(requested.effort),'EFFORT_NOT_SUPPORTED');
+ const directModel=native.perInvocationModel && (!native.invocationModelIds || native.invocationModelIds.includes(requested.model));
  const nativeArguments:{model?:string;reasoning_effort?:string;subagent_type?:string}={};
- const definitionRoute=host==='claude' && (needsModel&&!native.perInvocationModel || needsEffort&&!native.perInvocationEffort || needsModel&&!descriptor);
+ const definitionRoute=host==='claude' && (needsModel&&!directModel || needsEffort&&!native.perInvocationEffort || needsModel&&!descriptor);
  if(definitionRoute) {
   check(native.claudeDefinitionRoot && native.claudeRoleDefinitions?.length,'CLAUDE_ROLE_DEFINITION_REQUIRED');
   const definition=verifyClaudeRoleDefinitions(native.claudeDefinitionRoot,native.claudeRoleDefinitions).find(value=>value.role===role);
@@ -43,7 +46,7 @@ export function resolveRoleModel(input: {config:Config;host:NativeModelContext['
   if(needsModel) check(descriptor,'MODEL_NOT_SUPPORTED');
   if(!automatic(requested.effort) && !inheritedEffortMatch) check(model?.efforts?.includes(requested.effort),'EFFORT_NOT_SUPPORTED');
   if(model?.efforts?.length===0) effort=null;
-  if(needsModel) {check(native.perInvocationModel,'BLOCKED_CAPABILITY');nativeArguments.model=requested.model;}
+  if(needsModel) {check(directModel,'BLOCKED_CAPABILITY');nativeArguments.model=requested.model;}
   if(needsEffort && effort!==null) {check(native.perInvocationEffort,'BLOCKED_CAPABILITY');nativeArguments.reasoning_effort=effort;}
  }
  return {requestedModel:requested.model,requestedEffort:requested.effort,resolvedModel:modelId,resolvedEffort:effort,

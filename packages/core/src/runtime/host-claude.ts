@@ -3,6 +3,8 @@ import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync, rea
 import { join } from 'node:path';
 import { parse } from 'yaml';
 import { z } from 'zod';
+import type { NativeModelContext } from './models.ts';
+import { git } from '../git/repository.ts';
 import { roleIds } from '../../../protocol/src/config.ts';
 import { nativeAgentId, requireCondition as check } from '../../../protocol/src/runtime.ts';
 
@@ -60,7 +62,7 @@ function safeRead(path:string,limit:number) {
  }finally{closeSync(fd);}
 }
 
-export function prepareClaudeRoleDefinition(input:{originRoot:string;commonDir:string;role:typeof roleIds[number];model:string;effort:string|null;dryRun:boolean}) {
+export async function prepareClaudeRoleDefinition(input:{originRoot:string;commonDir:string;role:typeof roleIds[number];model:string;effort:string|null;dryRun:boolean}) {
  const {originRoot,commonDir,role,model,effort,dryRun}=input;
  text.parse(model);if(effort!==null)text.parse(effort);z.enum(roleIds).parse(role);
  check(realpathSync(originRoot)===originRoot&&realpathSync(commonDir)===commonDir,'CLAUDE_ROLE_DEFINITION_INVALID');
@@ -80,9 +82,21 @@ export function prepareClaudeRoleDefinition(input:{originRoot:string;commonDir:s
    const fd=openSync(excludePath,constants.O_WRONLY|constants.O_APPEND|constants.O_CREAT|constants.O_NOFOLLOW,0o600);
    try{check(fstatSync(fd).isFile(),'CLAUDE_ROLE_DEFINITION_INVALID');appendFileSync(fd,`${exclude&&!exclude.endsWith('\n')?'\n':''}${entry}\n`);}finally{closeSync(fd);}
   }
+  check(await git(originRoot,'check-ignore','--',path).catch(()=>null)===path,'CLAUDE_ROLE_DEFINITION_IGNORE_REQUIRED');
+  safeDirectory(join(originRoot,'.claude'),false);safeDirectory(join(originRoot,'.claude/agents'),false);
   try{writeFileSync(join(originRoot,path),content,{flag:'wx',mode:0o600});}
   catch(error){if((error as NodeJS.ErrnoException).code!=='EEXIST')throw error;}
   check(safeRead(join(originRoot,path),16384).toString('utf8')===content,'CLAUDE_ROLE_DEFINITION_CONFLICT');
  }
  return {originRoot,role,name,path,sha256:digest(content),model,effort,agentsDirectoryExisted,reloadHint:agentsDirectoryExisted?'WATCH_OR_PROBE':'RELOAD_MAY_BE_REQUIRED',dryRun};
+}
+
+export function verifyPreparedClaudeDefinition(native:NativeModelContext|undefined,resolution:{resolvedModel:string|null;resolvedEffort:string|null;nativeArguments?:{subagent_type?:string}}) {
+ const name=resolution.nativeArguments?.subagent_type;if(name===undefined)return;
+ check(native?.host==='claude'&&native.claudeDefinitionRoot,'CLAUDE_ROLE_DEFINITION_REQUIRED');
+ const definitions=native.claudeRoleDefinitions?.filter(value=>value.name===name);
+ check(definitions?.length===1,'CLAUDE_ROLE_DEFINITION_REQUIRED');
+ const definition=definitions[0];
+ check(definition.model===resolution.resolvedModel&&definition.effort===resolution.resolvedEffort,'CLAUDE_ROLE_DEFINITION_MISMATCH');
+ verifyClaudeRoleDefinitions(native.claudeDefinitionRoot,[definition]);
 }

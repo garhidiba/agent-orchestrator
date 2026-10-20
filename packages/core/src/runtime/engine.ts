@@ -16,6 +16,7 @@ import { id, nativeAgentId, requirementsSchema, requireCondition as check, valid
 import type { Task, Plan, Review, GateResult, Requirements } from '../../../protocol/src/runtime.ts';
 
 import { completionEvidence, findingBlocks } from './completion.ts';
+import { verifyPreparedClaudeDefinition } from './host-claude.ts';
 import { resolveRoleModel, observeRoleModel, type NativeModelContext } from './models.ts';
 import { enforceRunBudget, activeElapsedMs, reconcileExpiredTasks, confirmHostHeartbeat, type HostHeartbeat } from './lifecycle.ts';
 import { allocateAttemptResources, reservePort, type AttemptResources } from './resources.ts';
@@ -23,7 +24,7 @@ import { prepareNodeDependencies, type DependencySetup } from './dependencies.ts
 
 const exec = promisify(execFile);
 type Gate = { id?: string; details?: GateResult[]; stage: string; task: string | null; sha: string; source: string; commands: string; status: string; results: { id: string; status: string; exitCode: number | null }[] };
-type Work = { dependencySetup?: DependencySetup | null; nativeContext?: NativeCapability; resources?: AttemptResources; deadline?: number; heartbeat?: { observedAt: number; evidenceRef: string }; modelObservation?: ReturnType<typeof observeRoleModel>; spec: Task; state: string; base: string; path: string; branch: string; attempt: number; lease: string; expires: number; nativeId: string | null; nativeBootstrap?: { cwd: string; origin_root: string; common_dir: string; branch: string; head: string }; units: Record<string, string>; validated: string | null; pausedState?: string; dispatchBase?: string; configRevision?: number; observedModel?: string | null; observedEffort?: string | null; modelResolution?: { requestedModel: string; requestedEffort: string; resolvedModel: string | null; resolvedEffort: string | null }; acceptanceEvidence?: { acceptanceId: string; evidenceRefs: string[] }[]; changedPaths?: string[]; reportedModel?: string | null; recoveryHead?: string; lastCommitSha?: string; attempts?: { number: number; path: string; branch: string; nativeId: string | null; stopped: boolean; reason: string; configRevision?: number; modelResolution?: Work['modelResolution']; observedModel?: string | null; observedEffort?: string | null; modelObservation?: Work['modelObservation']; resources?: AttemptResources }[] };
+type Work = { dependencySetup?: DependencySetup | null; nativeContext?: NativeCapability; resources?: AttemptResources; deadline?: number; heartbeat?: { observedAt: number; evidenceRef: string }; modelObservation?: ReturnType<typeof observeRoleModel>; spec: Task; state: string; base: string; path: string; branch: string; attempt: number; lease: string; expires: number; nativeId: string | null; nativeBootstrap?: { cwd: string; origin_root: string; common_dir: string; branch: string; head: string }; units: Record<string, string>; validated: string | null; pausedState?: string; dispatchBase?: string; configRevision?: number; observedModel?: string | null; observedEffort?: string | null; modelResolution?: { requestedModel: string; requestedEffort: string; resolvedModel: string | null; resolvedEffort: string | null; nativeArguments?: ReturnType<typeof resolveRoleModel>['nativeArguments'] }; acceptanceEvidence?: { acceptanceId: string; evidenceRefs: string[] }[]; changedPaths?: string[]; reportedModel?: string | null; recoveryHead?: string; lastCommitSha?: string; attempts?: { number: number; path: string; branch: string; nativeId: string | null; stopped: boolean; reason: string; configRevision?: number; modelResolution?: Work['modelResolution']; observedModel?: string | null; observedEffort?: string | null; modelObservation?: Work['modelObservation']; resources?: AttemptResources }[] };
 type Finding = Review['findings'][number] & { fingerprint: string; lifecycle: string; seenRounds?: number[]; dispositions?: { status: 'ACCEPTED_RISK' | 'NOT_A_BUG' | 'DEFERRED'; reason: string; actor: 'user'; approvedAt: string; sha: string | null }[] };
 const attemptKey = (taskId: string, attempt: number) => { const key = `${taskId}-${attempt}`; return key.length <= 80 ? key : `attempt-${hash([taskId, attempt])}`; };
 const acceptedGate = (gate: { status: string }) => ['passed', 'waived'].includes(gate.status);
@@ -392,6 +393,7 @@ export class Engine {
     check(dispatch.sha === reviewedSha && await git(run.integrationPath, 'rev-parse', 'HEAD') === reviewedSha && dispatch.source === await sourceFingerprint(run.integrationPath), 'REVIEW_STALE');
     nativeAgentId.parse(nativeId);
     check(!run.implementers?.includes(nativeId) && !Object.values(run.tasks).some(task => task.nativeId === nativeId) && !run.reviews.some(review => review.reviewer === nativeId), 'REVIEW_NOT_INDEPENDENT');
+    verifyPreparedClaudeDefinition(dispatch.nativeContext, dispatch.resolution);
     const observation = observeRoleModel(dispatch.resolution, { model: observedModel, effort: observedEffort }, dispatch.nativeContext.models);
     dispatch.nativeId = nativeId; dispatch.observation = observation; dispatch.state = observation.policyViolation ? 'BLOCKED_MODEL_POLICY' : 'RUNNING';
     this.store.snapshot(run.id, 'model', `${dispatchId}-observed`, { nativeId, observation });
@@ -461,6 +463,7 @@ export class Engine {
     check(repo.root === await realpath(task.path) && repo.commonDir === run.commonDir && repo.branch === task.branch && repo.head === (task.dispatchBase ?? task.base) && !repo.dirty, 'BASE_SHA_MISMATCH');
     if (this.native.source === 'coordinator_native_receipt') check(bootstrap && bootstrap.cwd === repo.root && bootstrap.origin_root === repo.root && bootstrap.common_dir === repo.commonDir && bootstrap.branch === repo.branch && bootstrap.head === repo.head, 'WORKER_BOOTSTRAP_MISMATCH');
     check(task.modelResolution, 'MODEL_RESOLUTION_REQUIRED');
+    verifyPreparedClaudeDefinition(task.nativeContext, task.modelResolution);
     const observation = observeRoleModel(task.modelResolution, { model: observedModel, effort: observedEffort }, task.nativeContext?.models);
     task.modelObservation = observation;
     if (bootstrap) task.nativeBootstrap = structuredClone(bootstrap);

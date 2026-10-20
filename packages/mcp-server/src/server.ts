@@ -72,7 +72,7 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
     const detected = await detectHost(host);
     return { installation: 'READY', host: { ...detected, executionReady: native !== null, capabilityEvidence: native?.source ?? null, capabilities: { ...detected.capabilities, nativeSubagents: native ? 'supported' : 'unknown' } }, coordinatorTokenRef: tokenPath,
       nativeDispatch: native ? 'READY' : 'NEEDS_HOST_HANDSHAKE', originRoot: origin,
-      nativeControl: { transport: 'current_host_agent_tool', daemonRequired: false, executionReady: native !== null, source: native?.source ?? null, model: native?.model ?? null, effort: native?.effort ?? null, perInvocationModel: native?.perInvocationModel ?? false, perInvocationEffort: native?.perInvocationEffort ?? false },
+      nativeControl: { transport: 'current_host_agent_tool', daemonRequired: false, executionReady: native !== null, source: native?.source ?? null, model: native?.model ?? null, effort: native?.effort ?? null, perInvocationModel: native?.perInvocationModel ?? false, perInvocationEffort: native?.perInvocationEffort ?? false, invocationModelIds: native?.invocationModelIds ?? null },
       nativeHandshake: native ? null : { challenge, expiresAt: new Date(challengeExpires).toISOString(), originRoot: origin, nativeTool: host === 'codex' ? 'spawn_agent' : 'Agent' } };
   });
   register('orch_host_connect', { ...auth, native_tool: z.enum(['spawn_agent', 'Agent']), native_agent_id: nativeAgentId,
@@ -102,7 +102,7 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
     check(data.probe.cwd === repo.root && data.probe.origin_root === repo.root && data.probe.branch === repo.branch && data.probe.head === repo.head, 'HOST_CONTEXT_MISMATCH');
     check(!data.native_context.models || data.native_context.models.every(model => model.host === host) && new Set(data.native_context.models.map(model => model.id)).size === data.native_context.models.length, 'HOST_MODEL_METADATA_MISMATCH');
     check(!data.native_context.claudeRoleDefinitions?.length || host === 'claude', 'HOST_MODEL_METADATA_MISMATCH');
-    const claudeRoleDefinitions = data.native_context.claudeRoleDefinitions;
+    const claudeRoleDefinitions = data.native_context.claudeRoleDefinitions ?? native.claudeRoleDefinitions;
     if (claudeRoleDefinitions?.length) verifyClaudeRoleDefinitions(repo.root, claudeRoleDefinitions);
     native = { ...native, ...data.native_context, claudeRoleDefinitions, claudeDefinitionRoot: host === 'claude' ? repo.root : undefined, evidence: [...native.evidence.slice(0, 2), repo.root, repo.head] };
     if (engine) engine.native = native;
@@ -130,7 +130,7 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
     return prepareClaudeRoleDefinition({originRoot: repo.root, commonDir: repo.commonDir, role: data.role, model: model.id, effort, dryRun: data.dry_run});
   });
   register('orch_models', { refresh: z.boolean().default(false) }, async data => ({ ...await getCatalogForHost(origin, host, { refresh: data.refresh }),
-    authenticatedNative: native ? { source: native.source, model: native.model, effort: native.effort, models: native.models ?? [], claudeRoleDefinitions: native.claudeRoleDefinitions ?? [], evidence: native.evidence } : null }));
+    authenticatedNative: native ? { source: native.source, model: native.model, effort: native.effort, models: native.models ?? [], invocationModelIds: native.invocationModelIds ?? null, claudeRoleDefinitions: native.claudeRoleDefinitions ?? [], evidence: native.evidence } : null }));
   register('orch_project_init', { ...auth, complete: z.boolean().default(false), dry_run: z.boolean().default(false), profile: z.enum(['balanced', 'quality', 'economy', 'fast']).optional() }, async data => {
     authenticate(data.coordinator_token); check(origin, 'PROJECT_REQUIRED');
     const root = await git(origin, 'rev-parse', '--show-toplevel');
@@ -162,7 +162,7 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
     if (data.action === 'apply') { authenticate(data.coordinator_token); check(data.approved, 'APPROVAL_REQUIRED'); check(data.expected_hash, 'CONFIG_HASH_REQUIRED'); }
     const loaded = await configuration(), nativeModel = native?.model ?? null;
     const catalog = native?.verified && native.contextMatches && native.perInvocationModel
-      ? (native.models ?? []).filter(model => model.defaultEffort === null || native?.perInvocationEffort) : [];
+      ? (native.models ?? []).filter(model => (!native?.invocationModelIds || native.invocationModelIds.includes(model.id)) && (model.defaultEffort === null || native?.perInvocationEffort)) : [];
     const policy = resolveConfig({ global: loaded.layers.global, project: data.scope === 'global' ? undefined : loaded.layers.project,
       session: data.scope === 'session' ? loaded.layers.session : undefined }).config;
     const recommendation = recommendModels(policy, host, catalog, { scope: data.scope, profile: data.profile,
