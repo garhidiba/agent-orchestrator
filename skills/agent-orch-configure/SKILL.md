@@ -1,5 +1,5 @@
 ---
-name: orch-configure
+name: agent-orch-configure
 description: Explain, configure or optimize ORCH role models, reasoning effort, profiles and execution settings for the current project or an explicitly requested global scope. Use for ORCH quality, speed or usage optimization; exclude settings of unrelated tools.
 ---
 

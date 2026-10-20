@@ -11,6 +11,7 @@ const versionSchema = z.string().regex(/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/);
 const hashesSchema = z.record(z.string(), z.string().regex(/^[a-f0-9]{64}$/));
 const releaseSchema = z.object({ schema: z.literal(1), version: versionSchema, nodeMajor: z.literal(24), platform: z.string(), arch: z.string(), hostExecution: z.literal('UNVERIFIED'), sqlite: z.literal('node:sqlite'), skippedOptionalPackages: z.array(z.string()).default([]), files: hashesSchema }).strict();
 type Release = z.infer<typeof releaseSchema>;
+const releaseSkills = (release: Release) => release.files['skills/agent-orch/SKILL.md'] ? ['agent-orch', 'agent-orch-configure'] : ['orch', 'orch-configure'];
 export type Host = 'codex' | 'claude';
 export interface InstallOptions {
   root: string; home: string; scope: 'user' | 'project'; project?: string; configFile?: string;
@@ -59,7 +60,7 @@ export async function verifyRelease(bundle: string, checksum: string): Promise<R
   for (const name of Object.keys(release.files)) validName(name);
   const actual = await filesAt(bundle); delete actual['release.json'];
   if (!isDeepStrictEqual(actual, release.files)) throw new Error('RELEASE_CONTENT_MISMATCH');
-  for (const required of ['package.json', 'packages/mcp-server/src/stdio.ts', 'skills/orch/SKILL.md', 'skills/orch-configure/SKILL.md', 'templates/defaults/config.yaml']) {
+  for (const required of ['package.json', 'packages/mcp-server/src/stdio.ts', ...releaseSkills(release).map(name => `skills/${name}/SKILL.md`), 'templates/defaults/config.yaml']) {
     if (!release.files[required]) throw new Error(`RELEASE_MISSING_ASSET: ${required}`);
   }
   if (release.platform !== process.platform || release.arch !== process.arch) throw new Error('RELEASE_PLATFORM_UNVERIFIED');
@@ -226,6 +227,12 @@ async function apply(changes: Change[]) {
     throw error;
   }
 }
+async function removeEmptyOwnedDirectories(changes: Change[]) {
+  const dirs = new Set(changes.filter(change => change.after === null).map(change => dirname(change.file)));
+  for (const dir of [...dirs].sort((a, b) => b.length - a.length)) {
+    try { await rmdir(dir); } catch (error) { if (!['ENOENT', 'ENOTEMPTY'].includes((error as NodeJS.ErrnoException).code!)) throw error; }
+  }
+}
 async function locked<T>(root: string, action: () => Promise<T>) {
   await safe(root, dirname(root));
   await mkdir(root, { recursive: true });
@@ -264,7 +271,7 @@ export async function install(options: InstallOptions) {
       mcp.orch = entry;
       const owned: Record<string, string> = {};
       const sources: Record<string, Buffer> = {};
-      for (const skill of ['orch', 'orch-configure']) {
+      for (const skill of releaseSkills(release)) {
         const target = join(skillRoot(host, base), skill); await safe(target, base);
         const sourcePrefix = `skills/${skill}/`;
         for (const name of Object.keys(release.files)) {
@@ -273,7 +280,7 @@ export async function install(options: InstallOptions) {
         }
         try {
           const current = await filesAt(target);
-          if (!previous) throw new Error(`INSTALL_CONFLICT: ${target}`);
+          if (!previous?.files[join(target, 'SKILL.md')]) throw new Error(`INSTALL_CONFLICT: ${target}`);
           for (const name of Object.keys(current)) {
             const file = join(target, name);
             if (!previous || previous.files[file] !== current[name]) throw new Error(`INSTALL_CONFLICT: ${file}`);
@@ -317,6 +324,7 @@ export async function install(options: InstallOptions) {
       if (options.migrate) { await options.migrate(orchConfig, manifest.activeVersion); const migrated = await optional(orchConfig); if (migrated) parseConfig(migrated.toString()); }
       changes.push({ file: manifestFile, before: await optional(manifestFile), after: Buffer.from(JSON.stringify(newManifest, null, 2) + '\n') });
       await apply(changes);
+      await removeEmptyOwnedDirectories(changes);
     } catch (error) {
       if (options.migrate) { if (oldConfig) await atomic(orchConfig, oldConfig); else await rm(orchConfig, { force: true }); }
       throw error;
@@ -361,11 +369,7 @@ export async function uninstall(options: Pick<InstallOptions, 'root' | 'home' | 
     if (!options.dryRun) {
       changes.push({ file: manifestFile, before: await optional(manifestFile), after: Buffer.from(JSON.stringify(next, null, 2) + '\n') });
       await apply(changes);
-      const dirs = new Set(changes.filter(change => change.after === null).map(change => dirname(change.file)));
-      for (const host of options.hosts.filter(host => manifest.hosts[host])) for (const skill of ['orch', 'orch-configure']) dirs.add(join(skillRoot(host, base), skill));
-      for (const dir of [...dirs].sort((a, b) => b.length - a.length)) {
-        try { await rmdir(dir); } catch (error) { if (!['ENOENT', 'ENOTEMPTY'].includes((error as NodeJS.ErrnoException).code!)) throw error; }
-      }
+      await removeEmptyOwnedDirectories(changes);
     }
     return { removedHosts: options.hosts.filter(host => manifest.hosts[host]), preserved, keepData: true, retainedVersions: true, dryRun: !!options.dryRun };
   };

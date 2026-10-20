@@ -8,7 +8,7 @@ import { parse } from 'yaml';
 import { configSchema } from '../../packages/protocol/src/config.ts';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
-const names = ['orch', 'orch-configure'];
+const names = ['agent-orch', 'agent-orch-configure'];
 const links = (text: string) => [...text.matchAll(/\[[^\]]*\]\(([^)\s]+)\)/g)]
   .map(match => match[1]).filter(path => !/^[a-z]+:/i.test(path)).map(path => path.split('#')[0]).filter(Boolean);
 

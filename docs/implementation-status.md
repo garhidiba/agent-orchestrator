@@ -41,7 +41,7 @@ npm run orch:manage -- --help
 npm run schema
 ```
 
-`doctor --host codex|claude`는 설치된 실행 파일의 metadata 조회 진단이며 native 실행 가능 판정이 아니다. 대화형 진입은 설치 후 `$orch`/`/orch`를 사용하되, 현재 대화의 네이티브 연결 절차를 자동 수행하며 실제 도구 부재나 작업 공간 불일치는 계속 차단한다.
+`doctor --host codex|claude`는 설치된 실행 파일의 metadata 조회 진단이며 native 실행 가능 판정이 아니다. 대화형 진입은 설치 후 `$agent-orch`/`/agent-orch`를 사용하되, 현재 대화의 네이티브 연결 절차를 자동 수행하며 실제 도구 부재나 작업 공간 불일치는 계속 차단한다.
 
 ## 적용한 개발 워크플로
 

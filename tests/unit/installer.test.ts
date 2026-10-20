@@ -293,3 +293,35 @@ test('one installer command builds, verifies and installs locally without bundle
     assert.deepEqual(await readdir(temporary), []);
   } finally { await rm(f.dir, { recursive: true, force: true }); }
 });
+
+test('renaming entry skills migrates owned installs, supports rollback and preserves edited legacy skills', async () => {
+  const { rename, access } = await import('node:fs/promises');
+  const { rollback, uninstall } = await import('../../packages/installer/src/installation/index.ts');
+  const f = await fixture(), options = { ...f, hosts: ['codex', 'claude'] as const, scope: 'user' as const };
+  try {
+    await install(options);
+    await rename(join(f.source, 'skills/orch'), join(f.source, 'skills/agent-orch'));
+    await rename(join(f.source, 'skills/orch-configure'), join(f.source, 'skills/agent-orch-configure'));
+    const bundle = join(f.dir, 'renamed-bundle'), checksum = await packRelease(f.source, bundle, '0.2.0');
+    const next = { ...options, bundle, checksum };
+    await install(next);
+    for (const host of ['.agents', '.claude']) {
+      await access(join(f.home, host, 'skills/agent-orch/SKILL.md'));
+      await access(join(f.home, host, 'skills/agent-orch-configure/SKILL.md'));
+      await assert.rejects(access(join(f.home, host, 'skills/orch')), { code: 'ENOENT' });
+      await assert.rejects(access(join(f.home, host, 'skills/orch-configure')), { code: 'ENOENT' });
+    }
+    await rollback({ ...options, version: '0.1.0' });
+    await access(join(f.home, '.agents/skills/orch/SKILL.md'));
+    await assert.rejects(access(join(f.home, '.agents/skills/agent-orch')), { code: 'ENOENT' });
+    await install(next); await uninstall(options);
+    await assert.rejects(access(join(f.home, '.agents/skills/agent-orch')), { code: 'ENOENT' });
+    await rollback({ ...options, version: '0.1.0' });
+    const edited = join(f.home, '.agents/skills/orch/SKILL.md'); await writeFile(edited, 'user-owned edits');
+    const config = await readFile(join(f.home, '.codex/config.toml'), 'utf8');
+    await assert.rejects(install(next), /INSTALL_CONFLICT/);
+    assert.equal(await readFile(edited, 'utf8'), 'user-owned edits');
+    assert.equal(await readFile(join(f.home, '.codex/config.toml'), 'utf8'), config);
+    await assert.rejects(access(join(f.home, '.agents/skills/agent-orch')), { code: 'ENOENT' });
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
