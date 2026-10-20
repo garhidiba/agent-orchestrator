@@ -19,10 +19,11 @@ import { completionEvidence, findingBlocks } from './completion.ts';
 import { resolveRoleModel, observeRoleModel, type NativeModelContext } from './models.ts';
 import { enforceRunBudget, activeElapsedMs, reconcileExpiredTasks, confirmHostHeartbeat, type HostHeartbeat } from './lifecycle.ts';
 import { allocateAttemptResources, reservePort, type AttemptResources } from './resources.ts';
+import { prepareNodeDependencies, type DependencySetup } from './dependencies.ts';
 
 const exec = promisify(execFile);
 type Gate = { id?: string; details?: GateResult[]; stage: string; task: string | null; sha: string; source: string; commands: string; status: string; results: { id: string; status: string; exitCode: number | null }[] };
-type Work = { nativeContext?: NativeCapability; resources?: AttemptResources; deadline?: number; heartbeat?: { observedAt: number; evidenceRef: string }; modelObservation?: ReturnType<typeof observeRoleModel>; spec: Task; state: string; base: string; path: string; branch: string; attempt: number; lease: string; expires: number; nativeId: string | null; nativeBootstrap?: { cwd: string; origin_root: string; common_dir: string; branch: string; head: string }; units: Record<string, string>; validated: string | null; pausedState?: string; dispatchBase?: string; configRevision?: number; observedModel?: string | null; observedEffort?: string | null; modelResolution?: { requestedModel: string; requestedEffort: string; resolvedModel: string | null; resolvedEffort: string | null }; acceptanceEvidence?: { acceptanceId: string; evidenceRefs: string[] }[]; changedPaths?: string[]; reportedModel?: string | null; recoveryHead?: string; lastCommitSha?: string; attempts?: { number: number; path: string; branch: string; nativeId: string | null; stopped: boolean; reason: string; configRevision?: number; modelResolution?: Work['modelResolution']; observedModel?: string | null; observedEffort?: string | null; modelObservation?: Work['modelObservation']; resources?: AttemptResources }[] };
+type Work = { dependencySetup?: DependencySetup | null; nativeContext?: NativeCapability; resources?: AttemptResources; deadline?: number; heartbeat?: { observedAt: number; evidenceRef: string }; modelObservation?: ReturnType<typeof observeRoleModel>; spec: Task; state: string; base: string; path: string; branch: string; attempt: number; lease: string; expires: number; nativeId: string | null; nativeBootstrap?: { cwd: string; origin_root: string; common_dir: string; branch: string; head: string }; units: Record<string, string>; validated: string | null; pausedState?: string; dispatchBase?: string; configRevision?: number; observedModel?: string | null; observedEffort?: string | null; modelResolution?: { requestedModel: string; requestedEffort: string; resolvedModel: string | null; resolvedEffort: string | null }; acceptanceEvidence?: { acceptanceId: string; evidenceRefs: string[] }[]; changedPaths?: string[]; reportedModel?: string | null; recoveryHead?: string; lastCommitSha?: string; attempts?: { number: number; path: string; branch: string; nativeId: string | null; stopped: boolean; reason: string; configRevision?: number; modelResolution?: Work['modelResolution']; observedModel?: string | null; observedEffort?: string | null; modelObservation?: Work['modelObservation']; resources?: AttemptResources }[] };
 type Finding = Review['findings'][number] & { fingerprint: string; lifecycle: string; seenRounds?: number[]; dispositions?: { status: 'ACCEPTED_RISK' | 'NOT_A_BUG' | 'DEFERRED'; reason: string; actor: 'user'; approvedAt: string; sha: string | null }[] };
 const attemptKey = (taskId: string, attempt: number) => { const key = `${taskId}-${attempt}`; return key.length <= 80 ? key : `attempt-${hash([taskId, attempt])}`; };
 const acceptedGate = (gate: { status: string }) => ['passed', 'waived'].includes(gate.status);
@@ -179,6 +180,7 @@ export class Engine {
       } else if (request.tool === 'orch_task_prepare' && task) {
         const repo = await inspectRepository(task.path);
         check(repo.commonDir === run.commonDir && repo.branch === task.branch && repo.head === (task.dispatchBase ?? task.base) && !repo.dirty && task.state === 'LEASED', 'RECOVERY_WORKTREE_NOT_PROVEN');
+        task.dependencySetup = await prepareNodeDependencies(run.origin, task.path);
         // The caller never received the lost dispatch; retain its lease, do not start another worker.
         result = { recovered: true, task, requiresNativeStateCheck: true };
       } else if (request.tool === 'orch_reintegrate') {
@@ -204,6 +206,7 @@ export class Engine {
   }
   async gate(run: Run, stage: string, path: string, task: string | null = null) {
     enforceRunBudget(run);
+    await prepareNodeDependencies(run.origin, path);
     let commands = run.config.quality.commands.filter(command => command.stages.includes(stage as 'baseline') && (task === null || run.tasks[task].spec.verification_ids.includes(command.id)));
     if (!commands.length && run.missingTestsWaiver) commands = [{ id: 'missing-tests', executable: process.execPath, args: [], cwd: '.', stages: ['baseline', 'task', 'integration', 'final'], required: true, timeout_seconds: 1 }];
     check(commands.some(command => command.required), 'REQUIRED_GATES_MISSING');
@@ -300,6 +303,7 @@ export class Engine {
     await this.syncConfig(run);
     const resolution = resolveRoleModel({ config: run.config, host: run.host, role: task.spec.role, native: this.native });
     check(await git(run.integrationPath, 'rev-parse', 'HEAD') === (run.integrationSha ?? run.targetBase), 'INTEGRATION_DRIFT');
+    await prepareNodeDependencies(run.origin, run.integrationPath);
     const reuse = Object.keys(task.units).length > 0;
     const createRecovered = reuse && !!task.recoveryHead;
     if (reuse && task.recoveryHead) {
@@ -323,6 +327,7 @@ export class Engine {
     task.validated = null; task.observedModel = null; task.observedEffort = null; task.modelObservation = undefined; task.nativeBootstrap = undefined; task.resources = undefined;
     task.state = 'LEASED'; task.nativeId = null; this.checkpointIntent(run);
     if (!reuse || createRecovered) await git(run.origin, 'worktree', 'add', '-b', task.branch, task.path, task.dispatchBase ?? task.base);
+    task.dependencySetup = await prepareNodeDependencies(run.origin, task.path);
     const reservation = await reservePort();
     try { task.resources = await allocateAttemptResources(run.origin, run.id, attemptKey(taskId, task.attempt), { host: reservation.host, port: reservation.port }); }
     catch (error) { await reservation.release(); throw error; }
@@ -332,7 +337,7 @@ export class Engine {
     this.store.snapshot(run.id, 'attempt', `${attemptKey(taskId, task.attempt)}-prepared`, task);
     return { runId: run.id, taskId, attemptId: attemptKey(taskId, task.attempt), host: run.host, role: task.spec.role,
       modelId: resolution.resolvedModel, effort: resolution.resolvedEffort, nativeArguments: resolution.nativeArguments, resources: task.resources, configRevision: task.configRevision, baseSha: task.dispatchBase ?? task.base, lineageBaseSha: task.base, worktreePath: task.path,
-      isolation: 'core_managed', leaseId: task.lease, fencingToken: task.attempt, expiresAt: new Date(task.expires).toISOString(), taskBrief: task.spec };
+      isolation: 'core_managed', dependencySetup: task.dependencySetup, leaseId: task.lease, fencingToken: task.attempt, expiresAt: new Date(task.expires).toISOString(), taskBrief: task.spec };
   }
   async attemptPort(run: Run, taskId: string, lease: string, generation: number, action: 'status' | 'release_for_claim') {
     const task = run.tasks[taskId]; check(task, 'TASK_NOT_FOUND');
