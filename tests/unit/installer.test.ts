@@ -160,6 +160,36 @@ test('AT-053/056: shell launcher installs copy assets from a space/Korean path w
   } finally { await rm(f.dir, { recursive: true, force: true }); }
 });
 
+test('uninstall shell entry through a linked checkout previews and removes both hosts while preserving data', { skip: process.platform === 'win32' }, async () => {
+  const { symlink, access } = await import('node:fs/promises');
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const { fileURLToPath } = await import('node:url');
+  const f = await fixture();
+  try {
+    await install({ ...f, hosts: ['codex', 'claude'], scope: 'user' });
+    await mkdir(join(f.root, 'runs')); await writeFile(join(f.root, 'runs/keep.txt'), 'keep');
+    const linked = join(f.dir, 'linked checkout');
+    await symlink(fileURLToPath(new URL('../../', import.meta.url)), linked);
+    const config = await readFile(join(f.home, '.config/orch/config.yaml'));
+    const manifest = await readFile(join(f.root, 'installation.json'));
+    const run = async (...args: string[]) => JSON.parse((await promisify(execFile)('/bin/sh', [join(linked, 'scripts/uninstall.sh'), '--root', f.root, ...args], {
+      cwd: f.dir, env: { ...process.env, HOME: f.home, USERPROFILE: f.home }, timeout: 10000,
+    })).stdout);
+    assert.deepEqual((await run('--dry-run')).removedHosts, ['codex', 'claude']);
+    assert.deepEqual(await readFile(join(f.root, 'installation.json')), manifest);
+    assert.deepEqual((await run()).removedHosts, ['codex', 'claude']);
+    assert.deepEqual((await run()).removedHosts, []);
+    for (const host of ['.agents', '.claude']) await assert.rejects(access(join(f.home, host, 'skills/orch/SKILL.md')), { code: 'ENOENT' });
+    assert.doesNotMatch(await readFile(join(f.home, '.codex/config.toml'), 'utf8'), /mcp_servers\.orch/);
+    assert.equal(JSON.parse(await readFile(join(f.home, '.claude.json'), 'utf8')).mcpServers.orch, undefined);
+    assert.match(await readFile(join(f.home, '.codex/config.toml'), 'utf8'), /user-model/);
+    assert.deepEqual(await readFile(join(f.home, '.config/orch/config.yaml')), config);
+    assert.equal(await readFile(join(f.root, 'runs/keep.txt'), 'utf8'), 'keep');
+    await access(join(f.root, 'versions/0.1.0/release.json'));
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
+
 test('installer rejects symlinked host settings instead of writing through them', async () => {
   const { symlink } = await import('node:fs/promises');
   const f = await fixture();

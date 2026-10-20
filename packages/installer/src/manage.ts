@@ -1,7 +1,7 @@
 import { parseArgs } from 'node:util';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { install, update, rollback, uninstall, packRelease, type Host } from './installation/index.ts';
 import { detectHost } from './detection/host.ts';
@@ -88,7 +88,7 @@ export async function manage(args: string[]) {
   return (command === 'update' ? update : install)({ ...options, bundle: resolve(values.bundle), checksum: values.checksum });
 }
 
-if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
+if (process.argv[1] && await realpath(resolve(process.argv[1])) === fileURLToPath(import.meta.url)) {
   try { const result = await manage(process.argv.slice(2)); console.log('help' in result ? result.help : JSON.stringify(result, null, 2)); }
   catch (error) { console.error(error instanceof Error ? error.message : 'Installation failed'); process.exitCode = 1; }
 }
