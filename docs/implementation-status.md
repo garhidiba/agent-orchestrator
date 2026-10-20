@@ -23,7 +23,7 @@
 
 ## 남은 구현과 출시 차단 조건
 
-- **Production native adapter 부재:** 실제 MCP Engine은 검증된 native capability 없이 생성된다. `orch_environment`는 `BLOCKED_CAPABILITY`를 유지한다. Codex read-only probe에서 control socket 부재를 관측했으며, socket 도달만으로 현재 세션 identity/권한을 증명할 수도 없다. Claude native model/effort·worktree binding·reload·stop/resume도 실제 adapter와 증거가 없다.
+- **네이티브 모델·호스트 지원 범위:** 현재 대화의 실제 Agent 응답을 인증된 coordinator relay로 연결하며 별도 daemon socket은 요구하지 않는다. 기본 auto/inherit는 호스트 기본값을 상속하고 실제 모델·effort 관측은 null이다. 구체적인 모델·effort 고정값, Claude 실제 Agent 실행과 OS별 동작에는 추가 검증이 필요하다. relay는 호스트 서명 증명이 아닌 신뢰된 부모의 전달이며 각 워커의 실제 Git bootstrap을 별도 대조한다.
 - **로컬 API 제한:** checkpoint는 `leaseRenewed=false`이며 heartbeat lease 연장을 제공하지 않는다. session override는 프로세스 수명만 유지하며 서버 재시작 후에는 새 hash로 승인된 설정을 다시 적용해야 한다. 요구사항은 제출·저장 후 plan과 일치해야 하며 실행 시작 후 교체할 수 없다.
 - **통합된 정책:** pause 시간을 제외한 active budget, snapshot별 명시 gate/missing-tests waiver, 반복 finding 재분석 제한과 run/target별 finalize preapproval이 로컬 테스트로 검증됐다. waiver는 passed와 구분하며 config 값만으로 사용자 승인을 대신하지 않는다. 실제 호스트 승인·실행 검증과는 별개이다.
 - **실제 출시 증거 부족:** Codex/Claude 각각 catalog → selection → native worker → 적용/관측 → 검증·review·finalize·복구·cleanup 경로를 완료해야 한다. Linux, Windows native/PowerShell, WSL 및 실제 두 호스트 설치/update/removal smoke는 미검증이다.
@@ -41,8 +41,16 @@ npm run orch:manage -- --help
 npm run schema
 ```
 
-`doctor --host codex|claude`는 설치된 실행 파일의 metadata 조회 진단이며 native 실행 가능 판정이 아니다. 대화형 진입은 설치 후 `$orch`/`/orch`를 사용하되, production capability 차단을 우회하지 않는다.
+`doctor --host codex|claude`는 설치된 실행 파일의 metadata 조회 진단이며 native 실행 가능 판정이 아니다. 대화형 진입은 설치 후 `$orch`/`/orch`를 사용하되, 현재 대화의 네이티브 연결 절차를 자동 수행하며 실제 도구 부재나 작업 공간 불일치는 계속 차단한다.
 
 ## 적용한 개발 워크플로
 
 최소 변경과 구현은 `minimal-code`, `ponytail`, 회귀 검증은 `mattpocock-skills:tdd`, `diagnose`, fixture 경계는 `software-engineering-foundations`, 병렬 worktree 통합은 `multi-agent-git-orchestration`을 적용했다. 공식 host API 조사는 `openai-docs`, 설치 스킬 작성은 `skill-creator`와 `mattpocock-skills:writing-for-agents`, README는 `awesome-readme-adaptation`을 적용했다. 독립 검토는 `ponytail-review`, `pr-security-review`, `security-hardening-review`, `dependency-vulnerability-audit`, `security-verification`을 적용했다. 비활성 `qa-verification`은 실행하지 않았다.
+
+## 실제 네이티브 준비 상태 수정과 테스트
+
+2026-10-20: `365e727`에서 항상 null이던 production native 연결과 잘못된 daemon socket 전제조건을 수정했다. 설치는 `installation=READY`, 첫 실행은 실제 부모 호스트 Agent의 read-only challenge 응답을 `orch_host_connect`로 전달한 뒤 `nativeDispatch=READY`가 된다. 저장소/만료/재사용/인증/개별 워커 bootstrap 검사가 유지된다. 코드 typecheck와 102개 테스트가 통과했고 독립 보안 검토 및 집중 테스트 16개도 통과했다.
+
+설치본 `0.1.0-local.16e8bcab654f3cb2`로 임시 Git 저장소에서 실제 native `spawn_agent`를 사용했다. 워커가 지정 worktree에서 read-only bootstrap 후 `result.txt`에 정확한 `ORCH native ready\n` 바이트를 썼다. MCP가 content assertion, 단위 커밋, 통합을 수행했고 별도 네이티브 reviewer와 auditor가 실제 diff/바이트/계보를 확인했다. 최종 target SHA는 `fcbcfae2bd809f2e8eee399a99d79bc4b3ff5f4a`, run은 `run-e131609e-1617-42d6-bdd3-d10e5d909fa2`, 보고서는 `COMPLETED`, `completionVerified=true`, blockers 빈 배열, cleanup complete이다. 원본 프로젝트는 수정하지 않았다.
+
+이는 현재 Codex 대화에서의 단일 태스크 실행 증거다. 실제 모델·effort·계정 권한은 null/unknown을 유지하며 Claude native E2E, 역할별 concrete model/effort, 다른 OS, heartbeat 연장은 이 테스트로 승인하지 않는다. 최신 source에서는 host.executionReady 표시도 실제 연결 상태와 일치시켰으며 관련 MCP/protocol/skill 집중 테스트 17개가 통과했다.

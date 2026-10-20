@@ -62,7 +62,8 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
   }
   register('orch_environment', {}, async () => {
     if (!native && Date.now() > challengeExpires) { challenge = randomBytes(32).toString('hex'); challengeExpires = Date.now() + 300000; }
-    return { installation: 'READY', host: await detectHost(host), coordinatorTokenRef: tokenPath,
+    const detected = await detectHost(host);
+    return { installation: 'READY', host: { ...detected, executionReady: native !== null, capabilityEvidence: native?.source ?? null, capabilities: { ...detected.capabilities, nativeSubagents: native ? 'supported' : 'unknown' } }, coordinatorTokenRef: tokenPath,
       nativeDispatch: native ? 'READY' : 'NEEDS_HOST_HANDSHAKE', originRoot: origin,
       nativeControl: { transport: 'current_host_agent_tool', daemonRequired: false, executionReady: native !== null, source: native?.source ?? null, model: native?.model ?? null, effort: native?.effort ?? null },
       nativeHandshake: native ? null : { challenge, expiresAt: new Date(challengeExpires).toISOString(), originRoot: origin, nativeTool: host === 'codex' ? 'spawn_agent' : 'Agent' } };

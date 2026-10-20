@@ -133,7 +133,8 @@ test('installed MCP connects the current native coordinator without a daemon and
     assert.equal(connected.state, 'READY'); assert.equal(connected.source, 'coordinator_native_receipt');
     assert.equal(connected.model, null); assert.equal(connected.effort, null);
     assert.equal((await call('orch_host_connect', receipt)).error.code, 'HOST_ALREADY_CONNECTED');
-    assert.equal((await call('orch_environment')).data.nativeDispatch, 'READY');
+    const readyEnvironment = (await call('orch_environment')).data;
+    assert.equal(readyEnvironment.nativeDispatch, 'READY'); assert.equal(readyEnvironment.host.executionReady, true);
     await f.change({ action: 'plan' }, run => f.engine.plan(run, f.plan, true));
     const envelope = { ...auth, protocol_version: 1, run_id: f.created.runId, operation_id: 'prepare-native', expected_state_version: f.engine.status(f.created.runId).version, input: { task_id: 'T1' } };
     const prepareResult = await call('orch_task_prepare', envelope); assert.equal(prepareResult.error, undefined, JSON.stringify(prepareResult));

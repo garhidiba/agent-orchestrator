@@ -8,7 +8,7 @@ Baseline: integrated source `d6f73631e6eb875a87e282871cf5a536a5b93638`, 2026-10-
 - Checkpoint is summary-only (`leaseRenewed=false`); no heartbeat renewal API.
 - Session overrides intentionally last only for the MCP server process; restart does not persist them. Requirements submission is now an authenticated engine operation and must precede a plan with exactly matching acceptance criteria.
 - Dedicated conflict-resolution and partial-delete/retry acceptance scenarios are not demonstrated by the current named tests. These are local evidence gaps, independent of host availability.
-- Native production adapters are absent. Codex’s read-only probe cannot prove current-session authority even with a reachable socket; Claude native lifecycle/model/effort application is likewise unimplemented/unproven.
+- Current-host native relay is implemented and a real inherited Codex task passed worker bootstrap, validation, independent review/audit, finalization and cleanup. See the native smoke record in implementation-status.md. Concrete role model/effort and actual Claude native lifecycle remain unverified; coordinator receipts are not signed host/account proof.
 
 ## Acceptance index
 
@@ -79,8 +79,12 @@ Named tests below are stable test titles or owning suites under `tests/unit/`; r
 
 `npm run check` runs the project typecheck and deterministic suite; use the current output for the exact result/count. `node --test tests/unit/skills.test.ts` checks generated installed reference paths, frontmatter, configured roles and bilingual fixture integrity. Installer tests use temporary user/project paths; native metadata processes are fixtures unless explicitly recorded otherwise.
 
-For M0–M6, deterministic config/runtime/installer foundations are implemented in part. M0 native capability, M2 both-host real single-task E2E and M6 OS/release acceptance remain incomplete. No injected fixture capability may make the production gate green.
+For M0–M6, deterministic config/runtime/installer foundations are implemented in part. The current Codex inherited-worker smoke passed; M0 concrete role selection, M2 both-host E2E and M6 OS/release acceptance remain incomplete. No injected fixture capability may make the production gate green.
 
 ## Skill evaluation
 
 `skills/evaluations.json` supplies Korean and English positive/negative prompts for automatic settings, pinned models, global/project scope, explanation-only, unrelated tools, status and unsafe approval bypass. Expected route/effect are oracles, not actual host outcomes. Evaluate each in a disposable installed host context and record route, writes, preserved overrides and capability decisions. Structural tests validate packaging only.
+
+## Native readiness follow-up
+
+The dated baseline table above precedes `365e727`. The current-conversation native relay now has a real Codex single-task smoke: challenge → read-only Git bootstrap → native edit → MCP validation/unit commit/integration → independent native review/audit → approved finalization → owned cleanup. Report: COMPLETED, completionVerified=true, no blockers. Full details and exact SHAs are in [implementation status](implementation-status.md#실제-네이티브-준비-상태-수정과-테스트). This supersedes baseline statements that production dispatch is always absent/blocked, but does not establish untested model pins, Claude execution or other operating systems.
