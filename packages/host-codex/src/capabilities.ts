@@ -3,7 +3,7 @@ import { promisify } from 'node:util';
 
 import { resolveExecutable } from '../../core/src/process/executable.ts';
 const exec = promisify(execFile);
-// This read-only probe never starts a daemon or treats its existence as native-session authority.
+// Optional daemon diagnostic only; current-conversation native Agent dispatch does not require this socket.
 export async function inspectCodexNativeControl(executable?: string, timeout = 5000) {
   const base = { status: 'BLOCKED_CAPABILITY' as const, executionReady: false as const, contextMatches: false as const,
     checkedAt: new Date().toISOString(), evidence: 'codex app-server daemon version',

@@ -103,3 +103,47 @@ test('MCP session patches use CAS, dry-run and instance isolation without config
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('installed MCP connects the current native coordinator without a daemon and prepares inherited workers', async () => {
+  const { runtimeFixture } = await import('../fixtures/runtime.ts');
+  const { readFile, realpath } = await import('node:fs/promises');
+  const { git } = await import('../../packages/core/src/git/repository.ts');
+  const f = await runtimeFixture(false), tokenPath = join(f.dir, 'host.token');
+  const server = await createServer(f.root, 'codex', join(f.dir, 'managed'), tokenPath);
+  const client = new Client({ name: 'native-relay-contract', version: '1' });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(a); await client.connect(b);
+    const call = async (name: string, args: Record<string, unknown> = {}) => {
+      const response = await client.callTool({ name, arguments: args });
+      return JSON.parse((response.content as { text: string }[])[0].text);
+    };
+    const environment = (await call('orch_environment')).data;
+    assert.equal(environment.installation, 'READY');
+    assert.equal(environment.nativeDispatch, 'NEEDS_HOST_HANDSHAKE');
+    const auth = { coordinator_token: await readFile(tokenPath, 'utf8') };
+    const receipt = { ...auth, native_tool: 'spawn_agent', native_agent_id: '/root/native-probe',
+      probe: { challenge: environment.nativeHandshake.challenge, cwd: await realpath(f.root), origin_root: await realpath(f.root),
+        branch: await git(f.root, 'branch', '--show-current'), head: await git(f.root, 'rev-parse', 'HEAD') } };
+    assert.equal((await call('orch_host_connect', { ...receipt, coordinator_token: 'worker' })).error.code, 'COORDINATOR_RELAY_REQUIRED');
+    assert.equal((await call('orch_host_connect', { ...receipt, probe: { ...receipt.probe, head: 'a'.repeat(40) } })).error.code, 'HOST_CONTEXT_MISMATCH');
+    assert.equal((await call('orch_host_connect', { ...receipt, probe: { ...receipt.probe, challenge: '0'.repeat(64) } })).error.code, 'HOST_CHALLENGE_MISMATCH');
+    const connectResult = await call('orch_host_connect', receipt); assert.equal(connectResult.error, undefined, JSON.stringify(connectResult));
+    const connected = connectResult.data;
+    assert.equal(connected.state, 'READY'); assert.equal(connected.source, 'coordinator_native_receipt');
+    assert.equal(connected.model, null); assert.equal(connected.effort, null);
+    assert.equal((await call('orch_host_connect', receipt)).error.code, 'HOST_ALREADY_CONNECTED');
+    assert.equal((await call('orch_environment')).data.nativeDispatch, 'READY');
+    await f.change({ action: 'plan' }, run => f.engine.plan(run, f.plan, true));
+    const envelope = { ...auth, protocol_version: 1, run_id: f.created.runId, operation_id: 'prepare-native', expected_state_version: f.engine.status(f.created.runId).version, input: { task_id: 'T1' } };
+    const prepareResult = await call('orch_task_prepare', envelope); assert.equal(prepareResult.error, undefined, JSON.stringify(prepareResult));
+    const prepared = prepareResult.data;
+    assert.ok(prepared.result.worktreePath); assert.equal(prepared.result.modelId, null); assert.equal(prepared.result.effort, null);
+    const blocked = await call('orch_task_bind', { ...envelope, operation_id: 'bad-bootstrap', expected_state_version: prepared.version, input: { task_id: 'T1', lease_id: prepared.result.leaseId, fencing_token: prepared.result.fencingToken, native_id: '/root/native-worker', observed_model: null, observed_effort: null } });
+    assert.ok(blocked.error, 'host-relay workers must supply their observed Git bootstrap identity');
+    const path = prepared.result.worktreePath;
+    const bootstrap = { cwd: await realpath(path), origin_root: await git(path, 'rev-parse', '--show-toplevel'), common_dir: await git(path, 'rev-parse', '--path-format=absolute', '--git-common-dir'), branch: await git(path, 'branch', '--show-current'), head: await git(path, 'rev-parse', 'HEAD') };
+    const bound = await call('orch_task_bind', { ...envelope, operation_id: 'bind-native', expected_state_version: prepared.version, input: { task_id: 'T1', lease_id: prepared.result.leaseId, fencing_token: prepared.result.fencingToken, native_id: '/root/native-worker', observed_model: null, observed_effort: null, bootstrap } });
+    assert.equal(bound.error, undefined, JSON.stringify(bound)); assert.equal(bound.data.result.state, 'RUNNING');
+  } finally { await client.close(); await server.close(); await f.close(); }
+});

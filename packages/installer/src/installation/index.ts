@@ -303,7 +303,7 @@ export async function install(options: InstallOptions) {
     else changes.push({ file: orchConfig, before: null, after: await readAsset(options.bundle, release, 'templates/defaults/config.yaml') });
     newManifest.activeVersion = release.version;
     newManifest.releases[release.version] = options.checksum;
-    const result = { version: release.version, hosts: [...new Set(options.hosts)], scope: options.scope, packagePath: versionDir, dryRun: !!options.dryRun, reload: 'NEEDS_RELOAD', execution: 'UNVERIFIED', mcp: 'CONFIGURED_NOT_HANDSHAKE_VERIFIED', authentication: 'NOT_CHECKED', preservedRunVersions: true };
+    const result = { installation: 'READY', version: release.version, hosts: [...new Set(options.hosts)], scope: options.scope, packagePath: versionDir, dryRun: !!options.dryRun, reload: 'NEEDS_RELOAD', execution: 'UNVERIFIED', mcp: 'CONFIGURED_NOT_HANDSHAKE_VERIFIED', authentication: 'NOT_CHECKED', preservedRunVersions: true };
     if (options.dryRun) return result;
     if (!existingVersion) {
       await mkdir(dirname(versionDir), { recursive: true });

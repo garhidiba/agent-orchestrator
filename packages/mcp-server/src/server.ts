@@ -10,11 +10,10 @@ import { createSessionConfig } from '../../core/src/config/session.ts';
 import { patchConfig } from '../../core/src/config/write.ts';
 import { detectHost } from '../../installer/src/detection/host.ts';
 import { getCatalogForHost } from '../../core/src/model-registry/service.ts';
-import { inspectCodexNativeControl } from '../../host-codex/src/capabilities.ts';
 import { buildReport, writeReport } from '../../core/src/reporting/index.ts';
-import { git } from '../../core/src/git/repository.ts';
-import { envelopeSchema, id, requirementsSchema, planSchema, reviewSchema, taskResultSchema, requireCondition as check } from '../../protocol/src/runtime.ts';
-import type { Run } from '../../core/src/runtime/engine.ts';
+import { git, inspectRepository } from '../../core/src/git/repository.ts';
+import { envelopeSchema, id, nativeAgentId, sha, requirementsSchema, planSchema, reviewSchema, taskResultSchema, requireCondition as check } from '../../protocol/src/runtime.ts';
+import type { NativeCapability, Run } from '../../core/src/runtime/engine.ts';
 
 export async function createServer(origin: string | null, host: 'codex' | 'claude', managedRoot: string, tokenPath: string) {
   await mkdir(join(tokenPath, '..'), { recursive: true });
@@ -25,13 +24,14 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
   const token = (await readFile(tokenPath, 'utf8')).trim();
   check(/^[a-f0-9]{64}$/.test(token), 'COORDINATOR_TOKEN_INVALID');
   const server = new McpServer({ name: 'orch', version: '0.1.0' }, { maxToolInputElements: 20000 });
-  let engine: Engine | null = null;
+  let engine: Engine | null = null, native: NativeCapability | null = null;
+  let challenge = randomBytes(32).toString('hex'), challengeExpires = Date.now() + 300000;
   const session = createSessionConfig();
   const configuration = async () => {
     const loaded = await loadConfig(origin), snapshot = session.snapshot(loaded.layers);
     return { ...loaded, config: snapshot.effective, sources: snapshot.sources, layers: { ...loaded.layers, session: snapshot.config }, hashes: { ...loaded.hashes, session: snapshot.hash }, sessionRevision: snapshot.revision };
   };
-  const runtime = (readOnly = false) => { check(origin, 'PROJECT_REQUIRED'); const path = join(origin, '.orch', 'state', 'state.db'); check(!readOnly || engine || existsSync(path), 'RUN_NOT_FOUND'); return engine ??= new Engine(path, null, async () => (await configuration()).config); };
+  const runtime = (readOnly = false) => { check(origin, 'PROJECT_REQUIRED'); const path = join(origin, '.orch', 'state', 'state.db'); check(!readOnly || engine || existsSync(path), 'RUN_NOT_FOUND'); return engine ??= new Engine(path, native, async () => (await configuration()).config); };
   const authenticate = (value: string) => {
     const incoming = Buffer.from(value), expected = Buffer.from(token);
     check(incoming.length === expected.length && timingSafeEqual(incoming, expected), 'COORDINATOR_RELAY_REQUIRED');
@@ -60,7 +60,26 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
       return runtime().change(data.run_id, data.operation_id, data.expected_state_version, { tool: name, input: data.input }, run => fn(run, data.input as z.infer<z.ZodObject<S>>));
     });
   }
-  register('orch_environment', {}, async () => ({ installation: 'development', host: await detectHost(host), coordinatorTokenRef: tokenPath, nativeDispatch: 'BLOCKED_CAPABILITY', nativeControl: host === 'codex' ? await inspectCodexNativeControl() : { reason: 'CURRENT_SESSION_NATIVE_CONTROL_UNVERIFIED', executionReady: false }, originRoot: origin }));
+  register('orch_environment', {}, async () => {
+    if (!native && Date.now() > challengeExpires) { challenge = randomBytes(32).toString('hex'); challengeExpires = Date.now() + 300000; }
+    return { installation: 'READY', host: await detectHost(host), coordinatorTokenRef: tokenPath,
+      nativeDispatch: native ? 'READY' : 'NEEDS_HOST_HANDSHAKE', originRoot: origin,
+      nativeControl: { transport: 'current_host_agent_tool', daemonRequired: false, executionReady: native !== null, source: native?.source ?? null, model: native?.model ?? null, effort: native?.effort ?? null },
+      nativeHandshake: native ? null : { challenge, expiresAt: new Date(challengeExpires).toISOString(), originRoot: origin, nativeTool: host === 'codex' ? 'spawn_agent' : 'Agent' } };
+  });
+  register('orch_host_connect', { ...auth, native_tool: z.enum(['spawn_agent', 'Agent']), native_agent_id: nativeAgentId,
+    probe: z.strictObject({ challenge: z.string().regex(/^[a-f0-9]{64}$/), cwd: z.string(), origin_root: z.string(), branch: z.string(), head: sha }),
+  }, async data => {
+    authenticate(data.coordinator_token); check(origin, 'PROJECT_REQUIRED'); check(!native, 'HOST_ALREADY_CONNECTED');
+    check(data.probe.challenge === challenge && Date.now() <= challengeExpires, 'HOST_CHALLENGE_MISMATCH');
+    check(data.native_tool === (host === 'codex' ? 'spawn_agent' : 'Agent'), 'HOST_TOOL_MISMATCH');
+    const repo = await inspectRepository(origin);
+    check(data.probe.cwd === repo.root && data.probe.origin_root === repo.root && data.probe.branch === repo.branch && data.probe.head === repo.head, 'HOST_CONTEXT_MISMATCH');
+    // Trust the authenticated parent's native-tool receipt, not a worker's JSON role or a daemon probe.
+    native = { host, model: null, effort: null, verified: true, contextMatches: true, source: 'coordinator_native_receipt', evidence: [data.native_tool, data.native_agent_id, repo.root, repo.head] };
+    if (engine) engine.native = native;
+    return { state: 'READY', source: native.source, host, model: null, effort: null, evidence: native.evidence };
+  });
   register('orch_models', { refresh: z.boolean().default(false) }, async data => getCatalogForHost(origin, host, { refresh: data.refresh }));
   register('orch_config', { action: z.enum(['effective', 'patch', 'unset']), ...auth,
     scope: z.enum(['project', 'global', 'session']).default('project'), dry_run: z.boolean().default(false), expected_hash: z.string().optional(),
@@ -80,12 +99,12 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
     authenticate(data.coordinator_token); check(origin, 'PROJECT_REQUIRED'); const config = await configuration();
     return runtime().create(origin, config.config, host, managedRoot, data.trusted_commands_hash, { missingTestsWaiver: data.missing_tests_waiver });
   });
-  register('orch_run_status', scoped, async data => { const snapshot = runtime(true).status(data.run_id); return { ...snapshot, readyTasks: runtime().ready(snapshot.data), dispatchBlocked: 'BLOCKED_CAPABILITY', pendingOperations: runtime().store.pending(data.run_id).map(item => item.id) }; });
+  register('orch_run_status', scoped, async data => { const snapshot = runtime(true).status(data.run_id); return { ...snapshot, readyTasks: runtime().ready(snapshot.data), dispatchBlocked: native ? null : 'NEEDS_HOST_HANDSHAKE', pendingOperations: runtime().store.pending(data.run_id).map(item => item.id) }; });
   mutation('orch_requirements_submit', { requirements: requirementsSchema }, (run, data) => runtime().submitRequirements(run, data.requirements));
   mutation('orch_plan_submit', { plan: planSchema, approved: z.boolean() }, (run, data) => runtime().plan(run, data.plan, data.approved));
   mutation('orch_task_prepare', { task_id: id }, (run, data) => runtime().prepare(run, data.task_id));
   const lease = { task_id: id, lease_id: z.string(), fencing_token: z.int().positive() };
-  mutation('orch_task_bind', { ...lease, native_id: id, observed_model: z.string().nullable(), observed_effort: z.string().nullable() }, (run, data) => runtime().bind(run, data.task_id, data.lease_id, data.fencing_token, data.native_id, data.observed_model, data.observed_effort));
+  mutation('orch_task_bind', { ...lease, native_id: nativeAgentId, observed_model: z.string().nullable(), observed_effort: z.string().nullable(), bootstrap: z.strictObject({ cwd: z.string(), origin_root: z.string(), common_dir: z.string(), branch: z.string(), head: sha }).optional() }, (run, data) => runtime().bind(run, data.task_id, data.lease_id, data.fencing_token, data.native_id, data.observed_model, data.observed_effort, data.bootstrap));
   mutation('orch_task_checkpoint', { ...lease, summary: z.string().max(4096) }, async (run, data) => {
     const task = runtime().leased(run, data.task_id, data.lease_id, data.fencing_token);
     return { state: task.state, summary: data.summary, leaseRenewed: false };
@@ -103,7 +122,7 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
   });
   mutation('orch_review_submit', { review: reviewSchema, final: z.boolean().default(false) }, (run, data) => runtime().review(run, data.review, data.final));
   mutation('orch_repair_plan_submit', { plan: planSchema, finding_ids: z.array(id), analysis: z.string().min(1).max(8192).optional() }, (run, data) => runtime().repair(run, data.plan, data.finding_ids, data.analysis));
-  mutation('orch_run_control', { action: z.enum(['pause', 'cancel', 'resume']), stopped_agents: z.array(id).default([]), never_started_tasks: z.array(id).default([]) }, (run, data) => runtime().control(run, data.action, data.stopped_agents, data.never_started_tasks));
+  mutation('orch_run_control', { action: z.enum(['pause', 'cancel', 'resume']), stopped_agents: z.array(nativeAgentId).default([]), never_started_tasks: z.array(id).default([]) }, (run, data) => runtime().control(run, data.action, data.stopped_agents, data.never_started_tasks));
   mutation('orch_gate_waive', { stage: z.enum(['baseline', 'task', 'integration', 'final']), gate_id: id, task_id: id.nullable(), reason: z.string().min(1).max(4096), approved: z.literal(true) }, (run, data) => runtime().waiveGate(run, data.stage, data.gate_id, data.task_id, data.reason, data.approved));
   mutation('orch_finalize_approve', { approved: z.literal(true), target_branch: z.string().min(1) }, (run, data) => runtime().preapproveFinalization(run, data.target_branch, data.approved));
   mutation('orch_finalize', { approved: z.boolean(), expected_target_sha: z.string() }, (run, data) => runtime().finalize(run, data.approved, data.expected_target_sha));

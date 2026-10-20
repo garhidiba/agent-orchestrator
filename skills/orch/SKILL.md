@@ -7,7 +7,7 @@ description: Coordinate ORCH work in the current Codex or Claude Code conversati
 
 Keep this conversation as coordinator. Native Agent execution belongs to the host; ORCH MCP owns state, Git, validation and recovery. Use the active host only. Remain in the parent session rather than forking this entire skill.
 
-1. Read [safety](references/safety.md). Call `orch_environment` and inspect installation, host, origin and capability evidence. Missing tools or `BLOCKED_CAPABILITY` mean execution is blocked: report the limitation and retain state. A prompt, fixture or metadata subprocess is not native capability evidence.
+1. Read [safety](references/safety.md). Call `orch_environment`. `installation=READY` means MCP is ready. For start/test/resume with `nativeDispatch=NEEDS_HOST_HANDSHAKE`, read [native connection](references/workflow.md#native-connection) and complete it automatically using this conversation's native Agent tool. Status/explanation reads need no worker. Missing native tools or an unsuccessful handshake block execution; preserve state and report the actual error. A separate app-server daemon is not required.
 2. Route the intent:
    - Start: read [project analysis](references/project-analysis.md), [roles](references/agent-roles.md) and [workflow](references/workflow.md). Establish goal, acceptance, ownership, trusted commands and approval before creating a write run. Persist requirements through `orch_requirements_submit` before submitting the plan; plan acceptance must match the saved contract.
    - Status/report: use `orch_run_status` / `orch_report` for the user's run ID. Summarize states, SHA-bound gates, findings and unknown observations without changing the run.

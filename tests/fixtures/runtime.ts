@@ -15,6 +15,9 @@ export async function runtimeFixture(native = true, overrides: unknown = {}, par
   await writeFile(join(root, '.gitignore'), '.orch/state/\n'); await writeFile(join(root, 'base'), 'base');
   await git(root, 'add', '.gitignore', 'base'); await git(root, 'commit', '-m', 'base');
   const config = resolveConfig({ project: { quality: { commands: [{ id: 'unit', executable: process.execPath, args: ['-e', 'process.exit(0)'], cwd: '.', stages: ['baseline', 'task', 'integration', 'final'], required: true, timeout_seconds: 5 }] } }, session: overrides }).config;
+  await mkdir(join(root, '.orch'));
+  await writeFile(join(root, '.orch/config.yaml'), JSON.stringify(config));
+  await git(root, 'add', '.orch/config.yaml'); await git(root, 'commit', '-m', 'fixture configuration');
   engine = new Engine(join(root, '.orch/state/state.db'), native ? { host: 'codex', model: 'fixture-model', effort: 'high', evidence: ['test-fixture'], verified: true, contextMatches: true } : null);
   const created = await engine.create(root, config, 'codex', join(dir, 'managed'), hash(config.quality.commands), createOptions);
   const active = engine;

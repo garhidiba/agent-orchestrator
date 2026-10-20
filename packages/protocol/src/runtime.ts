@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { roleIds } from './config.ts';
 
 export const id = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/);
+export const nativeAgentId = z.string().min(1).max(256).regex(/^[^\x00-\x1f\x7f]+$/).refine(value => value.trim().length > 0, 'Empty native identity');
 export const sha = z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/);
 export const relativePath = z.string().min(1).regex(/^(?![\\/])(?![A-Za-z]:)(?!.*(?:^|[\\/])\.{1,2}(?:[\\/]|$))[^\x00-\x1f\x7f]*$/);
 export const taskSchema = z.strictObject({
@@ -24,7 +25,7 @@ export const findingSchema = z.strictObject({
   status: z.literal('open'),
 });
 export const reviewSchema = z.strictObject({
-  schema_version: z.literal(1), reviewed_sha: sha, reviewer_id: id,
+  schema_version: z.literal(1), reviewed_sha: sha, reviewer_id: nativeAgentId,
   decision: z.enum(['approved', 'changes_requested']), findings: z.array(findingSchema),
   reviewed_areas: z.array(z.string().min(1)).min(1), limitations: z.array(z.string()),
   acceptance_ids: z.array(id).min(1),

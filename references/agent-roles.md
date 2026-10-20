@@ -11,4 +11,4 @@
 | repair | Fix assigned finding(s) | Resolution remains FIX_PROPOSED until independent verification |
 | final_auditor | Final independent acceptance audit | Current SHA only; cannot self-approve authored repairs |
 
-These are logical roles, not pre-proven native agent definitions. Host adapters must verify model/effort, worktree binding, reload and lifecycle before execution. No static model IDs are shipped as a substitute. Tool permissions and OS isolation must be established by the host; a role label in JSON is not authorization.
+These are logical roles. The authenticated current-conversation relay probes the native Agent tool and binds each real worker after its read-only Git bootstrap. Defaults inherit native host model/effort, with unobserved values null; concrete role pins remain blocked without verified support. Reload and lifecycle must be checked for the active connection. No static model IDs are shipped as a substitute. Tool permissions and OS isolation must be established by the host; a role label in JSON is not authorization.

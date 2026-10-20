@@ -2,7 +2,7 @@
 
 ORCH is a local coordination runtime for work started inside an existing Codex or Claude Code conversation. The current session stays in charge; MCP manages configuration, task state, Git worktrees, checks, reviews and recovery.
 
-**Development implementation, not a completed v1 release.** Production native dispatch currently stops at `BLOCKED_CAPABILITY`. Deterministic engine tests do not prove native host execution. See [compatibility](docs/compatibility.md) and [acceptance evidence](docs/acceptance.md).
+**Development implementation, not a completed v1 release.** Installation readies the MCP; the current conversation connects its native Agent tool automatically before running workers. Defaults inherit host model/effort; unverified concrete pins remain blocked. Deterministic tests alone do not prove native host execution. See [compatibility](docs/compatibility.md) and [acceptance evidence](docs/acceptance.md).
 
 ## Install
 
@@ -72,9 +72,9 @@ A work request should include a concrete result and verification command. For ex
 $orch 이 저장소의 설정 조회 CLI에 --help 예제를 추가해줘. 기존 출력은 유지하고 npm run check로 검증해줘. 먼저 실행 가능 상태를 확인하고 지원되지 않으면 중단해.
 ```
 
-The current version stops that work request at the native capability check; it does not start workers. Settings inspection and supported configuration changes remain available.
+On an execution request, `$orch` first connects this conversation’s native Agent tool with a read-only probe, then prepares worktrees and binds workers before edits. You do not need to start a separate app-server daemon or run a manual connection command.
 
-**Current execution limit:** the production native worker adapter is not implemented. Environment checks report `BLOCKED_CAPABILITY`; a start request must stop there. Settings inspection, supported configuration changes and MCP reads can be tested now, but a complete native multi-agent run cannot. Model availability/access and actual applied model/effort remain separate checks; see [compatibility](docs/compatibility.md).
+**Readiness:** `installation=READY` means MCP is ready; `NEEDS_HOST_HANDSHAKE` asks the skill to connect the current native Agent tool, then `nativeDispatch=READY` permits dispatch. Missing tools, wrong Git identity, expired challenges or unsupported concrete model/effort pins still block execution. Actual model/access observations remain separate from parent-relayed native receipts; see [compatibility](docs/compatibility.md).
 
 ## CLI and development checks
 
@@ -106,7 +106,7 @@ Only owned, unmodified assets are removed. Run data, old runtime versions and un
 
 ```text
 Current Codex or Claude conversation (coordinator)
-  ├─ host-native Agents (requires verified adapter; currently blocked)
+  ├─ host-native Agents (parent relay + checked worktree bootstrap)
   └─ local ORCH MCP
        ├─ configuration + model metadata
        ├─ SQLite state + operation journal

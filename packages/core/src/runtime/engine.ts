@@ -12,12 +12,12 @@ import { Store, hash } from '../state/store.ts';
 import { git, inspectRepository, within, owns, overlaps, changedPaths, sourceFingerprint } from '../git/repository.ts';
 import { configSchema } from '../../../protocol/src/config.ts';
 import type { Config } from '../../../protocol/src/config.ts';
-import { id, requirementsSchema, requireCondition as check, validatePlan, reviewSchema, taskResultSchema, gateResultSchema } from '../../../protocol/src/runtime.ts';
+import { id, nativeAgentId, requirementsSchema, requireCondition as check, validatePlan, reviewSchema, taskResultSchema, gateResultSchema } from '../../../protocol/src/runtime.ts';
 import type { Task, Plan, Review, GateResult, Requirements } from '../../../protocol/src/runtime.ts';
 
 const exec = promisify(execFile);
 type Gate = { id?: string; details?: GateResult[]; stage: string; task: string | null; sha: string; source: string; commands: string; status: string; results: { id: string; status: string; exitCode: number | null }[] };
-type Work = { spec: Task; state: string; base: string; path: string; branch: string; attempt: number; lease: string; expires: number; nativeId: string | null; units: Record<string, string>; validated: string | null; pausedState?: string; dispatchBase?: string; configRevision?: number; observedModel?: string | null; observedEffort?: string | null; modelResolution?: { requestedModel: string; requestedEffort: string; resolvedModel: string; resolvedEffort: string | null }; acceptanceEvidence?: { acceptanceId: string; evidenceRefs: string[] }[]; changedPaths?: string[]; reportedModel?: string | null; recoveryHead?: string; lastCommitSha?: string; attempts?: { number: number; path: string; branch: string; nativeId: string | null; stopped: boolean; reason: string }[] };
+type Work = { spec: Task; state: string; base: string; path: string; branch: string; attempt: number; lease: string; expires: number; nativeId: string | null; nativeBootstrap?: { cwd: string; origin_root: string; common_dir: string; branch: string; head: string }; units: Record<string, string>; validated: string | null; pausedState?: string; dispatchBase?: string; configRevision?: number; observedModel?: string | null; observedEffort?: string | null; modelResolution?: { requestedModel: string; requestedEffort: string; resolvedModel: string | null; resolvedEffort: string | null }; acceptanceEvidence?: { acceptanceId: string; evidenceRefs: string[] }[]; changedPaths?: string[]; reportedModel?: string | null; recoveryHead?: string; lastCommitSha?: string; attempts?: { number: number; path: string; branch: string; nativeId: string | null; stopped: boolean; reason: string }[] };
 type Finding = Review['findings'][number] & { fingerprint: string; lifecycle: string; seenRounds?: number[] };
 const acceptedGate = (gate: { status: string }) => ['passed', 'waived'].includes(gate.status);
 const activePhases = new Set(['ANALYZING', 'EXECUTING', 'INTEGRATING', 'VERIFYING', 'REVIEWING', 'REPAIR_PLANNING', 'FINAL_AUDIT', 'FINALIZING', 'CLEANING']);
@@ -25,6 +25,7 @@ export type Run = {
   id: string; host: 'codex' | 'claude'; origin: string; commonDir: string; target: string; targetBase: string;
   integration: string; integrationPath: string; managedRoot: string; state: string; config: Config;
   requirements?: Requirements; requirementRefs?: { json: string; markdown: string };
+  hostEvidence?: NativeCapability;
   plan: Plan | null; tasks: Record<string, Work>; gates: Gate[]; findings: Finding[];
   reviews: { sha: string; reviewer: string; final: boolean; acceptanceIds?: string[]; decision?: string; limitations?: string[] }[]; reviewRound: number; implementers?: string[]; integrationSha?: string;
   conflict?: { path: string; branch: string; taskId: string; expected: string; taskHead: string };
@@ -38,13 +39,13 @@ export type Run = {
   createdAt: string; pausedFrom?: string; cleanup: { path: string; status: string; reason: string | null }[];
 };
 export type NativeCapability = {
-  host: 'codex' | 'claude'; model: string; effort: string | null; evidence: string[];
-  verified: boolean; contextMatches: boolean;
+  host: 'codex' | 'claude'; model: string | null; effort: string | null; evidence: string[];
+  verified: boolean; contextMatches: boolean; source?: 'coordinator_native_receipt';
 };
 
 export class Engine {
   store: Store;
-  readonly native: NativeCapability | null;
+  native: NativeCapability | null;
   activeOperation: string | null = null;
   effectPrepared = false;
   runtimeRoot = fileURLToPath(new URL('../../../../', import.meta.url));
@@ -82,7 +83,7 @@ export class Engine {
     await writeFile(join(lock, 'write.json'), JSON.stringify({ runId, origin: repo.root }), { flag: 'wx', mode: 0o600 }).catch(() => { throw new Error('REPOSITORY_RUN_LOCKED'); });
     const integration = `orch/${runId}/integration`, integrationPath = join(managed, runId, 'integration');
     const run: Run = { id: runId, host, origin: repo.root, commonDir: repo.commonDir, target: repo.branch, targetBase: repo.head,
-      integration, integrationPath, managedRoot: managed, state: 'PREFLIGHT', config, plan: null, tasks: {}, gates: [], findings: [], reviews: [], reviewRound: 0,
+      integration, integrationPath, managedRoot: managed, hostEvidence: this.native ? structuredClone(this.native) : undefined, state: 'PREFLIGHT', config, plan: null, tasks: {}, gates: [], findings: [], reviews: [], reviewRound: 0,
       activeTimeMs: 0, activeSince: null, pauseTimeMs: 0, missingTestsWaiver: missingWaiver && config.quality.commands.length === 0 ? { actor: 'user', reason: missingWaiver.reason, approvedAt: new Date().toISOString() } : undefined, runtimeRoot: this.runtimeRoot, configRevision: 1, configRevisions: [{ revision: 1, hash: hash(config), roles: structuredClone(config.hosts), timestamp: new Date().toISOString() }], integrationSha: repo.head, createdAt: new Date().toISOString(), cleanup: [] };
     this.store.create(runId, run);
     return { runId, version: 0 };
@@ -244,6 +245,7 @@ export class Engine {
   async prepare(run: Run, taskId: string) {
     check(run.state === 'EXECUTING', 'INVALID_RUN_STATE');
     check(this.native?.verified && this.native.contextMatches && this.native.host === run.host && this.native.evidence.length, 'BLOCKED_CAPABILITY');
+    run.hostEvidence ??= structuredClone(this.native);
     check((run.activeTimeMs ?? Math.max(0, Date.now() - Date.parse(run.createdAt))) < run.config.execution.run_timeout_minutes * 60000, 'RUN_TIMEOUT');
     const task = run.tasks[taskId]; check(task, 'TASK_NOT_FOUND');
     check(['PENDING', 'RETRYABLE_FAILED'].includes(task.state), 'TASK_NOT_READY');
@@ -330,15 +332,17 @@ export class Engine {
     check(task.lease === lease && task.attempt === generation && Date.now() < task.expires, 'STALE_LEASE');
     return task;
   }
-  async bind(run: Run, taskId: string, lease: string, generation: number, nativeId: string, observedModel: string | null, observedEffort: string | null) {
+  async bind(run: Run, taskId: string, lease: string, generation: number, nativeId: string, observedModel: string | null, observedEffort: string | null, bootstrap?: { cwd: string; origin_root: string; branch: string; head: string; common_dir: string }) {
     const task = this.leased(run, taskId, lease, generation);
     check(this.native?.verified && this.native.contextMatches && this.native.host === run.host, 'BLOCKED_CAPABILITY');
     check(task.state === 'LEASED', 'INVALID_TASK_STATE');
     const repo = await inspectRepository(task.path);
     check(repo.root === await realpath(task.path) && repo.commonDir === run.commonDir && repo.branch === task.branch && repo.head === (task.dispatchBase ?? task.base) && !repo.dirty, 'BASE_SHA_MISMATCH');
+    if (this.native.source === 'coordinator_native_receipt') check(bootstrap && bootstrap.cwd === repo.root && bootstrap.origin_root === repo.root && bootstrap.common_dir === repo.commonDir && bootstrap.branch === repo.branch && bootstrap.head === repo.head, 'WORKER_BOOTSTRAP_MISMATCH');
     check((observedModel === null || observedModel === task.modelResolution?.resolvedModel) && (observedEffort === null || observedEffort === task.modelResolution?.resolvedEffort), 'MODEL_OBSERVATION_MISMATCH');
+    if (bootstrap) task.nativeBootstrap = structuredClone(bootstrap);
     task.observedModel = observedModel; task.observedEffort = observedEffort;
-    task.nativeId = id.parse(nativeId); run.implementers ??= []; run.implementers.push(task.nativeId); task.state = 'RUNNING';
+    task.nativeId = nativeAgentId.parse(nativeId); run.implementers ??= []; run.implementers.push(task.nativeId); task.state = 'RUNNING';
     return { state: task.state };
   }
   async taskIdentity(run: Run, task: Work) {

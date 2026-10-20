@@ -34,7 +34,7 @@ export function buildReport(run: Run, version: number, actualFinalSha: string | 
   if (blockingFindings.length) blockers.push('BLOCKING_FINDINGS');
   const tasks = Object.values(run.tasks).map((work: WorkEvidence) => ({
     id: work.spec.id, title: work.spec.title, role: work.spec.role, state: work.state, attempt: work.attempt,
-    configRevision: work.configRevision ?? null,
+    configRevision: work.configRevision ?? null, nativeBinding: { agentId: work.nativeId, bootstrap: work.nativeBootstrap ?? null, source: run.hostEvidence?.source ?? null },
     requested: work.modelResolution ? { model: work.modelResolution.requestedModel, effort: work.modelResolution.requestedEffort } : run.config.hosts[run.host].roles[work.spec.role],
     selectedModel: work.modelResolution?.resolvedModel ?? work.selectedModel ?? null, selectedEffort: work.modelResolution?.resolvedEffort ?? work.selectedEffort ?? null,
     observedModel: work.observedModel ?? null, observedEffort: work.observedEffort ?? null,
@@ -60,11 +60,11 @@ export function buildReport(run: Run, version: number, actualFinalSha: string | 
     targetBranch: run.target, targetBase: run.targetBase, integrationSha: currentSha, actualFinalSha,
     createdAt: run.createdAt, durationMs: run.finalizedAt ? Date.parse(run.finalizedAt) - Date.parse(run.createdAt) : null, activeTimeMs: run.activeTimeMs ?? null, pauseTimeMs: run.pauseTimeMs ?? null, reviewRound: run.reviewRound, host: run.host,
     models: Object.entries(run.config.hosts[run.host].roles).map(([role, requested]) => ({ role, requested, observations: tasks.filter(task => task.role === role).map(task => ({ taskId: task.id, selectedModel: task.selectedModel, selectedEffort: task.selectedEffort, observedModel: task.observedModel, observedEffort: task.observedEffort })) })),
-    tasks, acceptance, findings: run.findings.map(finding => ({ ...finding })),
+    hostEvidence: run.hostEvidence ?? null, tasks, acceptance, findings: run.findings.map(finding => ({ ...finding })),
     gates: run.gates.map((gate: Run['gates'][number] & { details?: GateResult[] }) => ({ stage: gate.stage, task: gate.task, sha: gate.sha, source: gate.source, commands: gate.commands, status: gate.status, results: gate.results.map(result => ({ ...result })), details: gate.details ?? null, logRefs: gate.details?.map(detail => detail.logRef) ?? null })),
     reviews: reviews.map(review => ({ sha: review.sha, reviewer: review.reviewer, final: review.final, decision: review.decision ?? null, acceptanceIds: review.acceptanceIds ?? null, limitations: review.limitations ?? null })),
     cleanup, blockers, nextActions, waivers: run.waivers ?? [], missingTestsWaiver: run.missingTestsWaiver ?? null, repairAnalyses: run.repairAnalyses ?? [], usage: null, cost: null,
-    limitations: ['Native host capability is not evidenced by this report.', 'Unrecorded model selection, observations, changed paths, duration, logs, usage and billing remain unknown.', 'Gate command IDs reference configured commands; raw arguments, prompts, environment and transcripts are not collected.'],
+    limitations: ['Native receipts are authenticated coordinator attestations, not signed host, account or model evidence.', 'Unrecorded model selection, observations, changed paths, duration, logs, usage and billing remain unknown.', 'Gate command IDs reference configured commands; raw arguments, prompts, environment and transcripts are not collected.'],
   };
   const sections = [
     ['Result', { state: report.state, completionVerified, blockers, nextActions }],
