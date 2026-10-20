@@ -12,3 +12,4 @@ coverage/
 *.log
 .orch/installation/
 .orch/config.yaml
+.claude/

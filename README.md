@@ -202,6 +202,79 @@ Current Codex or Claude conversation (coordinator)
 
 The core is deterministic; it does not launch an alternative AI controller. It preserves unknown model/access/usage information and user-owned changes. Worktrees isolate file changes, not OS permissions.
 
+## How a run works
+
+One write run per repository goes through the stages below. The coordinator is your current conversation; ORCH MCP records every state change, so an interrupted run can be inspected and resumed. Diamonds are decisions that need **you**.
+
+```mermaid
+flowchart TD
+  A["1. Init once<br/>agent-orch init writes .orch/config.yaml"] --> B["2. Start request in the client project"]
+  B --> C["3. Environment check<br/>MCP origin must equal the Git root"]
+  C --> D["4. Native handshake<br/>probe Agent echoes a challenge, valid about 5 min"]
+  D --> E["5. Role definitions loaded<br/>Claude: named agent per role, else NEEDS_RELOAD"]
+  E --> F{"6. Preflight<br/>clean checkout, no other active run,<br/>git identity, trusted commands"}
+  F -- "fails" --> F1["Run is not created<br/>fix the reported code and retry"]
+  F -- "passes" --> G["7. Requirements saved<br/>goal, scope, acceptance"]
+  G --> H["8. Plan: task DAG with file ownership"]
+  H --> I{"You approve plan<br/>and verification commands"}
+  I -- "no" --> H
+  I -- "yes" --> J["9. Baseline gate on the target SHA"]
+
+  J --> K
+  subgraph TASK ["10. Per task, parallel up to max_parallel_workers"]
+    direction TB
+    K["prepare<br/>worktree, branch, lease, port"] --> L["worker bootstrap, read-only<br/>reports cwd, Git root, branch, HEAD"]
+    L --> M["bind<br/>MCP checks the identity receipt"]
+    M --> N["worker edits only its write_paths"]
+    N --> O["validate: task gate"]
+    O --> P["commit one unit"]
+    P --> Q["validate again on the commit SHA"]
+    Q --> R["complete<br/>state MERGE_QUEUED"]
+  end
+
+  R --> S["11. Integrate one task at a time<br/>conflicts are resolved against fixed SHAs"]
+  S --> T["12. Integration gate"]
+  T --> U["13. Independent reviewer, read-only<br/>findings are bound to the SHA"]
+  U --> V{"Blocking findings?"}
+  V -- "yes" --> W["Repair plan, repair workers,<br/>then review again"]
+  W --> T
+  V -- "no" --> X["14. Final auditor, read-only<br/>current SHA only"]
+  X --> Y{"You approve finalize<br/>for the target branch"}
+  Y -- "yes" --> Z["15. Finalize: merge into target branch<br/>no remote push by default"]
+  Z --> AA["16. Cleanup: dry run first,<br/>owned, merged, clean resources only"]
+```
+
+Each worker follows the same task lifecycle:
+
+```mermaid
+stateDiagram-v2
+  [*] --> PENDING
+  PENDING --> LEASED: prepare
+  LEASED --> RUNNING: bind succeeds
+  RUNNING --> MERGE_QUEUED: validate, commit, validate, complete
+  RUNNING --> ORPHANED_UNKNOWN: lease expired, worker state unknown
+  ORPHANED_UNKNOWN --> LEASED: retry after the worker is confirmed stopped
+  MERGE_QUEUED --> [*]: integrated
+```
+
+### What you need to know
+
+| Topic | Behavior |
+|---|---|
+| Your approvals | The plan with its verification commands, any gate waiver, and finalize. A config value is never an approval. |
+| Preconditions | The checkout must be clean, and a tracked `.orch/config.yaml` that you edited counts as dirty: commit it or git-ignore it. Commit signing, submodules and active LFS block run creation. |
+| One run per repository | An active run holds the lock at `.git/orch/locks/write.json`. The lock is released by cleanup after finalization. A cancelled run is not finalized, so its lock can remain; check the run state before removing it by hand. |
+| Parallelism | `execution.max_parallel_workers` caps concurrent workers (default 4). `max_parallel_test_jobs` (default 1) runs gates one at a time. Tasks that share a file are serialized; dependencies start from the SHA where their prerequisites were integrated. |
+| Models and effort | Each role resolves its own model and effort. The pin reaches the worker through the Agent parameter or a generated `.claude/agents/orch-*.md` definition that is git-excluded locally. If it cannot be applied the run is blocked, never silently downgraded. Observed model and effort stay `null` when the host does not report them. |
+| Gates | Every verification command must pass at baseline, per task, on the integration SHA and at the end. A task gate is rerun after its commit. A waiver is recorded as `waived`, never `passed`. |
+| Limits | Defaults: 3 attempts per task, 30 minutes per attempt, 3 review rounds, 180 minutes per run. Findings of `critical` and `high` severity block. A repeated finding needs an explicit analysis before more repairs. |
+| Retrying a call | Every mutation carries an operation ID and the expected state version. Repeating an operation ID replays the first result; use a new ID for a genuinely new attempt, and reread the state after a `STATE_CONFLICT`. |
+| Interruption | Pause, cancel and resume go through the run control. A host disconnect does not prove a worker stopped, so unknown workers and their worktrees are preserved. |
+| Where things live | State and logs: `.orch/state/runs/RUN_ID/` in the project (git-ignored). Worktrees: `~/.local/share/orch/worktrees/RUN_ID/`. Coordinator token: `~/.local/state/orch/coordinators/`; never put it in a prompt. |
+| Safety | Worktrees isolate file changes, not OS permissions. Staged files are scanned for credentials before each commit, and remote push is off unless you enable it. |
+
+See [workflow](references/workflow.md) for the exact tool sequence and [recovery](references/recovery.md) for failure handling.
+
 ## Guides
 
 - [Configuration](references/configuration.md), [model selection](references/model-selection.md), [effort](references/reasoning-effort.md)
