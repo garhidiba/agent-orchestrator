@@ -4,15 +4,16 @@ import { promisify } from 'node:util';
 import { mkdir, readFile, realpath, rm, rmdir, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { redact } from '../quality/redact.ts';
+import { assertNoStagedSecrets } from '../quality/secrets.ts';
 import { existsSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { writeRequirements } from '../requirements/index.ts';
 import { writeStateArtifact } from '../state/artifacts.ts';
 import { Store, hash } from '../state/store.ts';
-import { git, inspectRepository, within, owns, overlaps, changedPaths, sourceFingerprint } from '../git/repository.ts';
+import { git, inspectRepository, preflightRepository, within, owns, overlaps, changedPaths, sourceFingerprint } from '../git/repository.ts';
 import { configSchema } from '../../../protocol/src/config.ts';
 import type { Config } from '../../../protocol/src/config.ts';
-import { id, nativeAgentId, requirementsSchema, requireCondition as check, validatePlan, reviewSchema, taskResultSchema, gateResultSchema } from '../../../protocol/src/runtime.ts';
+import { id, nativeAgentId, requirementsSchema, requireCondition as check, validatePlan, planAmendmentSchema, reviewSchema, taskResultSchema, gateResultSchema } from '../../../protocol/src/runtime.ts';
 import type { Task, Plan, Review, GateResult, Requirements } from '../../../protocol/src/runtime.ts';
 
 import { completionEvidence, findingBlocks } from './completion.ts';
@@ -20,10 +21,10 @@ import { verifyPreparedClaudeDefinition } from './host-claude.ts';
 import { resolveRoleModel, observeRoleModel, type NativeModelContext } from './models.ts';
 import { enforceRunBudget, activeElapsedMs, reconcileExpiredTasks, confirmHostHeartbeat, type HostHeartbeat } from './lifecycle.ts';
 import { allocateAttemptResources, reservePort, type AttemptResources } from './resources.ts';
-import { prepareNodeDependencies, type DependencySetup } from './dependencies.ts';
+import { prepareNodeDependencies, dependencyFingerprint, environmentFingerprint, type DependencySetup } from './dependencies.ts';
 
 const exec = promisify(execFile);
-type Gate = { id?: string; details?: GateResult[]; stage: string; task: string | null; sha: string; source: string; commands: string; status: string; results: { id: string; status: string; exitCode: number | null }[] };
+type Gate = { dependencies?: string; environment?: string; environmentOverrides?: Record<string, string>; id?: string; details?: GateResult[]; stage: string; task: string | null; sha: string; source: string; commands: string; status: string; results: { id: string; status: string; exitCode: number | null }[] };
 type Work = { dependencySetup?: DependencySetup | null; nativeContext?: NativeCapability; resources?: AttemptResources; deadline?: number; heartbeat?: { observedAt: number; evidenceRef: string }; modelObservation?: ReturnType<typeof observeRoleModel>; spec: Task; state: string; base: string; path: string; branch: string; attempt: number; lease: string; expires: number; nativeId: string | null; nativeBootstrap?: { cwd: string; origin_root: string; common_dir: string; branch: string; head: string }; units: Record<string, string>; validated: string | null; pausedState?: string; dispatchBase?: string; configRevision?: number; observedModel?: string | null; observedEffort?: string | null; modelResolution?: { requestedModel: string; requestedEffort: string; resolvedModel: string | null; resolvedEffort: string | null; nativeArguments?: ReturnType<typeof resolveRoleModel>['nativeArguments'] }; acceptanceEvidence?: { acceptanceId: string; evidenceRefs: string[] }[]; changedPaths?: string[]; reportedModel?: string | null; recoveryHead?: string; lastCommitSha?: string; attempts?: { number: number; path: string; branch: string; nativeId: string | null; stopped: boolean; reason: string; configRevision?: number; modelResolution?: Work['modelResolution']; observedModel?: string | null; observedEffort?: string | null; modelObservation?: Work['modelObservation']; resources?: AttemptResources }[] };
 type Finding = Review['findings'][number] & { fingerprint: string; lifecycle: string; seenRounds?: number[]; dispositions?: { status: 'ACCEPTED_RISK' | 'NOT_A_BUG' | 'DEFERRED'; reason: string; actor: 'user'; approvedAt: string; sha: string | null }[] };
 const attemptKey = (taskId: string, attempt: number) => { const key = `${taskId}-${attempt}`; return key.length <= 80 ? key : `attempt-${hash([taskId, attempt])}`; };
@@ -35,6 +36,7 @@ export type Run = {
   reviewDispatches?: Record<string, ReviewDispatch>;
   requirements?: Requirements; requirementRefs?: { json: string; markdown: string };
   hostEvidence?: NativeCapability;
+  planRevision?: number;
   plan: Plan | null; tasks: Record<string, Work>; gates: Gate[]; findings: Finding[];
   reviews: { sha: string; reviewer: string; final: boolean; acceptanceIds?: string[]; decision?: string; limitations?: string[] }[]; reviewRound: number; implementers?: string[]; integrationSha?: string;
   conflict?: { path: string; branch: string; taskId: string; expected: string; taskHead: string };
@@ -87,6 +89,7 @@ export class Engine {
     await mkdir(managedRoot, { recursive: true });
     const managed = await realpath(managedRoot);
     check(!within(repo.root, managed) && managed !== repo.root, 'WORKTREE_ROOT_UNSAFE');
+    await preflightRepository(repo.root, [repo.root, repo.commonDir, managed]);
     const runId = `run-${randomUUID()}`;
     const lock = join(repo.commonDir, 'orch', 'locks'); await mkdir(lock, { recursive: true });
     await writeFile(join(lock, 'write.json'), JSON.stringify({ runId, origin: repo.root }), { flag: 'wx', mode: 0o600 }).catch(() => { throw new Error('REPOSITORY_RUN_LOCKED'); });
@@ -164,6 +167,8 @@ export class Engine {
         const repo = await inspectRepository(run.integrationPath);
         check(run.state === 'EXECUTING' && run.plan && repo.commonDir === run.commonDir && repo.branch === run.integration && repo.head === run.targetBase && !repo.dirty, 'RECOVERY_PLAN_NOT_PROVEN');
         result = { state: run.state, recovered: true };
+      } else if (request.tool === 'orch_plan_amend') {
+        result = { ...await this.amendPlan(run, request.input), recovered: true };
       } else if (request.tool === 'orch_cleanup') {
         check(run.state === 'COMPLETED', 'RECOVERY_CLEANUP_NOT_PROVEN');
         result = await this.cleanup(run, false);
@@ -197,10 +202,22 @@ export class Engine {
         run.integrationSha = merged.head; run.targetBase = expected; run.reviews = []; run.finalizationApproval = undefined; run.state = 'VERIFYING';
         result = { state: run.state, sha: merged.head, targetBase: expected, recovered: true };
       } else if (request.tool === 'orch_finalize') {
-        const head = await git(run.integrationPath, 'rev-parse', 'HEAD');
-        check(await git(run.origin, 'rev-parse', 'HEAD') === head && run.gates.some(gate => gate.stage === 'final' && gate.sha === head && acceptedGate(gate)), 'RECOVERY_FINALIZE_NOT_PROVEN');
-        check(completionEvidence(run, head).blockers.length === 0, 'RECOVERY_FINALIZE_NOT_PROVEN');
-        run.finalizedAt ??= new Date().toISOString(); run.state = 'COMPLETED'; result = { sha: head, recovered: true };
+        const [target, integration] = await Promise.all([inspectRepository(run.origin), inspectRepository(run.integrationPath)]);
+        const head = integration.head;
+        check(target.commonDir === run.commonDir && integration.commonDir === run.commonDir && target.branch === run.target && integration.branch === run.integration && !target.dirty && !integration.dirty && target.head === head && run.gates.some(gate => gate.stage === 'final' && gate.sha === head && acceptedGate(gate)), 'RECOVERY_FINALIZE_NOT_PROVEN');
+        check(completionEvidence(run, head, { allowApprovedWaivers: true }).blockers.length === 0, 'RECOVERY_FINALIZE_NOT_PROVEN');
+        const source = await sourceFingerprint(run.integrationPath);
+        let inputsFresh = true;
+        for (const stage of ['integration', 'final']) {
+          const gate = run.gates.filter(gate => gate.stage === stage && gate.task === null).at(-1);
+          if (gate?.source !== source || !await this.gateInputsFresh(gate, run.integrationPath)) inputsFresh = false;
+        }
+        if (!inputsFresh) {
+          run.targetBase = head; run.reviews = []; run.finalizationApproval = undefined; run.finalizedAt = undefined; run.state = 'VERIFYING';
+          result = { recovered: true, state: run.state, reason: 'VALIDATION_STALE', targetAlreadyUpdated: true };
+        } else {
+          run.finalizedAt ??= new Date().toISOString(); run.state = 'COMPLETED'; result = { sha: head, recovered: true };
+        }
       } else throw new Error('RECOVERY_REQUIRES_MANUAL_RECONCILIATION');
       return this.store.save(runId, current.version, run, 'run.reconciled', operationId, { version: current.version + 1, result });
     } finally { await rmdir(mutex); }
@@ -217,6 +234,10 @@ export class Engine {
     const resources = task ? run.tasks[task].resources : await allocateAttemptResources(run.origin, run.id, result.id!);
     check(resources, 'ATTEMPT_RESOURCES_REQUIRED');
     const environment = { ...process.env, ...resources.environment };
+    // Persist only engine-owned overrides; inherited environment values remain a hash.
+    result.environmentOverrides = { ...resources.environment };
+    result.environment = environmentFingerprint(result.environmentOverrides);
+    result.dependencies = await dependencyFingerprint(path);
     for (const command of commands) {
       const budgetExpired = activeElapsedMs(run) >= run.config.execution.run_timeout_minutes * 60000 || task !== null && Date.now() >= run.tasks[task].deadline!;
       const cwd = await realpath(resolve(path, command.cwd));
@@ -241,13 +262,17 @@ export class Engine {
       const logRef = await writeStateArtifact(run.origin, run.id, `${recordId}.log`, redact(output), 'logs');
       result.details!.push(gateResultSchema.parse({ id: recordId, runId: run.id, taskId: task, gateId: command.id,
         stage, commitSha: result.sha, sourceFingerprint: fingerprint, commandFingerprint: hash(command),
-        environmentFingerprint: hash({ node: process.version, platform: process.platform, arch: process.arch, env: environment }),
+        environmentFingerprint: result.environment,
         status, exitCode, startedAt, finishedAt: new Date().toISOString(), logRef, waiverReason: waiver?.reason ?? null }));
       result.results.push({ id: command.id, status, exitCode });
     }
-    if (await sourceFingerprint(path) !== fingerprint) result.status = 'source_changed';
+    if (await sourceFingerprint(path) !== fingerprint || !await this.gateInputsFresh(result, path)) result.status = 'source_changed';
     run.gates.push(result);
     return result;
+  }
+  private async gateInputsFresh(gate: Gate | undefined, path: string) {
+    return !!gate?.dependencies && !!gate.environment && !!gate.environmentOverrides &&
+      gate.environment === environmentFingerprint(gate.environmentOverrides) && gate.dependencies === await dependencyFingerprint(path);
   }
   async submitRequirements(run: Run, input: unknown) {
     check(['PREFLIGHT', 'PLAN_READY'].includes(run.state) && Object.keys(run.tasks).length === 0, 'INVALID_RUN_STATE');
@@ -271,10 +296,50 @@ export class Engine {
     if (!approved) { run.state = 'PLAN_READY'; return { state: run.state }; }
     const baseline = await this.gate(run, 'baseline', run.origin);
     if (!acceptedGate(baseline)) { run.state = 'BLOCKED_BASELINE'; return baseline; }
+    run.planRevision = 1;
+    this.store.snapshot(run.id, 'plan', 'revision-1', { plan, actor: 'user', reason: 'Initial approved plan' });
     for (const task of plan.tasks) run.tasks[task.id] = { spec: task, state: 'PENDING', base: '', path: '', branch: '', attempt: 0, lease: '', expires: 0, nativeId: null, units: {}, validated: null };
     run.state = 'EXECUTING'; this.checkpointIntent(run);
     await git(run.origin, 'worktree', 'add', '-b', run.integration, run.integrationPath, run.targetBase);
     return { state: run.state };
+  }
+  async amendPlan(run: Run, input: unknown) {
+    const amendment = planAmendmentSchema.parse(input);
+    check(run.state === 'PAUSED' && run.plan && Object.keys(run.tasks).length > 0, 'INVALID_RUN_STATE');
+    check(Object.values(run.tasks).every(task => ['PENDING', 'RETRYABLE_FAILED', 'BLOCKED_ATTEMPT_LIMIT', 'MERGE_QUEUED', 'INTEGRATED'].includes(task.state)), 'WORKER_STOP_UNCONFIRMED');
+    check(Object.values(run.reviewDispatches ?? {}).every(dispatch => ['COMPLETED', 'STOPPED'].includes(dispatch.state)), 'REVIEW_STOP_UNCONFIRMED');
+    const plan = validatePlan(amendment.plan);
+    check(run.requirements && plan.acceptance.length === run.requirements.acceptance.length && plan.acceptance.every(item => run.requirements!.acceptance.some(required => required.id === item.id && required.text === item.text)), 'REQUIREMENTS_PLAN_MISMATCH');
+    const gateIds = new Set(run.config.quality.commands.map(command => command.id));
+    if (run.missingTestsWaiver) gateIds.add('missing-tests');
+    check(plan.tasks.every(task => task.verification_ids.every(key => gateIds.has(key))), 'UNKNOWN_VERIFICATION');
+    const specs = new Map(plan.tasks.map(spec => [spec.id, spec]));
+    const dependsOn = (task: Task, dependency: string): boolean => task.depends_on.some(key => key === dependency || dependsOn(specs.get(key)!, dependency));
+    for (const [index, task] of plan.tasks.entries()) for (const other of plan.tasks.slice(index + 1)) {
+      check(!(overlaps(task.write_paths, other.write_paths) || task.exclusive_resources.some(key => other.exclusive_resources.includes(key))) || dependsOn(task, other.id) || dependsOn(other, task.id), 'OWNERSHIP_CONFLICT');
+    }
+    for (const task of Object.values(run.tasks)) {
+      const next = specs.get(task.spec.id);
+      check(next || task.attempt === 0 && task.state === 'PENDING', 'TASK_EVIDENCE_IMMUTABLE');
+      const protectedEvidence = Object.keys(task.units).length > 0 || task.validated || task.acceptanceEvidence || task.changedPaths || ['MERGE_QUEUED', 'INTEGRATED'].includes(task.state);
+      check(!protectedEvidence || next && hash(next) === hash(task.spec), 'TASK_EVIDENCE_IMMUTABLE');
+      if (next && task.path) {
+        await this.taskIdentity(run, task);
+        check((await changedPaths(task.path, task.base)).every(path => owns(next.write_paths, path)), 'OWNERSHIP_VIOLATION');
+      }
+    }
+    const revision = (run.planRevision ?? 1) + 1;
+    if (this.activeOperation) this.checkpointIntent(run);
+    if (!run.planRevision) this.store.snapshot(run.id, 'plan', 'revision-1', { plan: run.plan, actor: 'user', reason: 'Initial approved plan' });
+    this.store.snapshot(run.id, 'plan', `revision-${revision}`, { plan, actor: 'user', reason: amendment.reason, previousTasks: structuredClone(run.tasks), previousGates: structuredClone(run.gates), previousReviews: structuredClone(run.reviews) });
+    for (const key of Object.keys(run.tasks)) if (!specs.has(key)) delete run.tasks[key];
+    for (const spec of plan.tasks) {
+      if (run.tasks[spec.id]) run.tasks[spec.id].spec = spec;
+      else run.tasks[spec.id] = { spec, state: 'PENDING', base: '', path: '', branch: '', attempt: 0, lease: '', expires: 0, nativeId: null, units: {}, validated: null };
+    }
+    run.plan = plan; run.planRevision = revision; run.reviews = []; run.finalizationApproval = undefined;
+    run.pausedFrom = Object.values(run.tasks).every(task => task.state === 'INTEGRATED') ? 'VERIFYING' : 'EXECUTING';
+    return { state: run.state, revision };
   }
   async syncConfig(run: Run) {
     if (this.readConfig) {
@@ -502,12 +567,15 @@ export class Engine {
     const spec = task.spec.commit_units.find(candidate => candidate.id === unit); check(spec, 'UNKNOWN_UNIT');
     if (task.units[unit]) return { sha: task.units[unit] };
     check(task.validated && task.validated === await sourceFingerprint(task.path), 'VALIDATION_STALE');
+    const gate = run.gates.filter(gate => gate.stage === 'task' && gate.task === taskId).at(-1);
+    check(gate && acceptedGate(gate) && gate.commands === hash(run.config.quality.commands) && gate.source === task.validated && await this.gateInputsFresh(gate, task.path), 'VALIDATION_STALE');
     const expectedHead = task.lastCommitSha ?? task.dispatchBase ?? task.base;
     check(await git(task.path, 'rev-parse', 'HEAD') === expectedHead, 'COMMIT_HEAD_MISMATCH');
     const paths = await changedPaths(task.path);
     check(paths.length && paths.every(path => owns(task.spec.write_paths, path)), 'OWNERSHIP_VIOLATION');
     check((await changedPaths(task.path, task.base)).every(path => owns(task.spec.write_paths, path)), 'OWNERSHIP_VIOLATION');
     await git(task.path, 'add', '--', ...paths);
+    await assertNoStagedSecrets(task.path);
     await git(task.path, 'diff', '--cached', '--check');
     this.checkpointIntent(run);
     await git(task.path, 'commit', '-m', `${spec.purpose}\n\nOrch-Run: ${run.id}\nOrch-Task: ${taskId}\nOrch-Unit: ${unit}`);
@@ -530,7 +598,7 @@ export class Engine {
       check(parents.length === 1 && message.includes(`Orch-Run: ${run.id}\n`) && message.includes(`Orch-Task: ${task.spec.id}\n`) && message.includes(`Orch-Unit: ${unit.id}\n`), 'UNTRACKED_COMMIT');
     }
     const gate = run.gates.filter(item => item.task === task.spec.id && item.stage === 'task').at(-1);
-    check(gate && acceptedGate(gate) && gate.commands === hash(run.config.quality.commands) && gate.source === await sourceFingerprint(task.path), 'VALIDATION_STALE');
+    check(gate && acceptedGate(gate) && gate.commands === hash(run.config.quality.commands) && gate.source === await sourceFingerprint(task.path) && await this.gateInputsFresh(gate, task.path), 'VALIDATION_STALE');
   }
   async complete(run: Run, taskId: string, lease: string, generation: number, nativeStopped: boolean, submittedResult: unknown = null) {
     const task = this.leased(run, taskId, lease, generation);
@@ -637,8 +705,8 @@ export class Engine {
       dispatch.state = 'COMPLETED';
     }
     check(review.reviewed_sha === current, 'REVIEW_STALE');
-    check(run.gates.some(gate => gate.stage === 'integration' && gate.sha === current && acceptedGate(gate) && gate.commands === hash(run.config.quality.commands)), 'VALIDATION_STALE');
-    check(run.gates.filter(gate => gate.stage === 'integration').at(-1)?.source === await sourceFingerprint(run.integrationPath), 'VALIDATION_STALE');
+    const integrationGate = run.gates.filter(gate => gate.stage === 'integration').at(-1);
+    check(integrationGate && integrationGate.sha === current && acceptedGate(integrationGate) && integrationGate.commands === hash(run.config.quality.commands) && integrationGate.source === await sourceFingerprint(run.integrationPath) && await this.gateInputsFresh(integrationGate, run.integrationPath), 'VALIDATION_STALE');
     check(!run.implementers?.includes(review.reviewer_id) && !Object.values(run.tasks).some(task => task.nativeId === review.reviewer_id), 'REVIEW_NOT_INDEPENDENT');
     check(!final || !run.reviews.some(item => item.reviewer === review.reviewer_id), 'AUDIT_NOT_INDEPENDENT');
     check(run.plan?.acceptance.every(item => review.acceptance_ids.includes(item.id)), 'UNMAPPED_ACCEPTANCE');
@@ -710,14 +778,16 @@ export class Engine {
     check(repo.branch === run.target && repo.head === run.targetBase && repo.head === expectedTarget, 'TARGET_DRIFT');
     check(!repo.dirty && !(await inspectRepository(run.integrationPath)).dirty, 'DIRTY_CHECKOUT');
     check(run.integrationSha === head, 'INTEGRATION_DRIFT');
-    check(completionEvidence(run, null, { beforeFinalGate: true, beforeTarget: true }).blockers.length === 0, 'COMPLETION_UNVERIFIED');
-    check(run.gates.filter(gate => gate.stage === 'integration' && gate.task === null).at(-1)?.source === await sourceFingerprint(run.integrationPath), 'VALIDATION_STALE');
+    check(completionEvidence(run, null, { beforeFinalGate: true, beforeTarget: true, allowApprovedWaivers: true }).blockers.length === 0, 'COMPLETION_UNVERIFIED');
+    const integrationGate = run.gates.filter(gate => gate.stage === 'integration' && gate.task === null).at(-1);
+    check(integrationGate?.source === await sourceFingerprint(run.integrationPath) && await this.gateInputsFresh(integrationGate, run.integrationPath), 'VALIDATION_STALE');
     const gate = await this.gate(run, 'final', run.integrationPath);
     if (!acceptedGate(gate)) { run.state = 'BLOCKED_TESTS'; return gate; }
     const targetNow = await inspectRepository(run.origin), integrationNow = await inspectRepository(run.integrationPath);
     check(targetNow.branch === run.target && targetNow.head === expectedTarget && targetNow.head === run.targetBase && !targetNow.dirty, 'TARGET_DRIFT');
     check(integrationNow.branch === run.integration && integrationNow.head === head && !integrationNow.dirty, 'INTEGRATION_DRIFT');
-    check(completionEvidence(run, null, { beforeTarget: true }).blockers.length === 0, 'COMPLETION_UNVERIFIED');
+    check(completionEvidence(run, null, { beforeTarget: true, allowApprovedWaivers: true }).blockers.length === 0, 'COMPLETION_UNVERIFIED');
+    check(gate.source === await sourceFingerprint(run.integrationPath) && await this.gateInputsFresh(integrationGate, run.integrationPath) && await this.gateInputsFresh(gate, run.integrationPath), 'VALIDATION_STALE');
     this.checkpointIntent(run);
     enforceRunBudget(run);
     await git(run.origin, 'merge', '--ff-only', run.integration);

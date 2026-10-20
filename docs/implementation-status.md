@@ -9,8 +9,8 @@
 - 프로토콜: 설정·요구사항·Task·결과·gate·review·recommendation의 검증 schema와 JSON Schema 산출물. 인증된 requirements 제출이 canonical JSON/Markdown을 저장하며 plan 수용 기준의 ID·문자열 exact match를 강제한다.
 - 설정: 필드별 default/global/project/session 병합 해석, 출처·파일 hash, atomic patch/unset, 충돌·dry-run, CLI 모델/profile 설정. 파일 설정 변경 API는 project/global 범위이며 session API는 MCP 서버 프로세스 수명의 메모리 layer를 제공한다.
 - 메타데이터: Codex handshake·전체 paging·deduplication, 호스트별 adapter, TTL·오류·stale fallback을 가진 disk cache. 현재 카탈로그 identity scope는 unknown이며 실제 세션과의 일치를 주장하지 않는다.
-- 상태·Git: SQLite event/operation journal, 동일 Git common dir 쓰기 락, 소유 worktree, DAG·ready wave, lease/fencing, 단위 커밋, 직렬 통합, retry 보존, commit/merge crash reconciliation, guarded cleanup.
-- 검증·review: 명령/source/environment fingerprint와 제한·redaction된 로그 참조, SHA-bound gate/review, 독립 reviewer 확인, finding/repair 순환 및 최대 round 제한. task self-report와 검증 증거를 구분한다.
+- 상태·Git: 승인된 `orch_plan_amend` revision/snapshot, Git preflight와 staged-secret commit guard, SQLite event/operation journal, 동일 Git common dir 쓰기 락, 소유 worktree, DAG·ready wave, lease/fencing, 단위 커밋, 직렬 통합, retry 보존, commit/merge crash reconciliation, guarded cleanup.
+- 검증·review: 명령/source/environment 및 루트 Node 설치 내용 fingerprint의 freshness 재검사와 제한·redaction된 로그 참조, SHA-bound gate/review, 독립 reviewer 확인, finding/repair 순환 및 최대 round 제한. task self-report와 검증 증거를 구분한다.
 - 실행 revision: immutable runtimeRoot로 run 코드를 고정하고, 새 attempt에서 허용된 설정 revision/model 정책을 읽으며 기존 attempt는 보존한다. 모델 requested/resolved/observed와 실제 관측 불가를 분리한다.
 - 보고서: 기본 읽기 전용 `orch_report`, 인증된 `persist=true`에서 run별 summary/findings/acceptance/cleanup 파일 저장. 완료 판정은 실제 target SHA·최신 gate/review·수용 증거에 의존하며 unknown usage/cost를 생성하지 않는다.
 - 배포 자산: 공통 진입 스킬 2개와 참조 8개, local checksum bundle pack/install/update/rollback/uninstall, 소유권 충돌 보존, 두 호스트별 설치 자산과 immutable runtime 경로. 실제 reload·MCP handshake·인증 실행은 설치 성공과 별개이다.
@@ -26,10 +26,10 @@
 ## 남은 구현과 출시 차단 조건
 
 - **네이티브 모델·호스트 지원 범위:** 현재 대화의 실제 Agent 응답을 인증된 coordinator relay로 연결하며 별도 daemon socket은 요구하지 않는다. 기본 auto/inherit는 호스트 기본값을 상속하고 실제 모델·effort 관측은 null이다. 구체적인 모델·effort 고정값, Claude 실제 Agent 실행과 OS별 동작에는 추가 검증이 필요하다. relay는 호스트 서명 증명이 아닌 신뢰된 부모의 전달이며 각 워커의 실제 Git bootstrap을 별도 대조한다.
-- **로컬 API 제한:** checkpoint는 `leaseRenewed=false`이며 heartbeat lease 연장을 제공하지 않는다. session override는 프로세스 수명만 유지하며 서버 재시작 후에는 새 hash로 승인된 설정을 다시 적용해야 한다. 요구사항은 제출·저장 후 plan과 일치해야 하며 실행 시작 후 교체할 수 없다.
+- **로컬 API 제한:** checkpoint는 `leaseRenewed=false`이다. 별도 `orch_heartbeat`는 실제 호스트 생존 영수증으로 lease를 갱신하며 고정 deadline은 연장하지 않는다. session override는 프로세스 수명만 유지하며 서버 재시작 후에는 새 hash로 승인된 설정을 다시 적용해야 한다. 요구사항은 제출·저장 후 plan과 일치해야 하며 실행 시작 후 교체할 수 없다.
 - **통합된 정책:** pause 시간을 제외한 active budget, snapshot별 명시 gate/missing-tests waiver, 반복 finding 재분석 제한과 run/target별 finalize preapproval이 로컬 테스트로 검증됐다. waiver는 passed와 구분하며 config 값만으로 사용자 승인을 대신하지 않는다. 실제 호스트 승인·실행 검증과는 별개이다.
 - **실제 출시 증거 부족:** Codex/Claude 각각 catalog → selection → native worker → 적용/관측 → 검증·review·finalize·복구·cleanup 경로를 완료해야 한다. Linux, Windows native/PowerShell, WSL 및 실제 두 호스트 설치/update/removal smoke는 미검증이다.
-- **추가 로컬 증거:** conflict-resolution과 일부 삭제 실패 후 cleanup 재실행의 전용 acceptance fixture는 현재 문서 기준에서 확인하지 못했다. 상세 잔여 항목과 후속 변경 영향은 acceptance index에서 추적한다.
+- **추가 로컬 증거:** 두 Task conflict-resolution의 전체 acceptance 시나리오는 부족하다. 이미 제거된 worktree의 남은 branch cleanup 재시도 fixture는 있지만 실제 파일시스템 장애·호스트 복구 증거와는 구분한다. 상세 잔여 항목과 후속 변경 영향은 acceptance index에서 추적한다.
 
 ## 재현 명령
 

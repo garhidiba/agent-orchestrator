@@ -7,12 +7,24 @@ export function findingBlocks(run: Run, finding: Run['findings'][number]) {
   return !resolved && (run.config.review.block_on.includes(finding.severity) || finding.acceptance_ids.length > 0);
 }
 
-export function completionEvidence(run: Run, actualFinalSha: string | null, options: { beforeFinalGate?: boolean; beforeTarget?: boolean } = {}) {
+export function completionEvidence(run: Run, actualFinalSha: string | null, options: { beforeFinalGate?: boolean; beforeTarget?: boolean; allowApprovedWaivers?: boolean } = {}) {
   const currentSha = run.integrationSha ?? null;
-  const gatePassed = (stage: string) => {
-    const gate = run.gates.filter(item => item.stage === stage && item.task === null).at(-1);
-    const required = run.config.quality.commands.filter(command => command.required && command.stages.includes(stage as 'final'));
-    return !!gate && !!currentSha && gate.sha === currentSha && gate.status === 'passed' && gate.commands === hash(run.config.quality.commands) && required.length > 0 && required.every(command => gate.results.some(result => result.id === command.id && result.status === 'passed' && result.exitCode === 0));
+  const gatePassed = (stage: string, task: string | null = null) => {
+    const gate = run.gates.filter(item => item.stage === stage && item.task === task).at(-1);
+    const required = run.config.quality.commands.filter(command => command.required && command.stages.includes(stage as 'final') && (task === null || run.tasks[task].spec.verification_ids.includes(command.id)));
+    if (!gate || !currentSha || ['integration', 'final'].includes(stage) && gate.sha !== currentSha || gate.commands !== hash(run.config.quality.commands)) return false;
+    const waived = (result: typeof gate.results[number]) => {
+      if (!options.allowApprovedWaivers || result.status !== 'waived' || result.exitCode !== null) return false;
+      const command = run.config.quality.commands.find(command => command.id === result.id && command.stages.includes(stage as 'final'));
+      const missingTests = result.id === 'missing-tests' && run.config.quality.commands.length === 0;
+      const waiver = missingTests ? run.missingTestsWaiver : run.waivers?.find(item => item.stage === stage && item.taskId === task && item.gateId === result.id && item.sha === gate.sha && item.source === gate.source && command && item.command === hash(command));
+      const detail = gate.details?.find(item => item.gateId === result.id && item.stage === stage && item.taskId === task && item.runId === run.id && item.commitSha === gate.sha && item.sourceFingerprint === gate.source && (missingTests || command && item.commandFingerprint === hash(command)) && item.status === 'waived' && item.exitCode === null && item.waiverReason === waiver?.reason);
+      return !!waiver && waiver.actor === 'user' && !!waiver.reason.trim() && !!detail && Number.isFinite(Date.parse(waiver.approvedAt)) && Date.parse(waiver.approvedAt) <= Date.parse(detail.startedAt);
+    };
+    const passed = (result: typeof gate.results[number]) => result.status === 'passed' && result.exitCode === 0;
+    const requiredIds = required.map(command => command.id);
+    if (run.config.quality.commands.length === 0 && run.missingTestsWaiver) requiredIds.push('missing-tests');
+    return (gate.status === 'passed' || options.allowApprovedWaivers && gate.status === 'waived' && gate.results.some(waived)) && requiredIds.length > 0 && requiredIds.every(id => gate.results.some(result => result.id === id && (passed(result) || waived(result)))) && gate.results.filter(result => result.status === 'waived').every(waived);
   };
   const reviews: Run['reviews'] = run.reviews;
   const finalReview = reviews.filter(review => review.final).at(-1);
@@ -20,6 +32,10 @@ export function completionEvidence(run: Run, actualFinalSha: string | null, opti
   const independent = (reviewer: string) => !run.implementers?.includes(reviewer) && !Object.values(run.tasks).some(task => task.nativeId === reviewer);
   const blockingFindings = run.findings.filter(finding => findingBlocks(run, finding));
   const blockers: string[] = [];
+  for (const [stage, task] of [['baseline', null], ...Object.keys(run.tasks).map(id => ['task', id])] as [string, string | null][]) {
+    const gate = run.gates.filter(item => item.stage === stage && item.task === task).at(-1);
+    if (gate && (gate.status === 'waived' || gate.results.some(result => result.status === 'waived')) && !gatePassed(stage, task)) blockers.push(`${stage.toUpperCase()}_GATE_UNVERIFIED`);
+  }
   if (run.hostEvidence?.source === 'coordinator_native_receipt') {
     for (const item of [review, finalReview]) if (!item || !Object.values(run.reviewDispatches ?? {}).some(dispatch => dispatch.nativeId === item.reviewer && dispatch.sha === currentSha && dispatch.role === (item.final ? 'final_auditor' : 'reviewer') && dispatch.state === 'COMPLETED')) blockers.push('REVIEW_DISPATCH_UNVERIFIED');
   }

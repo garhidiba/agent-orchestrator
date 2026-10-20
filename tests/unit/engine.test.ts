@@ -590,3 +590,105 @@ test('final gate branch switching cannot finalize an unrelated checkout', async 
     assert.notEqual(f.engine.status(current.id).data.state, 'COMPLETED');
   } finally { await f.close(); }
 });
+
+test('review and finalization require unchanged effective environment and fresh gate metadata', async () => {
+  const f = await fixture();
+  const previous = process.env.ORCH_FRESHNESS_TEST;
+  try {
+    f.plan.tasks = f.plan.tasks.slice(0, 1);
+    await f.change({}, run => f.engine.plan(run, f.plan, true));
+    await finishFixtureTask(f, 'T1');
+    const sha = await git(f.engine.status(f.created.runId).data.integrationPath, 'rev-parse', 'HEAD');
+    const review = { schema_version: 1, reviewed_sha: sha, reviewer_id: 'reviewer', decision: 'approved', findings: [], reviewed_areas: ['all'], limitations: [], acceptance_ids: ['AC-1'] };
+    process.env.ORCH_FRESHNESS_TEST = 'changed-secret-value';
+    await assert.rejects(f.change({}, run => f.engine.review(run, review)), /VALIDATION_STALE/);
+    if (previous === undefined) delete process.env.ORCH_FRESHNESS_TEST;
+    else process.env.ORCH_FRESHNESS_TEST = previous;
+    await f.change({}, run => f.engine.review(run, review));
+    await f.change({}, run => f.engine.review(run, { ...review, reviewer_id: 'auditor' }, true));
+    process.env.ORCH_FRESHNESS_TEST = 'changed-again';
+    await assert.rejects(f.change({}, run => f.engine.finalize(run, true, run.targetBase)), /VALIDATION_STALE/);
+    if (previous === undefined) delete process.env.ORCH_FRESHNESS_TEST;
+    else process.env.ORCH_FRESHNESS_TEST = previous;
+    await assert.rejects(f.change({}, run => {
+      delete run.gates.filter(gate => gate.stage === 'integration').at(-1)!.environment;
+      return f.engine.finalize(run, true, run.targetBase);
+    }), /VALIDATION_STALE/);
+    const originalGate = f.engine.gate.bind(f.engine);
+    const current = f.engine.status(f.created.runId).data;
+    await writeFile(join(current.commonDir, 'info', 'exclude'), 'node_modules\n');
+    for (const drift of ['environment', 'dependency']) {
+      f.engine.gate = async (...args) => {
+        const gate = await originalGate(...args);
+        if (args[1] === 'final') {
+          if (drift === 'environment') process.env.ORCH_FRESHNESS_TEST = 'changed-after-final-gate';
+          else {
+            await mkdir(join(current.integrationPath, 'node_modules'));
+            await writeFile(join(current.integrationPath, 'node_modules', 'changed.js'), 'module.exports = 24;');
+          }
+        }
+        return gate;
+      };
+      await assert.rejects(f.change({}, run => f.engine.finalize(run, true, run.targetBase)), /VALIDATION_STALE/);
+      assert.equal(await git(f.root, 'rev-parse', 'HEAD'), current.targetBase);
+      f.engine.gate = originalGate;
+      if (previous === undefined) delete process.env.ORCH_FRESHNESS_TEST;
+      else process.env.ORCH_FRESHNESS_TEST = previous;
+      await rm(join(current.integrationPath, 'node_modules'), { recursive: true, force: true });
+    }
+    await f.change({}, run => f.engine.finalize(run, true, run.targetBase));
+  } finally {
+    if (previous === undefined) delete process.env.ORCH_FRESHNESS_TEST;
+    else process.env.ORCH_FRESHNESS_TEST = previous;
+    await f.close();
+  }
+});
+
+test('finalization crash recovery reruns verification on current environment and installed dependencies', async () => {
+  const f = await fixture();
+  const previous = process.env.ORCH_FRESHNESS_TEST;
+  try {
+    f.plan.tasks = f.plan.tasks.slice(0, 1);
+    await f.change({}, run => f.engine.plan(run, f.plan, true));
+    await finishFixtureTask(f, 'T1');
+    const current = f.engine.status(f.created.runId).data;
+    const review = { schema_version: 1, reviewed_sha: current.integrationSha, reviewer_id: 'reviewer', decision: 'approved', findings: [], reviewed_areas: ['all'], limitations: [], acceptance_ids: ['AC-1'] };
+    await f.change({}, run => f.engine.review(run, review));
+    await f.change({}, run => f.engine.review(run, { ...review, reviewer_id: 'auditor' }, true));
+    const save = f.engine.store.save.bind(f.engine.store);
+    f.engine.store.save = () => { throw new Error('finalization save crash'); };
+    try {
+      await assert.rejects(f.engine.change(current.id, 'freshness-finalize-crash', f.engine.status(current.id).version,
+        { tool: 'orch_finalize', input: { approved: true, expected_target_sha: current.targetBase } }, run => f.engine.finalize(run, true, run.targetBase)), /finalization save crash/);
+    } finally { f.engine.store.save = save; }
+    await git(f.root, 'switch', '-c', 'wrong-recovery-target');
+    await assert.rejects(f.engine.reconcile(current.id, 'freshness-finalize-crash', true), /RECOVERY_FINALIZE_NOT_PROVEN/);
+    await git(f.root, 'switch', current.target);
+    await writeFile(join(current.integrationPath, 'T1.txt'), 'dirty');
+    await assert.rejects(f.engine.reconcile(current.id, 'freshness-finalize-crash', true), /RECOVERY_FINALIZE_NOT_PROVEN/);
+    await git(current.integrationPath, 'restore', '--', 'T1.txt');
+    process.env.ORCH_FRESHNESS_TEST = 'changed-after-crash';
+    await writeFile(join(current.commonDir, 'info', 'exclude'), 'node_modules\n');
+    const installed = join(current.integrationPath, 'node_modules');
+    await mkdir(installed);
+    await writeFile(join(installed, 'changed.js'), 'module.exports = 24;');
+    const recovered = await f.engine.reconcile(current.id, 'freshness-finalize-crash', true);
+    assert.deepEqual(recovered.result, { recovered: true, state: 'VERIFYING', reason: 'VALIDATION_STALE', targetAlreadyUpdated: true });
+    const pending = f.engine.status(current.id).data;
+    assert.equal(pending.state, 'VERIFYING');
+    assert.equal(pending.targetBase, current.integrationSha);
+    assert.deepEqual(pending.reviews, []);
+    assert.equal(pending.finalizedAt, undefined);
+    assert.equal(pending.finalizationApproval, undefined);
+    assert.ok(pending.gates.some(gate => gate.stage === 'final'));
+    await f.change({}, run => f.engine.verify(run));
+    await f.change({}, run => f.engine.review(run, review));
+    await f.change({}, run => f.engine.review(run, { ...review, reviewer_id: 'auditor' }, true));
+    await f.change({}, run => f.engine.finalize(run, true, run.targetBase));
+    assert.equal(f.engine.status(current.id).data.state, 'COMPLETED');
+  } finally {
+    if (previous === undefined) delete process.env.ORCH_FRESHNESS_TEST;
+    else process.env.ORCH_FRESHNESS_TEST = previous;
+    await f.close();
+  }
+});

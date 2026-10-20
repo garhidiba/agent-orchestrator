@@ -1,6 +1,6 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { realpath } from 'node:fs/promises';
+import fs, { realpath, lstat } from 'node:fs/promises';
 import { resolve, relative, isAbsolute } from 'node:path';
 import { resolveExecutable } from '../process/executable.ts';
 import { requireCondition } from '../../../protocol/src/runtime.ts';
@@ -24,6 +24,29 @@ export async function git(cwd: string, ...args: string[]) {
   });
   return stdout.endsWith('\n') ? stdout.slice(0, -1) : stdout;
 }
+// Inspect blobs without buffering arbitrary binary assets or including their contents in errors.
+export async function gitBlobMatches(cwd: string, oid: string, matches: (text: string) => boolean) {
+  requireCondition(/^[a-f0-9]{40,64}$/.test(oid), 'STAGED_SECRET_SCAN_FAILED');
+  const resolved = await trustedGit(cwd);
+  return new Promise<boolean>((resolve, reject) => {
+    const child = spawn(resolved.command, [...resolved.args, '-C', cwd, 'cat-file', 'blob', oid], {
+      env: { ...resolved.env, GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C' }, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
+    });
+    let tail = '', found = false, expired = false;
+    const timer = setTimeout(() => { expired = true; child.kill(); }, 30000);
+    child.stdout.on('data', (chunk: Buffer) => {
+      const text = tail + chunk.toString('latin1').replaceAll('\0', '');
+      if (matches(text)) { found = true; child.kill(); }
+      tail = text.slice(-4096);
+    });
+    child.on('error', () => { clearTimeout(timer); reject(new Error('STAGED_SECRET_SCAN_FAILED')); });
+    child.on('close', code => {
+      clearTimeout(timer);
+      if (!expired && (found || code === 0)) resolve(found);
+      else reject(new Error('STAGED_SECRET_SCAN_FAILED'));
+    });
+  });
+}
 export async function inspectRepository(cwd: string) {
   const root = await realpath(await git(cwd, 'rev-parse', '--show-toplevel'));
   requireCondition(await git(root, 'rev-parse', '--is-bare-repository') === 'false', 'BARE_REPOSITORY');
@@ -34,6 +57,35 @@ export async function inspectRepository(cwd: string) {
   const head = await git(root, 'rev-parse', '--verify', 'HEAD').catch(() => '');
   requireCondition(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head), 'EMPTY_REPOSITORY');
   return { root, commonDir, branch, head, dirty: (await git(root, 'status', '--porcelain=v1', '--untracked-files=all')).length > 0 };
+}
+// Read-only checks: signing keys and LFS/submodule checkout are not verified in v1.
+export async function preflightRepository(root: string, diskPaths: string[]) {
+  const gitDir = await git(root, 'rev-parse', '--absolute-git-dir');
+  for (const marker of ['MERGE_HEAD', 'rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'sequencer']) {
+    const path = resolve(gitDir, marker);
+    const present = await lstat(path).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
+    requireCondition(!present, 'GIT_OPERATION_IN_PROGRESS');
+  }
+  for (const identity of ['GIT_AUTHOR_IDENT', 'GIT_COMMITTER_IDENT']) {
+    const value = await git(root, 'var', identity).catch(() => '');
+    requireCondition(/^[^<>\n]+ <[^<>\n]+> \d+ [+-]\d{4}$/.test(value), 'GIT_IDENTITY_REQUIRED');
+  }
+  const signing = await git(root, 'config', '--type=bool', '--get', 'commit.gpgsign').catch(error => {
+    if (error.code === 1) return 'false'; throw error;
+  });
+  requireCondition(signing !== 'true', 'SIGNING_POLICY_UNVERIFIED');
+  const entries = await git(root, 'ls-files', '--stage', '-z');
+  requireCondition(!entries.split('\0').some(entry => entry.startsWith('160000 ') || entry.endsWith('\t.gitmodules')), 'SUPERPROJECT_SUBMODULES_UNSUPPORTED');
+  const paths = (await git(root, 'ls-files', '-z')).split('\0').filter(Boolean);
+  requireCondition(!paths.includes('.lfsconfig'), 'LFS_UNSUPPORTED');
+  for (let offset = 0; offset < paths.length; offset += 128) {
+    const attributes = (await git(root, 'check-attr', '-z', 'filter', '--', ...paths.slice(offset, offset + 128))).split('\0');
+    requireCondition(!attributes.some((value, index) => index % 3 === 2 && value === 'lfs'), 'LFS_UNSUPPORTED');
+  }
+  for (const path of diskPaths) {
+    const disk = await fs.statfs(path, { bigint: true });
+    requireCondition(disk.bavail * disk.bsize > 0n, 'DISK_SPACE_UNAVAILABLE');
+  }
 }
 export function within(root: string, path: string) {
   const part = relative(root, path);

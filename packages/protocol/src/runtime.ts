@@ -17,6 +17,9 @@ export const planSchema = z.strictObject({
   acceptance: z.array(z.strictObject({ id, text: z.string().min(1) })).min(1),
   tasks: z.array(taskSchema).min(1),
 });
+export const planAmendmentSchema = z.strictObject({
+  plan: planSchema, approved: z.literal(true), reason: z.string().trim().min(1).max(4096),
+});
 export const findingSchema = z.strictObject({
   id, severity: z.enum(['critical', 'high', 'medium', 'low']), category: z.string().min(1),
   path: relativePath, symbol: z.string().min(1), line_start: z.int().positive(), line_end: z.int().positive(),

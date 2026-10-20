@@ -4,7 +4,7 @@ Start with environment, run status and report. Record run ID, state/version, ope
 
 Pause/cancel through `orch_run_control`. A host disconnect does not prove a worker stopped. Confirm native lifecycle using the host; otherwise preserve the orphan state/worktree. Resume only after coordinator/worker ownership and pending operations have been reconciled. Status returns `pendingOperations` and `readyTasks`; neither is permission to dispatch.
 
-For duplicate requests, reuse the original operation ID and inputs. After a commit/merge crash, `orch_reconcile` examines durable intent and Git ancestry; confirm the previous coordinator stopped before requesting reconciliation. Do not delete locks, reset, stash or recommit by guesswork. A conflict requires reading current state and establishing a safe next action.
+For duplicate requests, reuse the original operation ID and inputs. After a commit/merge crash, `orch_reconcile` examines durable intent and Git ancestry; confirm the previous coordinator stopped before requesting reconciliation. Do not delete locks, reset, stash or recommit by guesswork. A conflict requires reading current state and establishing a safe next action. If finalization already updated the target but its status save was interrupted, reconciliation verifies exact branch/common-directory/clean identities and gate inputs. Changed inputs return `state:VERIFYING`, `reason:VALIDATION_STALE`, `targetAlreadyUpdated:true`; the target is not rolled back. Rerun integration verification, independent review/audit and explicit finalization approval with the current target SHA. Old gate evidence is preserved.
 
 | Condition | Action |
 |---|---|
@@ -31,7 +31,7 @@ Session configuration is process-local: restarting the MCP server removes it. Re
 
 Completion and `orch_report` share the same conservative evidence rule: TaskResult acceptance evidence, current-SHA gates, independent reviewer/final-auditor evidence and acceptance limitations must agree. A waiver remains waived and does not become fully verified completion. Preserve reports, unresolved findings and unknown resources when evidence is insufficient.
 
-For context recovery, reread current state plus immutable config/catalog/model/attempt snapshots. `orch_export` produces replaceable event/snapshot/config/plan/request views from the database; it does not infer absent observations or collect raw prompts. A snapshot hash identifies the original input while stored snapshot content is redacted, so do not recompute that identity hash from redacted export bytes.
+For context recovery, reread current state plus immutable config/catalog/model/plan/attempt snapshots. `orch_export` produces replaceable event/snapshot/config/plan/request views from the database; it does not infer absent observations or collect raw prompts. A snapshot hash identifies the original input while stored snapshot content is redacted, so do not recompute that identity hash from redacted export bytes.
 
 Read-only reviewers also own live resources. Submit a production review only after actual native termination, with `native_stopped=true`. For an abandoned review call `orch_review_stop` with exact `dispatch_id`, matching `native_id` (null for an unbound dispatch only) and `native_stopped=true` after confirming no worker remains. A duplicate active role dispatch is blocked, and cleanup preserves the integration worktree while a read-only dispatch remains active or uncertain.
 

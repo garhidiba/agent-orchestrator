@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, writeFile, readFile, lstat, realpath, rm, rename, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
-import { runtimeFixture } from '../fixtures/runtime.ts';
+import { runtimeFixture, fixtureTaskResult } from '../fixtures/runtime.ts';
 import { git } from '../../packages/core/src/git/repository.ts';
 
 async function nodeFixture(ignore: boolean | string = true, manifest: object = { dependencies: { 'orch-disposable-dependency': '1.0.0' } }) {
@@ -190,3 +190,72 @@ for (const kind of ['directory', 'symlink', 'dangling-symlink']) {
     } finally { await f.close(); }
   });
 }
+
+for (const drift of ['dependency-content', 'dependency-retarget', 'environment']) {
+  test(`commit rejects validation after ${drift} changes`, async () => {
+    const f = await nodeFixture();
+    const previous = process.env.ORCH_FRESHNESS_TEST;
+    try {
+      await f.change({}, run => f.engine.prepare(run, 'T1'));
+      const task = f.engine.status(f.created.runId).data.tasks.T1;
+      await f.change({}, run => f.engine.bind(run, 'T1', task.lease, task.attempt, 'native-T1', 'fixture-model', 'high'));
+      await writeFile(join(task.path, 'T1.txt'), 'feature');
+      if (drift === 'environment') process.env.ORCH_FRESHNESS_TEST = 'initial-secret-value';
+      await f.change({}, run => f.engine.validate(run, 'T1', task.lease, task.attempt));
+      assert.ok(!JSON.stringify(f.engine.status(f.created.runId)).includes('initial-secret-value'));
+      if (drift === 'environment') process.env.ORCH_FRESHNESS_TEST = 'changed-secret-value';
+      else if (drift === 'dependency-content') await writeFile(join(f.root, 'node_modules', 'orch-disposable-dependency', 'index.js'), 'module.exports = 24;');
+      else {
+        const replacement = join(f.dir, 'replacement');
+        await mkdir(join(replacement, 'orch-disposable-dependency'), { recursive: true });
+        await writeFile(join(replacement, 'orch-disposable-dependency', 'index.js'), 'module.exports = 42;');
+        await rm(join(task.path, 'node_modules'));
+        await symlink(replacement, join(task.path, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
+      }
+      await assert.rejects(f.change({}, run => f.engine.commit(run, 'T1', task.lease, task.attempt, 'U1')), /VALIDATION_STALE/);
+    } finally {
+      if (previous === undefined) delete process.env.ORCH_FRESHNESS_TEST;
+      else process.env.ORCH_FRESHNESS_TEST = previous;
+      await f.close();
+    }
+  });
+}
+
+test('completion rejects installed dependency drift after a validated commit', async () => {
+  const f = await nodeFixture();
+  try {
+    await f.change({}, run => f.engine.prepare(run, 'T1'));
+    const task = f.engine.status(f.created.runId).data.tasks.T1;
+    await f.change({}, run => f.engine.bind(run, 'T1', task.lease, task.attempt, 'native-T1', 'fixture-model', 'high'));
+    await writeFile(join(task.path, 'T1.txt'), 'feature');
+    await f.change({}, run => f.engine.validate(run, 'T1', task.lease, task.attempt));
+    await f.change({}, run => f.engine.commit(run, 'T1', task.lease, task.attempt, 'U1'));
+    await writeFile(join(f.root, 'node_modules', 'orch-disposable-dependency', 'index.js'), 'module.exports = 24;');
+    await assert.rejects(f.change({}, async run => f.engine.complete(run, 'T1', task.lease, task.attempt, true, await fixtureTaskResult(run, 'T1'))), /VALIDATION_STALE/);
+  } finally { await f.close(); }
+});
+
+test('gate refuses dependency mutation during execution and tolerates internal symlink cycles', async () => {
+  const f = await nodeFixture();
+  try {
+    await symlink('.', join(f.root, 'node_modules', 'cycle'), process.platform === 'win32' ? 'junction' : 'dir');
+    await f.change({}, run => f.engine.prepare(run, 'T1'));
+    const gate = await f.change({}, run => {
+      run.config.quality.commands[0].args = ['-e', 'require("node:fs").writeFileSync("node_modules/orch-disposable-dependency/index.js", "module.exports = 24;")'];
+      return f.engine.gate(run, 'task', run.tasks.T1.path, 'T1');
+    });
+    assert.equal(gate.result.status, 'source_changed');
+  } finally { await f.close(); }
+});
+
+test('gates reject user-owned dependency links outside the installation root', async () => {
+  const f = await nodeFixture();
+  try {
+    await f.change({}, run => f.engine.prepare(run, 'T1'));
+    const task = f.engine.status(f.created.runId).data.tasks.T1;
+    await rm(join(task.path, 'node_modules'));
+    await mkdir(join(task.path, 'node_modules'));
+    await symlink(f.root, join(task.path, 'node_modules', 'external'), process.platform === 'win32' ? 'junction' : 'dir');
+    await assert.rejects(f.change({}, run => f.engine.gate(run, 'task', task.path, 'T1')), /BLOCKED_DEPENDENCY_EXTERNAL_LINK/);
+  } finally { await f.close(); }
+});

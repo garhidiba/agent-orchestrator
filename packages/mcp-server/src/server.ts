@@ -18,7 +18,7 @@ import { exportRunEvidence } from '../../core/src/runtime/snapshots.ts';
 import { buildReport, writeReport } from '../../core/src/reporting/index.ts';
 import { git, inspectRepository } from '../../core/src/git/repository.ts';
 import { roleIds } from '../../protocol/src/config.ts';
-import { envelopeSchema, id, nativeAgentId, sha, requirementsSchema, planSchema, reviewSchema, taskResultSchema, hostHeartbeatSchema, findingDispositionSchema, requireCondition as check } from '../../protocol/src/runtime.ts';
+import { envelopeSchema, id, nativeAgentId, sha, requirementsSchema, planSchema, planAmendmentSchema, reviewSchema, taskResultSchema, hostHeartbeatSchema, findingDispositionSchema, requireCondition as check } from '../../protocol/src/runtime.ts';
 import type { NativeCapability, Run } from '../../core/src/runtime/engine.ts';
 
 export async function createServer(origin: string | null, host: 'codex' | 'claude', managedRoot: string, tokenPath: string) {
@@ -190,6 +190,7 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
   register('orch_run_status', scoped, async data => { const snapshot = runtime(true).status(data.run_id); return { ...snapshot, readyTasks: runtime().ready(snapshot.data), dispatchBlocked: native ? null : 'NEEDS_HOST_HANDSHAKE', pendingOperations: runtime().store.pending(data.run_id).map(item => item.id) }; });
   mutation('orch_requirements_submit', { requirements: requirementsSchema }, (run, data) => runtime().submitRequirements(run, data.requirements));
   mutation('orch_plan_submit', { plan: planSchema, approved: z.boolean() }, (run, data) => runtime().plan(run, data.plan, data.approved));
+  mutation('orch_plan_amend', planAmendmentSchema.shape, (run, data) => runtime().amendPlan(run, data));
   mutation('orch_task_prepare', { task_id: id }, (run, data) => runtime().prepare(run, data.task_id));
   const lease = { task_id: id, lease_id: z.string(), fencing_token: z.int().positive() };
   mutation('orch_attempt_port', { ...lease, action: z.enum(['status', 'release_for_claim']) }, (run, data) => runtime().attemptPort(run, data.task_id, data.lease_id, data.fencing_token, data.action));

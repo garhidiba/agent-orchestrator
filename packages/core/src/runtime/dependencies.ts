@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
 import { lstat, readFile, readdir, readlink, realpath, stat, symlink } from 'node:fs/promises';
 import { basename, join, resolve, toNamespacedPath } from 'node:path';
 import { git, within } from '../git/repository.ts';
@@ -55,3 +57,34 @@ export async function prepareNodeDependencies(origin: string, target: string, pr
   if (!existing) await symlink(sourcePath, targetPath, process.platform === 'win32' ? 'junction' : 'dir');
   return { method: 'shared_origin_symlink', source, target: targetPath, inputsFingerprint: hash(inputs), mutationPolicy: 'preserve_source_dependencies' };
 }
+
+// Hash installed bytes, including ignored files; visit each canonical directory once to bound symlink cycles.
+export async function dependencyFingerprint(root: string): Promise<string> {
+  const digest = createHash('sha256'), visited = new Set<string>();
+  const installation = await realpath(join(root, 'node_modules')).catch(() => null);
+  async function visit(path: string, name: string): Promise<void> {
+    const info = await entry(path);
+    digest.update(JSON.stringify([name, info?.mode ?? null]));
+    if (!info) return;
+    if (info.isSymbolicLink()) {
+      const destination = await realpath(path).catch(() => null);
+      digest.update(JSON.stringify([await readlink(path), destination]));
+      check(!destination || destination === installation || installation && within(installation, destination), 'BLOCKED_DEPENDENCY_EXTERNAL_LINK');
+      if (destination) await visit(destination, `${name}/@target`);
+    } else if (info.isDirectory()) {
+      const canonical = await realpath(path);
+      if (visited.has(canonical)) return;
+      visited.add(canonical);
+      for (const child of (await readdir(path)).sort()) await visit(join(path, child), `${name}/${child}`);
+    } else if (info.isFile()) {
+      const file = createHash('sha256');
+      for await (const chunk of createReadStream(path)) file.update(chunk);
+      digest.update(file.digest());
+    }
+  }
+  await visit(join(root, 'node_modules'), 'node_modules');
+  return digest.digest('hex');
+}
+
+export const environmentFingerprint = (overrides: Record<string, string>) =>
+  hash({ node: process.version, platform: process.platform, arch: process.arch, env: { ...process.env, ...overrides } });

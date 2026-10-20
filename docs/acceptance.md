@@ -26,7 +26,7 @@ Source-audit baseline: `79d3ab5`. This map supersedes the older acceptance index
 | AT-022–023 | Ownership and serialized integration contracts; actual concurrent native result arrival NOT RUN. |
 | AT-024 | Conflict candidate/fixed-parent resolution code exists. Target-conflict fixtures do not complete the two-task conflict acceptance scenario. |
 | AT-025 | Failed/timeout gate contracts; actual native host stop remains separate. |
-| AT-026 | Explicit missing-test waiver is retained; approved-exception finalization has a source gap. |
+| AT-026 | Missing-test waiver can finalize as an approved exception; `waiver-finalization.test.ts` covers the local contract, without claiming tests passed or host acceptance. |
 | AT-027 | SHA/source review freshness contracts plus a historical independent native review; actual host re-review after drift NOT RUN. |
 | AT-028–029 | Repair DAG/grouping contracts; multiple parallel repairs and related-finding grouping need their full scenarios. |
 | AT-030–032 | Proposed/verified finding lifecycle, stable IDs and bounded review/reanalysis contracts; actual model-driven relocation/repeated defects NOT RUN. |
@@ -40,11 +40,11 @@ Source-audit baseline: `79d3ab5`. This map supersedes the older acceptance index
 | AT-045 | Project config separation contract; actual simultaneous differing project role definitions NOT RUN. |
 | AT-046 | Common-dir lock contract; actual simultaneous host start NOT RUN. |
 | AT-047–050 | Isolated installation/update/conflict/rollback/removal contracts and dated installation records; no general OS/release certification. |
-| AT-051 | Authenticated coordinator/strict-schema/command-trust contracts; staged secret scanning is separately missing. Model-driven injection evaluation NOT RUN. |
+| AT-051 | Authenticated coordinator/strict-schema/command-trust contracts; staged secret scanning has a dedicated commit regression (known pattern/path detection, not exhaustive secret discovery). Model-driven injection evaluation NOT RUN. |
 | AT-052 | Unknown actual model/usage/cost stays null. |
 | AT-053 | Copy/space/Korean-path fixtures; actual Windows/PowerShell/no-symlink-privilege run NOT RUN. |
 | AT-054 | Bounded metadata subprocess fixtures; actual cleanup on every supported OS NOT RUN. |
-| AT-055 | Waiver reason/approval/status contract; approved waived finalization has a source gap. |
+| AT-055 | Snapshot-bound approved waived finalization/recovery and distinct report outcome have dedicated regressions; waived remains waived and completionVerified stays false. |
 | AT-056 | Non-inference/non-login installation fixtures; actual logged-out two-host installation NOT RUN. |
 | AT-057 | Orphan/unknown-stop preservation contracts; actual native disappearance/cancel/resume NOT RUN. |
 | AT-058 | Owned partial cleanup retry fixture exists (`cleanup retries a remaining owned branch after its worktree was already removed`); real filesystem failure and host lifecycle remain separate. |

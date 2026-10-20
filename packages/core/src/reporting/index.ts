@@ -30,9 +30,10 @@ export function buildReport(run: Run, version: number, actualFinalSha: string | 
   const resourceBranches = new Map([...Object.values(run.tasks), ...(run.candidates ?? []), { path: run.integrationPath, branch: run.integration }].map(item => [item.path, item.branch]));
   const cleanup = { status: run.cleanup.length === 0 ? 'not_requested' : run.cleanup.every(item => ['removed', 'absent'].includes(item.status)) ? 'complete' : 'partial', resources: run.cleanup.map(item => ({ ...item, branch: resourceBranches.get(item.path) ?? null })) };
   const completionVerified = run.state === 'COMPLETED' && blockers.length === 0;
-  const nextActions = completionVerified ? [] : run.state === 'READY_TO_FINALIZE' ? ['Approve finalization for the reviewed integration SHA.'] : ['Resolve the listed blockers and record acceptance evidence, independent final review and passing gates for the current SHA.'];
+  const finalizedWithApprovedExceptions = run.state === 'COMPLETED' && !completionVerified && completionEvidence(run, actualFinalSha, { allowApprovedWaivers: true }).blockers.length === 0;
+  const nextActions = completionVerified || finalizedWithApprovedExceptions ? [] : run.state === 'READY_TO_FINALIZE' ? ['Approve finalization for the reviewed integration SHA.'] : ['Resolve the listed blockers and record acceptance evidence, independent final review and passing gates for the current SHA.'];
   const report = {
-    schemaVersion: 1, runId: run.id, origin: run.origin, version, state: run.state, completionVerified,
+    schemaVersion: 1, runId: run.id, origin: run.origin, version, state: run.state, completionVerified, finalizedWithApprovedExceptions,
     targetBranch: run.target, targetBase: run.targetBase, integrationSha: currentSha, actualFinalSha,
     createdAt: run.createdAt, durationMs: run.finalizedAt ? Date.parse(run.finalizedAt) - Date.parse(run.createdAt) : null, activeTimeMs: run.activeTimeMs ?? null, pauseTimeMs: run.pauseTimeMs ?? null, reviewRound: run.reviewRound, host: run.host,
     models: Object.entries(run.config.hosts[run.host].roles).map(([role, requested]) => ({ role, requested, observations: [...tasks.filter(task => task.role === role).map(task => ({ taskId: task.id, selectedModel: task.selectedModel, selectedEffort: task.selectedEffort, observedModel: task.observedModel, observedEffort: task.observedEffort })), ...Object.entries(run.reviewDispatches ?? {}).filter(([, dispatch]) => dispatch.role === role).map(([dispatchId, dispatch]) => ({ taskId: null, dispatchId, selectedModel: dispatch.resolution.resolvedModel, selectedEffort: dispatch.resolution.resolvedEffort, observedModel: dispatch.observation?.observedModel ?? null, observedEffort: dispatch.observation?.observedEffort ?? null }))] })),
@@ -44,7 +45,7 @@ export function buildReport(run: Run, version: number, actualFinalSha: string | 
     limitations: ['Native receipts are authenticated coordinator attestations, not signed host, account or model evidence.', 'Unrecorded model selection, observations, changed paths, duration, logs, usage and billing remain unknown.', 'Gate command IDs reference configured commands; raw arguments, prompts, environment and transcripts are not collected.'],
   };
   const sections = [
-    ['Result', { state: report.state, completionVerified, blockers, nextActions }],
+    ['Result', { state: report.state, completionVerified, finalizedWithApprovedExceptions, blockers, nextActions }],
     ['Acceptance', acceptance], ['Code', { targetBranch: run.target, targetBase: run.targetBase, integrationSha: currentSha, actualFinalSha, tasks }],
     ['Models and execution', { host: run.host, models: report.models, tasks, createdAt: run.createdAt, durationMs: run.finalizedAt ? Date.parse(run.finalizedAt) - Date.parse(run.createdAt) : null, activeTimeMs: run.activeTimeMs ?? null, pauseTimeMs: run.pauseTimeMs ?? null, reviewRound: run.reviewRound, usage: null, cost: null }],
     ['Verification', { gates: report.gates, waivers: report.waivers, missingTestsWaiver: report.missingTestsWaiver }], ['Review and findings', { reviews: report.reviews, dispatches: report.reviewDispatches, findings: report.findings }], ['Cleanup', cleanup], ['Limitations', report.limitations],
