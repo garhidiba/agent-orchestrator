@@ -39,29 +39,29 @@ hosts:
     enabled: true
     roles:
       coordinator:
-        model: inherit
-        effort: inherit
+        model: claude-opus-5-5
+        effort: high
       requirements:
-        model: auto
-        effort: auto
+        model: claude-opus-5-5
+        effort: high
       planner:
-        model: auto
-        effort: auto
+        model: claude-opus-5-5
+        effort: high
       coder:
-        model: auto
+        model: claude-sonnet-5-5
         effort: auto
       tester:
-        model: auto
-        effort: auto
+        model: claude-opus-5-5
+        effort: high
       reviewer:
-        model: auto
-        effort: auto
+        model: claude-opus-5-5
+        effort: high
       repair:
-        model: auto
+        model: claude-sonnet-5-5
         effort: auto
       final_auditor:
-        model: auto
-        effort: auto
+        model: claude-opus-5-5
+        effort: high
 execution:
   mode: interactive_native
   max_parallel_workers: 4
