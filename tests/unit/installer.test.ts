@@ -253,3 +253,43 @@ test('management Git probes ignore repository node_modules PATH shadows for curr
     await assert.rejects(readFile(marker), { code: 'ENOENT' });
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test('one installer command builds, verifies and installs locally without bundle arguments', { skip: process.platform === 'win32' }, async () => {
+  const { cp, symlink, realpath, readdir } = await import('node:fs/promises');
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const { fileURLToPath } = await import('node:url');
+  const f = await fixture(), repo = fileURLToPath(new URL('../../', import.meta.url));
+  try {
+    for (const name of ['packages', 'scripts', 'skills', 'references', 'templates', 'package.json', 'package-lock.json']) await cp(join(repo, name), join(f.source, name), { recursive: true, force: true });
+    await symlink(join(repo, 'node_modules'), join(f.source, 'node_modules'));
+    const bin = join(f.dir, 'bin'), temporary = join(f.dir, 'tmp'); await mkdir(bin); await mkdir(temporary);
+    await symlink(process.execPath, join(bin, 'node'));
+    await writeFile(join(bin, 'codex'), '#!/bin/sh\nif [ "$1" != "--version" ]; then exit 91; fi\necho fixture-host\n', { mode: 0o755 });
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: f.home, PATH: `${bin}:/usr/bin:/bin`, XDG_DATA_HOME: join(f.dir, 'data'), XDG_CONFIG_HOME: join(f.home, '.config'), ORCH_CONFIG_HOME: join(f.home, '.config/orch'), TMPDIR: temporary };
+    const script = await realpath(join(f.source, 'scripts/install.sh')), exec = promisify(execFile);
+    const run = async (...args: string[]) => JSON.parse((await exec('/bin/sh', [script, ...args], { cwd: f.dir, env, timeout: 60000, maxBuffer: 1024 * 1024 })).stdout);
+    const preview = await run('--dry-run');
+    assert.equal(preview.dryRun, true);
+    const root = join(f.dir, 'data/orch');
+    await assert.rejects(readFile(join(root, 'installation.json')), { code: 'ENOENT' });
+    const first = await run();
+    assert.deepEqual(first.hosts, ['codex']); assert.match(first.version, /^0\.1\.0-local\.[a-f0-9]+$/);
+    assert.equal(first.authentication, 'NOT_CHECKED');
+    const config = await readFile(join(f.home, '.codex/config.toml'), 'utf8');
+    assert.match(config, /user-model/); assert.match(config, /mcp_servers.orch/);
+    const again = await run();
+    assert.equal(again.version, first.version);
+    assert.equal(await readFile(join(f.home, '.codex/config.toml'), 'utf8'), config);
+    assert.deepEqual(await readdir(join(root, 'versions')), [first.version]);
+    assert.deepEqual(await readdir(temporary), []);
+    // The npm executable is a process-boundary fixture; no registry or user installation is used.
+    await rm(join(f.source, 'node_modules'));
+    await writeFile(join(bin, 'npm'), '#!/bin/sh\n[ "$*" = "ci --ignore-scripts --no-audit --no-fund" ] || exit 92\n: > "$ORCH_TEST_NPM_MARKER"\nln -s "$ORCH_TEST_MODULES" node_modules\n', { mode: 0o755 });
+    const marker = join(f.dir, 'npm-invoked');
+    env.ORCH_TEST_NPM_MARKER = marker; env.ORCH_TEST_MODULES = join(repo, 'node_modules');
+    await run('--dry-run');
+    assert.equal(await readFile(marker, 'utf8'), '');
+    assert.deepEqual(await readdir(temporary), []);
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});

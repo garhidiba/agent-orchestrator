@@ -6,40 +6,25 @@ ORCH is a local coordination runtime for work started inside an existing Codex o
 
 ## Install
 
-Requires **Node.js 24+**, Git, and an installed Codex CLI or Claude Code. This development version is installed from a trusted local source bundle; no published npm package or remote release installer is available.
+Requires **Node.js 24+** (with npm), Git, and Codex CLI or Claude Code. From this checkout, run one command:
 
-The following commands use a POSIX shell (macOS/Linux). Build a bundle outside the checkout, preview installation, then install for the current user:
+```sh
+./scripts/install.sh
+```
+
+The installer handles missing npm dependencies, local packaging, checksums and installation for all detected hosts. It preserves unrelated settings and refuses user-owned skill/MCP conflicts. Run the same command again to update; unchanged sources reuse the installed version. No manual bundle or checksum is needed.
+
+For a fresh checkout:
 
 ```sh
 git clone https://github.com/garhidiba/agent-orchestrator.git
 cd agent-orchestrator
-npm ci
-
-ORCH_BUILD_DIR="$(mktemp -d)"
-ORCH_VERSION="0.1.0-local.$(git rev-parse --short HEAD)"
-node packages/installer/src/manage.ts pack \
-  --source . --bundle "$ORCH_BUILD_DIR/bundle" --version "$ORCH_VERSION" \
-  > "$ORCH_BUILD_DIR/pack.json"
-ORCH_CHECKSUM="$(node -e 'console.log(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).checksum)' "$ORCH_BUILD_DIR/pack.json")"
-
-node packages/installer/src/manage.ts install \
-  --bundle "$ORCH_BUILD_DIR/bundle" --checksum "$ORCH_CHECKSUM" \
-  --target auto --scope user --dry-run
-node packages/installer/src/manage.ts install \
-  --bundle "$ORCH_BUILD_DIR/bundle" --checksum "$ORCH_CHECKSUM" \
-  --target auto --scope user
+./scripts/install.sh
 ```
 
-`auto` installs for the detected hosts. Use `--target codex`, `--target claude`, or `--target both` to select explicitly. Existing unrelated settings are preserved; conflicting user-owned skills or MCP entries are rejected. The checksum verifies this trusted local build; it does not authenticate a downloaded bundle.
+On Windows PowerShell, run `./scripts/install.ps1` instead. Installation registers the `orch` MCP server and copies `orch` / `orch-configure` into each host's skills directory. Restart/reload the host afterward.
 
-User installation copies the runtime to `${XDG_DATA_HOME:-~/.local/share}/orch/versions/` on macOS/Linux and registers:
-
-| Host | Skills | MCP configuration |
-|---|---|---|
-| Codex | `~/.agents/skills/orch`, `~/.agents/skills/orch-configure` | `~/.codex/config.toml` |
-| Claude Code | `~/.claude/skills/orch`, `~/.claude/skills/orch-configure` | `~/.claude.json` |
-
-For a project-only installation, replace `--scope user` with `--scope project --project /absolute/path/to/git-root` in both install commands. Other platform paths, update/rollback and ownership details are in [installation](docs/installation.md). Each version directory is immutable: rebuild changed sources under a new version, then use `update` with the same bundle/checksum/scope options. The temporary build directory can be removed after installation; the installed runtime is a separate copy.
+Optional: `./scripts/install.sh --target codex` selects just Codex (`claude` selects Claude Code); `--dry-run` previews host changes. Project-only installation uses `--scope project --project /absolute/path/to/git-root`. Dependency setup can still write local `node_modules` during a preview. See [installation](docs/installation.md) for paths, advanced verified-bundle options and removal.
 
 ## Use in a conversation
 
@@ -53,6 +38,41 @@ For a project-only installation, replace `--scope user` with `--scope project --
 | Explain current settings without changing them | `$orch-configure 현재 모델과 설정을 설명해줘. 변경하지 마` | `/orch-configure 현재 모델과 설정을 설명해줘. 변경하지 마` |
 | Preview a project profile change | `$orch-configure 이 프로젝트를 quality 프로필로 바꾸는 변경안을 보여줘` | `/orch-configure 이 프로젝트를 quality 프로필로 바꾸는 변경안을 보여줘` |
 | Read an existing run | `$orch run-<ID> 상태와 보고서를 보여줘` | `/orch run-<ID> 상태와 보고서를 보여줘` |
+
+### Copyable prompts
+
+Use these in the host conversation, not in a terminal. In Claude Code, replace `$orch` / `$orch-configure` with `/orch` / `/orch-configure`.
+
+First inspect the project and current settings:
+
+```text
+$orch 현재 프로젝트의 환경, MCP 연결과 실행 가능 상태를 확인해줘. 파일은 변경하지 마.
+$orch-configure 현재 프로필과 역할별 모델·추론 설정을 설명해줘. 설정은 바꾸지 마.
+```
+
+To change configuration, request a preview first and approve the concrete proposal in the next message:
+
+```text
+$orch-configure 이 프로젝트를 quality 프로필로 바꾸는 변경안을 보여줘. 기존에 고정한 모델은 유지하고 아직 적용하지 마.
+```
+
+```text
+$orch-configure 방금 확인한 변경안을 이 프로젝트에만 적용해줘. 전역 설정과 기존 모델 고정값은 유지해줘.
+```
+
+For an existing run, substitute its actual ID:
+
+```text
+$orch run-<ID>의 진행 상태, 차단 이유와 보고서를 보여줘.
+```
+
+A work request should include a concrete result and verification command. For example:
+
+```text
+$orch 이 저장소의 설정 조회 CLI에 --help 예제를 추가해줘. 기존 출력은 유지하고 npm run check로 검증해줘. 먼저 실행 가능 상태를 확인하고 지원되지 않으면 중단해.
+```
+
+The current version stops that work request at the native capability check; it does not start workers. Settings inspection and supported configuration changes remain available.
 
 **Current execution limit:** the production native worker adapter is not implemented. Environment checks report `BLOCKED_CAPABILITY`; a start request must stop there. Settings inspection, supported configuration changes and MCP reads can be tested now, but a complete native multi-agent run cannot. Model availability/access and actual applied model/effort remain separate checks; see [compatibility](docs/compatibility.md).
 

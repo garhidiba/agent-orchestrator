@@ -1,8 +1,8 @@
 import { parseArgs } from 'node:util';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
-import { readFile, realpath } from 'node:fs/promises';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { install, update, rollback, uninstall, packRelease, type Host } from './installation/index.ts';
 import { detectHost } from './detection/host.ts';
 import { globalConfigPath } from '../../core/src/config/index.ts';
@@ -10,13 +10,14 @@ import { git } from '../../core/src/git/repository.ts';
 
 const help = `ORCH local release management (Node >=24 and Git required)
   pack --source DIR --bundle DIR --version VERSION
-  install --bundle DIR --checksum SHA256 [--target auto|codex|claude|both] [--scope user|project] [--project DIR] [--dry-run] [--yes]
+  install [--bundle DIR --checksum SHA256] [--target auto|codex|claude|both] [--scope user|project] [--project DIR] [--dry-run] [--yes]
   update --bundle DIR --checksum SHA256 [same options]
   rollback --version VERSION [--target auto|codex|claude|both] [same scope options]
   uninstall [--target auto|codex|claude|both] [--keep-data] [same scope options]
 
 user is the global/current-user scope; project requires a Git root.
 --checksum is the externally trusted SHA256 of the bundle's release.json.
+Without bundle arguments, install/update build and verify this local source automatically.
 Updates use local verified bundles; remote release retrieval is not configured.
 --yes never authorizes overwrites. Data and old versions are always retained.
 Host restart/reload and authenticated invocation remain separately unverified.`;
@@ -68,6 +69,14 @@ export async function manage(args: string[]) {
   if (command === 'rollback') {
     if (!values.version) throw new Error('ROLLBACK_VERSION_REQUIRED');
     return rollback({ ...options, version: values.version });
+  }
+  if (!values.bundle && !values.checksum) {
+    const temporary = await mkdtemp(join(tmpdir(), 'orch-install-'));
+    try {
+      const bundle = join(temporary, 'bundle');
+      const checksum = await packRelease(fileURLToPath(new URL('../../../', import.meta.url)), bundle, values.version);
+      return await install({ ...options, bundle, checksum });
+    } finally { await rm(temporary, { recursive: true, force: true }); }
   }
   if (!values.bundle || !values.checksum) throw new Error('VERIFIED_LOCAL_BUNDLE_REQUIRED');
   if (values.version) {

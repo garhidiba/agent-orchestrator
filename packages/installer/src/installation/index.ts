@@ -36,7 +36,7 @@ async function safe(file: string, base: string) {
 }
 async function filesAt(root: string, prefix = ''): Promise<Record<string, string>> {
   const files: Record<string, string> = {};
-  for (const entry of await readdir(join(root, prefix), { withFileTypes: true })) {
+  for (const entry of (await readdir(join(root, prefix), { withFileTypes: true })).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
     const name = prefix ? `${prefix}/${entry.name}` : entry.name;
     if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) throw new Error('RELEASE_UNSAFE_FILE');
     if (entry.isDirectory()) Object.assign(files, await filesAt(root, name));
@@ -135,8 +135,8 @@ async function copyProductionDependencies(source: string, bundle: string) {
   return skipped;
 }
 
-export async function packRelease(source: string, bundle: string, version: string) {
-  versionSchema.parse(version);
+export async function packRelease(source: string, bundle: string, version?: string) {
+  if (version !== undefined) versionSchema.parse(version);
   source = resolve(source); bundle = resolve(bundle);
   if (source === bundle || bundle.startsWith(`${source}${sep}`)) throw new Error('BUNDLE_MUST_BE_OUTSIDE_SOURCE');
   await mkdir(bundle); // Never reuse or overwrite a previous release directory.
@@ -151,7 +151,10 @@ export async function packRelease(source: string, bundle: string, version: strin
       catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
     }
     const lock = await optional(join(source, 'package-lock.json')); if (lock) await writeFile(join(bundle, 'package-lock.json'), lock);
-    const release: Release = { schema: 1, version, nodeMajor: 24, platform: process.platform, arch: process.arch, hostExecution: 'UNVERIFIED', sqlite: 'node:sqlite', skippedOptionalPackages, files: await filesAt(bundle) };
+    const files = await filesAt(bundle);
+    // Content-derived versions make unchanged local installs idempotent, including outside Git.
+    version ??= `${versionSchema.parse(JSON.parse(await readFile(join(source, 'package.json'), 'utf8')).version)}-local.${hash(JSON.stringify([process.platform, process.arch, files])).slice(0, 16)}`;
+    const release: Release = { schema: 1, version, nodeMajor: 24, platform: process.platform, arch: process.arch, hostExecution: 'UNVERIFIED', sqlite: 'node:sqlite', skippedOptionalPackages, files };
     const bytes = JSON.stringify(release, null, 2) + '\n';
     await writeFile(join(bundle, 'release.json'), bytes);
     const checksum = hash(bytes); await verifyRelease(bundle, checksum); return checksum;
