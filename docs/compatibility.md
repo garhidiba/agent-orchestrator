@@ -4,6 +4,8 @@ The [completion audit tracker](prd-completion.md) records the current run's find
 
 Status date: 2026-10-20. Package version 0.1.0 is a development implementation. PRD v1 completion requires real native E2E on both hosts; it has not been established.
 
+The user's real Claude full-version/effort and managed-worktree dependency scenarios currently have [open runtime failures](prd-completion.md#reopened-runtime-failures--2026-10-20). Treat prior local-check and installation results as scoped evidence, not successful acceptance of those paths.
+
 | Surface | Evidence | Status |
 |---|---|---|
 | Node + Git deterministic runtime | Repository unit/contract tests with disposable Git repositories | Implemented fixture path; see test results from the current checkout |

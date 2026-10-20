@@ -2,6 +2,8 @@
 
 For the current PRD completion run, use the [audit tracker](prd-completion.md). The results below retain their original baseline and do not prove later changes or the v1 release gate.
 
+**Current runtime failures:** real Claude full-version/effort dispatch and dependency readiness in managed worktrees are reopened in the tracker. Configuration saving, deterministic test passes and a dependency-free Codex marker smoke did not verify these scenarios. [Status terms](project-glossary.md) define the evidence required for each claim; no overall PRD completion is asserted.
+
 Baseline: integrated source `d6f73631e6eb875a87e282871cf5a536a5b93638`, 2026-10-20. This is a scoped evidence index, not an exhaustive QA Matrix or a passing v1 release gate. The disabled `qa-verification` workflow was not invoked. A local rule implemented and exercised by fixtures is distinct from an absent production native adapter, an unrun host/OS experiment, and an uncovered local scenario. The coordinator recorded `npm run check`: typecheck PASS and 100 tests PASS, 0 failures/skips (26.756 seconds), plus a clean diff check. Independent final review confirmed every raised finding fixed, with 15 focused tests and six masked model/effort checks passing. A source-built macOS arm64 bundle passed isolated both-host configuration installation, installed CLI and MCP handshake/27-tool listing, selective removal and preservation checks. Actual native host execution and other operating systems remain unverified.
 
 ## Remaining local implementation surfaces
