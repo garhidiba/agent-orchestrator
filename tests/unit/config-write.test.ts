@@ -93,3 +93,33 @@ test('higher layers cannot hide a new invalid model or effort in the changed sco
     assert.equal(await readFile(file, 'utf8'), '');
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test('project initialization is atomic, inherits settings and never replaces existing configuration', async () => {
+  const { initializeProjectConfig } = await import('../../packages/core/src/config/write.ts');
+  const dir = await mkdtemp(join(tmpdir(), 'orch-init-'));
+  try {
+    const results = await Promise.all([initializeProjectConfig(dir), initializeProjectConfig(dir)]);
+    assert.equal(results.filter(result => result.created).length, 1);
+    const file = join(dir, '.orch/config.yaml'), initial = await readFile(file, 'utf8');
+    const { parseConfig, resolveConfig } = await import('../../packages/core/src/config/index.ts');
+    assert.deepEqual(parseConfig(initial), { schema_version: 1 });
+    assert.equal(resolveConfig({ global: { model_selection: { profile: 'economy' } }, project: parseConfig(initial) }).config.model_selection.profile, 'economy');
+    const custom = '# user configuration\nmodel_selection: {profile: quality}\n'; await writeFile(file, custom);
+    assert.equal((await initializeProjectConfig(dir)).created, false); assert.equal(await readFile(file, 'utf8'), custom);
+    await writeFile(file, 'unknown_setting: keep-me\n');
+    await assert.rejects(initializeProjectConfig(dir), /CONFIG_INVALID/); assert.equal(await readFile(file, 'utf8'), 'unknown_setting: keep-me\n');
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('project initialization refuses linked directories and files without changing external data', { skip: process.platform === 'win32' }, async () => {
+  const { initializeProjectConfig } = await import('../../packages/core/src/config/write.ts');
+  const { mkdir, symlink, readdir } = await import('node:fs/promises');
+  const dir = await mkdtemp(join(tmpdir(), 'orch-init-links-')), outside = join(dir, 'outside'), project = join(dir, 'project');
+  try {
+    await mkdir(outside); await mkdir(project); await symlink(outside, join(project, '.orch'));
+    await assert.rejects(initializeProjectConfig(project), /CONFIG_PATH_UNSAFE/); assert.deepEqual(await readdir(outside), []);
+    await rm(join(project, '.orch')); await mkdir(join(project, '.orch'));
+    const victim = join(outside, 'config.yaml'); await writeFile(victim, 'schema_version: 1\n'); await symlink(victim, join(project, '.orch/config.yaml'));
+    await assert.rejects(initializeProjectConfig(project), /CONFIG_PATH_UNSAFE/); assert.equal(await readFile(victim, 'utf8'), 'schema_version: 1\n');
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

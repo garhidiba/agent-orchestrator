@@ -148,3 +148,26 @@ test('installed MCP connects the current native coordinator without a daemon and
     assert.equal(bound.error, undefined, JSON.stringify(bound)); assert.equal(bound.data.result.state, 'RUNNING');
   } finally { await client.close(); await server.close(); await f.close(); }
 });
+
+test('project initialization requires coordinator auth and ordinary config reads remain read-only', async () => {
+  const { readFile, writeFile, access } = await import('node:fs/promises');
+  const { git } = await import('../../packages/core/src/git/repository.ts');
+  const dir = await mkdtemp(join(tmpdir(), 'orch-mcp-init-')), token = join(dir, 'parent.token');
+  await git(dir, 'init');
+  const server = await createServer(dir, 'codex', join(dir, 'managed'), token), client = new Client({ name: 'project-init-contract', version: '1' });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(a); await client.connect(b);
+    const call = async (name: string, args: Record<string, unknown> = {}) => JSON.parse(((await client.callTool({ name, arguments: args })).content as { text: string }[])[0].text);
+    await call('orch_config', { action: 'effective' });
+    const file = join(dir, '.orch/config.yaml'); await assert.rejects(access(file), { code: 'ENOENT' });
+    assert.equal((await call('orch_project_init', { coordinator_token: 'worker' })).error.code, 'COORDINATOR_RELAY_REQUIRED');
+    await assert.rejects(access(file), { code: 'ENOENT' });
+    const auth = { coordinator_token: await readFile(token, 'utf8') };
+    const first = await call('orch_project_init', auth); assert.equal(first.error, undefined, JSON.stringify(first)); assert.equal(first.data.created, true);
+    assert.deepEqual(first.data.configuration.layers.project, { schema_version: 1 });
+    const custom = '# preserve me\nmodel_selection: {profile: quality}\n'; await writeFile(file, custom);
+    const again = await call('orch_project_init', auth); assert.equal(again.data.created, false); assert.equal(again.data.configuration.config.model_selection.profile, 'quality');
+    assert.equal(await readFile(file, 'utf8'), custom);
+  } finally { await client.close(); await server.close(); await rm(dir, { recursive: true, force: true }); }
+});

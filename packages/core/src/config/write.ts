@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { link, lstat, mkdir, realpath, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { parseDocument } from 'yaml';
 import { parseConfig, resolveConfig } from './index.ts';
 import { validateModels } from '../model-registry/index.ts';
@@ -49,4 +49,28 @@ export async function patchConfig(file: string, expectedHash: string, patches: C
     check(await read(file) === text, 'CONFIG_READBACK_FAILED');
     return { hash: configHash(text), config: patch };
   } finally { if (!options.dryRun) { await rm(temp, { force: true }); await rm(lock); } }
+}
+
+
+export async function initializeProjectConfig(origin: string) {
+  const directory = join(await realpath(origin), '.orch'), file = join(directory, 'config.yaml');
+  await mkdir(directory).catch(error => { if (error.code !== 'EEXIST') throw error; });
+  const folder = await lstat(directory); check(folder.isDirectory() && !folder.isSymbolicLink(), 'CONFIG_PATH_UNSAFE');
+  async function existing() {
+    const info = await lstat(file).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+    if (!info) return null;
+    check(info.isFile() && !info.isSymbolicLink(), 'CONFIG_PATH_UNSAFE');
+    const text = await readFile(file, 'utf8'); parseConfig(text); return text;
+  }
+  const previous = await existing();
+  if (previous !== null) return { created: false, file, hash: configHash(previous) };
+  const temporary = join(directory, `.init-${randomUUID()}.tmp`);
+  let created = false;
+  try {
+    await writeFile(temporary, '# Project overrides; omitted fields inherit user settings.\nschema_version: 1\n', { flag: 'wx', mode: 0o600 });
+    try { await link(temporary, file); created = true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+    const text = await existing(); check(text !== null, 'CONFIG_READBACK_FAILED');
+    return { created, file, hash: configHash(text) };
+  } finally { await rm(temporary, { force: true }); }
 }

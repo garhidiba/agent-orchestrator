@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { Engine } from '../../core/src/runtime/engine.ts';
 import { loadConfig, globalConfigPath } from '../../core/src/config/index.ts';
 import { createSessionConfig } from '../../core/src/config/session.ts';
-import { patchConfig } from '../../core/src/config/write.ts';
+import { initializeProjectConfig, patchConfig } from '../../core/src/config/write.ts';
 import { detectHost } from '../../installer/src/detection/host.ts';
 import { getCatalogForHost } from '../../core/src/model-registry/service.ts';
 import { buildReport, writeReport } from '../../core/src/reporting/index.ts';
@@ -82,6 +82,12 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
     return { state: 'READY', source: native.source, host, model: null, effort: null, evidence: native.evidence };
   });
   register('orch_models', { refresh: z.boolean().default(false) }, async data => getCatalogForHost(origin, host, { refresh: data.refresh }));
+  register('orch_project_init', auth, async data => {
+    authenticate(data.coordinator_token); check(origin, 'PROJECT_REQUIRED');
+    const root = await git(origin, 'rev-parse', '--show-toplevel');
+    const initialized = await initializeProjectConfig(root);
+    return { ...initialized, configuration: await configuration() };
+  });
   register('orch_config', { action: z.enum(['effective', 'patch', 'unset']), ...auth,
     scope: z.enum(['project', 'global', 'session']).default('project'), dry_run: z.boolean().default(false), expected_hash: z.string().optional(),
     patches: z.array(z.strictObject({ path: z.array(z.string()).min(1), value: z.unknown().optional(), remove: z.boolean().optional() })).default([]),
