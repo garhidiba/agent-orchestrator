@@ -40,10 +40,13 @@ export async function changedPaths(cwd: string, base = 'HEAD') {
 export async function sourceFingerprint(cwd: string) {
   const { hash } = await import('../state/store.ts');
   // Include tracked content, deletions and untracked files, not only the HEAD SHA.
-  const { readFile } = await import('node:fs/promises');
+  const { readFile, lstat, readlink } = await import('node:fs/promises');
   const files = (await git(cwd, 'ls-files', '-z', '--cached', '--others', '--exclude-standard')).split('\0').filter(Boolean).sort();
   const entries = await Promise.all(files.map(async path => {
-    try { return [path, (await readFile(resolve(cwd, path))).toString('base64')]; }
+    try {
+      const file = resolve(cwd, path), stat = await lstat(file);
+      return [path, stat.mode, stat.isSymbolicLink() ? await readlink(file) : (await readFile(file)).toString('base64')];
+    }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [path, null]; throw error; }
   }));
   return hash(entries);
