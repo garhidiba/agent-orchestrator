@@ -1,0 +1,392 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "number",
+      "const": 1
+    },
+    "model_selection": {
+      "type": "object",
+      "properties": {
+        "profile": {
+          "type": "string",
+          "enum": [
+            "balanced",
+            "quality",
+            "economy",
+            "fast"
+          ]
+        },
+        "allow_cross_host": {
+          "type": "boolean",
+          "const": false
+        },
+        "allow_unverified_models": {
+          "type": "boolean",
+          "const": false
+        },
+        "catalog_cache_ttl_hours": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "on_model_unavailable": {
+          "type": "string",
+          "const": "pause"
+        },
+        "on_catalog_change": {
+          "type": "string",
+          "const": "recommend_only"
+        }
+      },
+      "additionalProperties": false
+    },
+    "hosts": {
+      "type": "object",
+      "properties": {
+        "codex": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "roles": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string",
+                "enum": [
+                  "coordinator",
+                  "requirements",
+                  "planner",
+                  "coder",
+                  "tester",
+                  "reviewer",
+                  "repair",
+                  "final_auditor"
+                ]
+              },
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "model": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "^[^\\x00\\r\\n]+$"
+                  },
+                  "effort": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "^[^\\x00\\r\\n]+$"
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "claude": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "roles": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string",
+                "enum": [
+                  "coordinator",
+                  "requirements",
+                  "planner",
+                  "coder",
+                  "tester",
+                  "reviewer",
+                  "repair",
+                  "final_auditor"
+                ]
+              },
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "model": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "^[^\\x00\\r\\n]+$"
+                  },
+                  "effort": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "^[^\\x00\\r\\n]+$"
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "execution": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "const": "interactive_native"
+        },
+        "max_parallel_workers": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "max_parallel_test_jobs": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "max_task_attempts": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "max_review_rounds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "max_repeated_finding_rounds": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "task_timeout_minutes": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "run_timeout_minutes": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "on_host_disconnect": {
+          "type": "string",
+          "const": "pause_and_preserve"
+        }
+      },
+      "additionalProperties": false
+    },
+    "planning": {
+      "type": "object",
+      "properties": {
+        "require_approval": {
+          "type": "boolean"
+        },
+        "preserve_user_overrides": {
+          "type": "boolean",
+          "const": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "git": {
+      "type": "object",
+      "properties": {
+        "target_branch": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[^\\x00\\r\\n]+$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "integration_prefix": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\x00\\r\\n]+$"
+        },
+        "merge_strategy": {
+          "type": "string",
+          "const": "merge_no_ff"
+        },
+        "commit_policy": {
+          "type": "string",
+          "const": "atomic_unit"
+        },
+        "finalization": {
+          "type": "string",
+          "enum": [
+            "approval_required",
+            "auto_on_success"
+          ]
+        },
+        "remote_push": {
+          "type": "boolean",
+          "const": false
+        },
+        "dirty_checkout_policy": {
+          "type": "string",
+          "const": "stop"
+        }
+      },
+      "additionalProperties": false
+    },
+    "review": {
+      "type": "object",
+      "properties": {
+        "required": {
+          "type": "boolean",
+          "const": true
+        },
+        "block_on": {
+          "minItems": 1,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "critical",
+              "high",
+              "medium",
+              "low"
+            ]
+          }
+        },
+        "independent_session": {
+          "type": "boolean",
+          "const": true
+        },
+        "final_audit": {
+          "type": "boolean",
+          "const": true
+        },
+        "unresolved_nonblocking": {
+          "type": "string",
+          "const": "report"
+        }
+      },
+      "additionalProperties": false
+    },
+    "quality": {
+      "type": "object",
+      "properties": {
+        "baseline_required": {
+          "type": "boolean",
+          "const": true
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[^\\x00\\r\\n]+$"
+              },
+              "executable": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[^\\x00\\r\\n]+$"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[^\\x00]*$"
+                }
+              },
+              "cwd": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^(?![\\\\/])(?![A-Za-z]:)(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$))[^\\x00]*$"
+              },
+              "stages": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "baseline",
+                    "task",
+                    "integration",
+                    "final"
+                  ]
+                }
+              },
+              "required": {
+                "type": "boolean"
+              },
+              "timeout_seconds": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "id",
+              "executable",
+              "args",
+              "cwd",
+              "stages",
+              "required",
+              "timeout_seconds"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "allow_missing_tests": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "cleanup": {
+      "type": "object",
+      "properties": {
+        "on_success": {
+          "type": "string",
+          "const": "owned_merged_clean_only"
+        },
+        "on_failure": {
+          "type": "string",
+          "const": "preserve"
+        },
+        "keep_reports": {
+          "type": "boolean",
+          "const": true
+        },
+        "keep_integration_until_finalized": {
+          "type": "boolean",
+          "const": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "observability": {
+      "type": "object",
+      "properties": {
+        "telemetry": {
+          "type": "string",
+          "const": "off"
+        },
+        "store_raw_prompts": {
+          "type": "boolean",
+          "const": false
+        },
+        "redact_secrets": {
+          "type": "boolean",
+          "const": true
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

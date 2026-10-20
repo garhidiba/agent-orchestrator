@@ -10,10 +10,15 @@
     "orch": "node packages/installer/src/cli.ts",
     "test": "node --test tests/unit/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "check": "npm run typecheck && npm test"
+    "check": "npm run typecheck && npm test",
+    "schema": "node packages/protocol/src/generate-schemas.ts"
   },
   "devDependencies": {
     "@types/node": "26.6.5",
     "typescript": "7.0.2"
+  },
+  "dependencies": {
+    "yaml": "2.9.1",
+    "zod": "4.6.7"
   }
 }
