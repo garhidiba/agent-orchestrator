@@ -13,6 +13,20 @@ PRD completion is **not established**. Earlier conversational claims that testin
 
 The earlier Codex marker smoke verified its scoped workflow only: a marker with a dependency-free assertion cannot establish dependency readiness for this repository's actual test command. Native invocation arguments and actual provider model/effort observations remain separate; unexposed observations are null.
 
+## Remaining source-audit gaps
+
+Independent inspection at `79d3ab5` covered the frozen PRD, four status documents, the complete Engine, and related model/Git/completion/MCP tests. It was not an exhaustive review of every source file and did not execute a failing reproduction for the items below. They remain source-confirmed partial implementation, not closed by the two runtime-readiness fixes.
+
+| Requirement | Remaining implementation or evidence gap | Source seam |
+|---|---|---|
+| 10.3 / 13.3, AT-026/055 | Approved waived integration/final gates are retained honestly, but the shared completion guard rejects them before finalization. Approved-exception finalization and fully verified completion need distinct outcomes. | `runtime/completion.ts`, `Engine.finalize`; existing waiver tests stop before the complete finalization path. |
+| 13.4 | Environment fingerprints are recorded but not recomputed to invalidate prior commit/finalize validation. Ignored dependency changes are outside the tracked-source fingerprint. | `Engine.gate`, `Engine.commit`, `git/sourceFingerprint`; dependency-input readiness is not complete gate-freshness validation. |
+| 9.2 / 11.3 | A writing task cannot obtain an approved plan revision to expand its ownership after execution starts. Initial plans and repair task submission are not an amendment API. | `Engine.plan`, `Engine.repair`, plan protocol and MCP. |
+| 12.1 | Preflight lacks complete merge/rebase, author/signing-policy, disk and superproject submodule/LFS classification. Existing branch/dirty/common-dir checks cover only part of the stated requirement. | `inspectRepository`, `Engine.create`. |
+| 12.4 step 7 | Staged path allowlists and whitespace checks exist; staged secret scanning is absent. Log redaction does not implement this commit gate. | `Engine.commit`. |
+
+The [current acceptance map](acceptance.md#current-requirement-map) distinguishes contract coverage, actual-host evidence and missing scenarios. M0, both-host M2 acceptance and v1 release remain incomplete. NFR-01–03 measurements, four actual workers, actual parallel repair/recovery, Python/TypeScript/linked-worktree E2E and non-macOS host acceptance have no sufficient current evidence. No fixed test count substitutes for those requirements.
+
 **CODE_AND_LOCAL_CHECKS_PASSED** means the implementation passed the recorded full baseline and subsequent scoped local checks, with independent findings closed. It does not establish actual native model/effort application, Claude/other-OS acceptance, performance/provider results or v1 release completion. References to earlier results in [acceptance](acceptance.md) and [implementation status](implementation-status.md) remain dated historical evidence.
 
 | Finding / slice | Owner | Acceptance condition | Evidence state |

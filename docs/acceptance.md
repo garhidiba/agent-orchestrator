@@ -4,6 +4,64 @@ For the current PRD completion run, use the [audit tracker](prd-completion.md). 
 
 **Current runtime failures:** real Claude full-version/effort dispatch and dependency readiness in managed worktrees are reopened in the tracker. Configuration saving, deterministic test passes and a dependency-free Codex marker smoke did not verify these scenarios. [Status terms](project-glossary.md) define the evidence required for each claim; no overall PRD completion is asserted.
 
+## Current requirement map
+
+Source-audit baseline: `79d3ab5`. This map supersedes the older acceptance index below for current evidence classification. `Contract` means source and named deterministic fixtures exist, not that this audit ran them. `Historical host` applies only to its recorded Codex smoke; the current Claude failures remain open. Source gaps have not been promoted to dynamically reproduced failures.
+
+| PRD acceptance IDs | Current evidence and remaining requirement |
+|---|---|
+| AT-001 | Entry/relay contract and historical Codex single-task smoke; complete current entry-to-finalize rerun remains separate. |
+| AT-002 | Shared entry/plugin packaging contract; actual Claude entry-to-completion and namespace deduplication NOT RUN. |
+| AT-003–004 | Active-host guards tested locally; historical Codex-only smoke. Claude native workflow failed and remains open. |
+| AT-005–006 | Advisor/scope/read-only contracts and bilingual routing fixtures; actual installed-host natural-language evaluation NOT RUN. |
+| AT-007–009 | Field merge, unset and explicit-pin preservation contracts. |
+| AT-010 | Missing/invalid selection guards exist; valid Claude full-version/effort rejection is reopened. |
+| AT-011–012 | Cache/timeout/pagination/deduplication contracts; subprocess account/policy scope remains unknown. |
+| AT-013–014 | Requested/resolved/observed and next-attempt revision contracts. Actual host clamp and changing role settings are not proved by fixture metadata. |
+| AT-015 | Generated-definition reload/observation is incomplete at the audit baseline; actual reload proof NOT RUN. |
+| AT-016–017 | Isolated worktree/ownership/ready-wave contracts; two prepared tasks are not two concurrent actual workers. |
+| AT-018 | Unintegrated-dependency blocking is tested. A dependent task completing from the predecessor's integrated SHA needs its full scenario. |
+| AT-019–020 | Bootstrap/base and dirty-checkout preservation contracts; historical successful Codex bootstrap is not an actual wrong-base rejection test. |
+| AT-021 | Unit/trailer and partial-unit recovery contracts; one task completing two independent successful commits lacks its full fixture. |
+| AT-022–023 | Ownership and serialized integration contracts; actual concurrent native result arrival NOT RUN. |
+| AT-024 | Conflict candidate/fixed-parent resolution code exists. Target-conflict fixtures do not complete the two-task conflict acceptance scenario. |
+| AT-025 | Failed/timeout gate contracts; actual native host stop remains separate. |
+| AT-026 | Explicit missing-test waiver is retained; approved-exception finalization has a source gap. |
+| AT-027 | SHA/source review freshness contracts plus a historical independent native review; actual host re-review after drift NOT RUN. |
+| AT-028–029 | Repair DAG/grouping contracts; multiple parallel repairs and related-finding grouping need their full scenarios. |
+| AT-030–032 | Proposed/verified finding lifecycle, stable IDs and bounded review/reanalysis contracts; actual model-driven relocation/repeated defects NOT RUN. |
+| AT-033 | Shared completion/report guard and historical scoped Codex completion; not both-host PRD completion. |
+| AT-034–036 | Target drift, exact approval and run-scoped preapproval contracts. |
+| AT-037–039 | Owned cleanup and dirty/unknown preservation contracts; historical Codex cleanup only. |
+| AT-040 | Pause/resume/reconciliation contracts; real host shutdown/recovery NOT RUN. |
+| AT-041 | Operation fingerprint/replay contracts. |
+| AT-042 | Lease/fencing/retry and heartbeat contracts. `orch_heartbeat` exists; checkpoint alone does not renew a lease. Actual host liveness event path NOT RUN. |
+| AT-043–044 | Git crash intent/reconciliation fixtures; actual killed-host recovery NOT RUN. |
+| AT-045 | Project config separation contract; actual simultaneous differing project role definitions NOT RUN. |
+| AT-046 | Common-dir lock contract; actual simultaneous host start NOT RUN. |
+| AT-047–050 | Isolated installation/update/conflict/rollback/removal contracts and dated installation records; no general OS/release certification. |
+| AT-051 | Authenticated coordinator/strict-schema/command-trust contracts; staged secret scanning is separately missing. Model-driven injection evaluation NOT RUN. |
+| AT-052 | Unknown actual model/usage/cost stays null. |
+| AT-053 | Copy/space/Korean-path fixtures; actual Windows/PowerShell/no-symlink-privilege run NOT RUN. |
+| AT-054 | Bounded metadata subprocess fixtures; actual cleanup on every supported OS NOT RUN. |
+| AT-055 | Waiver reason/approval/status contract; approved waived finalization has a source gap. |
+| AT-056 | Non-inference/non-login installation fixtures; actual logged-out two-host installation NOT RUN. |
+| AT-057 | Orphan/unknown-stop preservation contracts; actual native disappearance/cancel/resume NOT RUN. |
+| AT-058 | Owned partial cleanup retry fixture exists (`cleanup retries a remaining owned branch after its worktree was already removed`); real filesystem failure and host lifecycle remain separate. |
+
+| PRD proof of concept | Current evidence |
+|---|---|
+| POC-01 | Codex invocation arguments and scoped native workflow recorded; actual provider identity/effort observations remain null. |
+| POC-02 | Claude relay contract; user's full-version/effort workflow failed. |
+| POC-03 | Unknown-scope metadata plus authenticated parent receipts; not an automatic proof of identical account/workspace/policy. |
+| POC-04 | Historical Codex managed-worktree bootstrap; Claude and wrong-native-base host scenarios NOT RUN. |
+| POC-05 | Actual definition change/reload/observation NOT RUN. |
+| POC-06 | Lifecycle receipt/orphan/retry contracts; actual stop/cancel/resume/event workflow NOT RUN. |
+| POC-07 | Windows native and WSL full integration NOT RUN. |
+| POC-08 | Parent-relay/MCP contracts and historical Codex relay; not a sandbox certification or actual Claude boundary proof. |
+
+The PRD's M0 and both-host M2 gates, NFR measurements and minimum E2E fixture set remain incomplete. The source PRD is unchanged. The historical sections below retain their dated context; descriptions superseded by the current map must not be read as current absence or success claims.
+
 Baseline: integrated source `d6f73631e6eb875a87e282871cf5a536a5b93638`, 2026-10-20. This is a scoped evidence index, not an exhaustive QA Matrix or a passing v1 release gate. The disabled `qa-verification` workflow was not invoked. A local rule implemented and exercised by fixtures is distinct from an absent production native adapter, an unrun host/OS experiment, and an uncovered local scenario. The coordinator recorded `npm run check`: typecheck PASS and 100 tests PASS, 0 failures/skips (26.756 seconds), plus a clean diff check. Independent final review confirmed every raised finding fixed, with 15 focused tests and six masked model/effort checks passing. A source-built macOS arm64 bundle passed isolated both-host configuration installation, installed CLI and MCP handshake/27-tool listing, selective removal and preservation checks. Actual native host execution and other operating systems remain unverified.
 
 ## Remaining local implementation surfaces
