@@ -24,6 +24,8 @@ Entry skills are named `agent-orch` and `agent-orch-configure`; the MCP registra
 
 ## Diagnostics and Claude plugin
 
+The default install automatically configures both detected hosts using standalone skills and MCP registration. In Claude Code, restart the host and use `/agent-orch init` (with a space). `/agent-orch:init` belongs to the optional plugin below and reports `Unknown command` unless that plugin was loaded; copying the plugin bundle during installation does not activate it.
+
 The CLI `doctor --host codex|claude` and no-argument read-only MCP `orch_doctor` report runtime package/checksum, Git context, configuration, managed host registration, trusted read-only MCP connection/tool-list status and metadata evidence separately. Preserve `unowned`, `not_configured`, failed and unknown results; a composite diagnostic is not a native worker execution test. Reload and actual account access still need their own evidence.
 
 The local bundle includes a Claude plugin root with `.claude-plugin/plugin.json`, `.mcp.json`, hooks, role agents and namespaced `run` / `configure` / `init` skills under the `agent-orch` plugin name (`/agent-orch:init` initializes the current client project). Installation returns `pluginPath`, `pluginActivation=LOAD_WITH_CLAUDE_PLUGIN_DIR` and `standaloneAlias=agent-orch`. Load it explicitly using `claude --plugin-dir <pluginPath>` after reviewing the actual returned path. This is a local plugin load, not an automatic marketplace installation. Namespaced plugin and standalone entries relay to the same `orch` MCP and `.orch` state; they do not create parallel engines. Native role definition activation/reload remains a separate host capability check.

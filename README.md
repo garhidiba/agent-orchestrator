@@ -24,6 +24,8 @@ cd agent-orchestrator
 
 On Windows PowerShell, run `./scripts/install.ps1` instead. Installation registers the `orch` MCP server and copies `agent-orch` / `agent-orch-configure` into each host's skills directory. Restart/reload the host afterward.
 
+Both detected hosts are installed automatically. After restarting, use `$agent-orch init` in Codex or **`/agent-orch init` in Claude Code**. The default installer installs standalone skills; it does not activate the optional Claude plugin, so `/agent-orch:init` is not a default-install command. If Claude reports `Unknown command: /agent-orch:init`, use `/agent-orch init` instead. See [optional plugin loading](docs/installation.md#diagnostics-and-claude-plugin) only if you specifically need namespaced plugin commands.
+
 The default installation is user-wide. Keep this ORCH checkout separate from the client projects you manage; installation is done once, not in every client repository.
 
 Optional: `./scripts/install.sh --target codex` selects just Codex (`claude` selects Claude Code); `--dry-run` previews host changes. Project-only installation uses `--scope project --project /absolute/path/to/git-root`. Dependency setup can still write local `node_modules` during a preview. See [installation](docs/installation.md) for paths, advanced verified-bundle options and removal.
@@ -38,7 +40,7 @@ Optional: `./scripts/install.sh --target codex` selects just Codex (`claude` sel
    $agent-orch init
    ```
 
-   In standalone Claude Code use `/agent-orch init`; when using the formal Claude plugin use `/agent-orch:init`. The skill verifies the MCP origin against the physical client Git root before writing. Initialization creates or completes only `.orch/config.yaml`: the client needs no `package.json`, `node_modules`, ORCH checkout or copied ORCH code. Global settings remain unchanged.
+   In Claude Code use `/agent-orch init` after the default installation. The skill verifies the MCP origin against the physical client Git root before writing. Initialization creates or completes only `.orch/config.yaml`: the client needs no `package.json`, `node_modules`, ORCH checkout or copied ORCH code. Global settings remain unchanged.
 
 The file visibly includes all eight roles for both hosts, model/effort policies, and execution, Git, review, quality and other defaults. Missing fields are seeded from global settings and shipped defaults; existing values and comments are preserved. Initialization configures the project without starting a run or an AI worker. Concrete role-model setup uses supported current-host metadata through `agent-orch-configure`; unresolved `auto` values remain explicit when that metadata is unavailable. A full file alone does not mean workers are ready.
 
@@ -48,7 +50,7 @@ The entry names are now `$agent-orch` / `$agent-orch-configure` (Codex) and `/ag
 
 | Goal | Codex prompt | Claude Code prompt |
 |---|---|---|
-| Initialize this client project | `$agent-orch init` | `/agent-orch init` (standalone), `/agent-orch:init` (plugin) |
+| Initialize this client project | `$agent-orch init` | `/agent-orch init` |
 | Inspect environment and capabilities | `$agent-orch 현재 환경과 실행 가능 상태를 확인해줘` | `/agent-orch 현재 환경과 실행 가능 상태를 확인해줘` |
 | Explain current settings without changing them | `$agent-orch-configure 현재 모델과 설정을 설명해줘. 변경하지 마` | `/agent-orch-configure 현재 모델과 설정을 설명해줘. 변경하지 마` |
 | Preview a project profile change | `$agent-orch-configure 이 프로젝트를 quality 프로필로 바꾸는 변경안을 보여줘` | `/agent-orch-configure 이 프로젝트를 quality 프로필로 바꾸는 변경안을 보여줘` |
@@ -124,9 +126,9 @@ For example, this repository currently uses the following **excerpt**, based on 
 hosts:
   codex:
     roles:
-      coordinator: { model: inherit, effort: inherit }
+      coordinator: { model: gpt-6-astra, effort: xhigh }
       coder: { model: gpt-6.1-sol, effort: medium }
-      reviewer: { model: gpt-6.1-sol, effort: medium }
+      reviewer: { model: gpt-6-astra, effort: xhigh }
 ```
 
 Use your host's supported IDs and effort levels. Existing concrete pins survive automatic optimization. `auto` can remain unresolved when metadata is missing; a valid YAML file does not prove model access or actual execution. The coordinator remains the current conversation; editing its policy does not switch that conversation's model.
