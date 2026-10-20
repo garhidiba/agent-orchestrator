@@ -12,29 +12,29 @@ hosts:
     enabled: true
     roles:
       coordinator:
-        model: inherit
-        effort: inherit
+        model: gpt-6-astra
+        effort: xhigh
       requirements:
-        model: gpt-6.1-sol
-        effort: medium
+        model: gpt-6-astra
+        effort: xhigh
       planner:
-        model: gpt-6.1-sol
-        effort: medium
+        model: gpt-6-astra
+        effort: xhigh
       coder:
         model: gpt-6.1-sol
         effort: medium
       tester:
-        model: gpt-6.1-sol
-        effort: medium
+        model: gpt-6-astra
+        effort: xhigh
       reviewer:
-        model: gpt-6.1-sol
-        effort: medium
+        model: gpt-6-astra
+        effort: xhigh
       repair:
         model: gpt-6.1-sol
         effort: medium
       final_auditor:
-        model: gpt-6.1-sol
-        effort: medium
+        model: gpt-6-astra
+        effort: xhigh
   claude:
     enabled: true
     roles:
