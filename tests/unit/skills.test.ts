@@ -43,7 +43,8 @@ test('shared skill sources form self-contained installed skills for both hosts',
 
 test('user documentation local links resolve to shipped files', async () => {
   const docs = ['README.md', 'SECURITY.md', 'CONTRIBUTING.md', 'CHANGELOG.md',
-    'docs/installation.md', 'docs/architecture.md', 'docs/compatibility.md', 'docs/acceptance.md'];
+    'docs/installation.md', 'docs/architecture.md', 'docs/compatibility.md', 'docs/acceptance.md',
+    'docs/implementation-status.md', 'docs/prd-completion.md'];
   for (const relative of docs) {
     const file = join(root, relative);
     for (const target of links(await readFile(file, 'utf8'))) {

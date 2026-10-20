@@ -1,5 +1,7 @@
 # 구현 진행 상태
 
+현재 PRD 완료 작업은 [감사 추적표](prd-completion.md)의 1–15번으로 관리한다. 아래의 커밋별 결과는 해당 시점의 증거이며, 후속 수정이나 전체 PRD 완료를 증명하지 않는다.
+
 기준: [ORCH PRD](orch-agent-orchestrator-prd.md) v1.0.0, 2026-10-20 개발 구현. **v1 출시 완료 또는 두 호스트 완전 지원 상태가 아니다.** 상세 수용 기준은 [acceptance](acceptance.md), 실제 호환성 한계는 [compatibility](compatibility.md)를 따른다.
 
 ## 현재 구현

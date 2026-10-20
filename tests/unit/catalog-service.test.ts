@@ -54,3 +54,13 @@ test('missing executable and unavailable native metadata are explicit outcomes',
     assert.deepEqual(partial.errors, ['NATIVE_MODEL_METADATA_UNAVAILABLE']); assert.equal(partial.contextMatches, false);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test('readonly metadata diagnostics do not create a cache directory',async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'orch-readonly-catalog-'));
+ try {
+  const executable=join(dir,'codex'),cacheRoot=join(dir,'cache');
+  await writeFile(executable,`#!${process.execPath}\nimport{createInterface}from'node:readline';if(process.argv[2]==='--version'){console.log('fixture 1');process.exit(0)}createInterface({input:process.stdin}).on('line',l=>{const m=JSON.parse(l);if(m.id)console.log(JSON.stringify({id:m.id,result:m.method==='initialize'?{}:m.method==='config/read'?{config:{model_provider:'openai'}}:{data:[]}}))});`,{mode:0o700});
+  assert.equal((await getCatalogForHost(dir,'codex',{executable,cacheRoot,readOnly:true,env:{PATH:process.env.PATH,HOME:dir}})).source,'live');
+  await assert.rejects(stat(cacheRoot),{code:'ENOENT'});
+ }finally{await rm(dir,{recursive:true,force:true})}
+});

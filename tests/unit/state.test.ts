@@ -18,7 +18,7 @@ test('state survives reopening, rejects stale writes and journals duplicate oper
     assert.deepEqual(store.intent('run', 'op', { state: 'PAUSED' })?.result, { version: 1 });
     store.close(); store = new Store(join(dir, 'state.db'));
     assert.deepEqual(store.get('run'), { version: 1, data: { state: 'PAUSED' } });
-    assert.equal(store.db.prepare('SELECT count(*) AS n FROM events').get()?.n, 2);
+    assert.deepEqual(store.events('run').map(event => event.type), ['run.created', 'run.paused', 'run.state_changed']);
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 

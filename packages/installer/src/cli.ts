@@ -6,7 +6,7 @@ import { patchConfig } from '../../core/src/config/write.ts';
 import { roleIds } from '../../protocol/src/config.ts';
 import { getCatalogForHost } from '../../core/src/model-registry/service.ts';
 import type { Model } from '../../core/src/model-registry/index.ts';
-import { detectHost } from './detection/host.ts';
+import { doctor } from './diagnostics/index.ts';
 
 async function originRoot() {
   try {
@@ -35,7 +35,7 @@ Usage:
   npm run orch -- models set <role> --host <codex|claude> --model <ID> [--effort <LEVEL>] [--global] [--dry-run]
   npm run orch -- configure [--profile <balanced|quality|economy|fast>] [--global] [--dry-run]`);
   } else if (args[0] === 'doctor' && args.length === 1 && host && !flags.effective && !flags.global && !flags['dry-run'] && !flags.profile && !flags.model && !flags.effort) {
-    const result = await detectHost(host); print(result); if (result.status !== 'detected') process.exitCode = 1;
+    const result = await doctor(await originRoot(), host); print(result); if (result.status !== 'detected' || result.configuration.status !== 'valid' || result.hostConfig.status === 'invalid' || result.mcp.status !== 'verified') process.exitCode = 1;
   } else {
     const origin = await originRoot();
     const loaded = await loadConfig(origin);

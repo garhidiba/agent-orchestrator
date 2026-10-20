@@ -4,7 +4,7 @@ import { writeFile, readFile, rm, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Engine } from '../../packages/core/src/runtime/engine.ts';
-import { runtimeFixture as fixture } from '../fixtures/runtime.ts';
+import { runtimeFixture as fixture, fixtureTaskResult } from '../fixtures/runtime.ts';
 import { git } from '../../packages/core/src/git/repository.ts';
 
 
@@ -21,7 +21,7 @@ test('two tasks use isolated worktrees, preserve commits, require independent re
       await writeFile(join(task.path, `${taskId}.txt`), taskId);
       await f.change({ action: 'validate', taskId }, run => f.engine.validate(run, taskId, task.lease, task.attempt));
       await f.change({ action: 'commit', taskId }, run => f.engine.commit(run, taskId, task.lease, task.attempt, 'U1'));
-      await f.change({ action: 'complete', taskId }, run => f.engine.complete(run, taskId, task.lease, task.attempt, true));
+      await f.change({ action: 'complete', taskId }, async run => f.engine.complete(run, taskId, task.lease, task.attempt, true, await fixtureTaskResult(run, taskId)));
       const head = await git(f.engine.status(f.created.runId).data.integrationPath, 'rev-parse', 'HEAD');
       await f.change({ action: 'integrate', taskId }, run => f.engine.integrate(run, taskId, head));
     }
@@ -156,7 +156,7 @@ async function finishFixtureTask(f: Awaited<ReturnType<typeof fixture>>, taskId:
   await writeFile(join(task.path, task.spec.write_paths[0]), `feature ${taskId}`);
   await f.change({ action: 'validate', taskId }, run => f.engine.validate(run, taskId, task.lease, task.attempt));
   await f.change({ action: 'commit', taskId }, run => f.engine.commit(run, taskId, task.lease, task.attempt, 'U1'));
-  await f.change({ action: 'complete', taskId }, run => f.engine.complete(run, taskId, task.lease, task.attempt, true));
+  await f.change({ action: 'complete', taskId }, async run => f.engine.complete(run, taskId, task.lease, task.attempt, true, await fixtureTaskResult(run, taskId)));
   const expected = await git(f.engine.status(f.created.runId).data.integrationPath, 'rev-parse', 'HEAD');
   await f.change({ action: 'integrate', taskId }, run => f.engine.integrate(run, taskId, expected));
   await f.change({ action: 'verify', taskId }, run => f.engine.verify(run));
@@ -301,7 +301,6 @@ test('verified dispatch may bind unobserved model fields as null without claimin
     await f.change({ action: 'plan' }, run => f.engine.plan(run, f.plan, true));
     await f.change({ action: 'prepare' }, run => f.engine.prepare(run, 'T1'));
     const task = f.engine.status(f.created.runId).data.tasks.T1;
-    await assert.rejects(f.change({ action: 'wrong-observation' }, run => f.engine.bind(run, 'T1', task.lease, task.attempt, 'native', 'different-model', 'high')), /MODEL_OBSERVATION_MISMATCH/);
     await f.change({ action: 'unknown-observation' }, run => f.engine.bind(run, 'T1', task.lease, task.attempt, 'native', null, null));
     const bound = f.engine.status(f.created.runId).data.tasks.T1;
     assert.equal(bound.state, 'RUNNING'); assert.equal(bound.observedModel, null); assert.equal(bound.observedEffort, null);
@@ -313,6 +312,13 @@ test('verified dispatch may bind unobserved model fields as null without claimin
     assert.equal(report.tasks[0].requested.effort, 'auto');
     assert.equal(report.tasks[0].selectedModel, 'fixture-model'); assert.equal(report.tasks[0].configRevision, 1);
     assert.equal(report.tasks[0].observedModel, null);
+    await f.change({ action: 'prepare-mismatch' }, run => f.engine.prepare(run, 'T2'));
+    const mismatched = f.engine.status(f.created.runId).data.tasks.T2;
+    const rejected = await f.change({ action: 'wrong-observation' }, run => f.engine.bind(run, 'T2', mismatched.lease, mismatched.attempt, 'wrong-native', 'different-model', 'high'));
+    assert.equal(rejected.result.reason, 'MODEL_OBSERVATION_MISMATCH');
+    const paused = f.engine.status(f.created.runId).data;
+    assert.equal(paused.state, 'PAUSED'); assert.equal(paused.tasks.T2.state, 'ORPHANED_UNKNOWN');
+    assert.equal(paused.tasks.T2.observedModel, 'different-model');
   } finally { await f.close(); }
 });
 
@@ -431,5 +437,156 @@ test('missing tests remain blocked without a separate explicit user waiver and a
     const { buildReport } = await import('../../packages/core/src/reporting/index.ts');
     const report = buildReport(run, f.engine.status(run.id).version, null);
     assert.equal(report.completionVerified, false); assert.equal(report.missingTestsWaiver?.reason, run.missingTestsWaiver?.reason);
+  } finally { await f.close(); }
+});
+
+
+test('blocked integration tests can retry normally or enter a bounded repair plan', async () => {
+  const f = await fixture(true, { quality: { commands: [
+    { id: 'unit', executable: process.execPath, args: ['-e', 'process.exit(0)'], cwd: '.', stages: ['baseline', 'task', 'final'], required: true, timeout_seconds: 5 },
+    { id: 'integration', executable: process.execPath, args: ['-e', 'process.exit(2)'], cwd: '.', stages: ['integration'], required: true, timeout_seconds: 5 },
+  ] } });
+  try {
+    f.plan.tasks = [f.plan.tasks[0]];
+    await f.change({}, run => f.engine.plan(run, f.plan, true));
+    await finishFixtureTask(f, 'T1');
+    assert.equal(f.engine.status(f.created.runId).data.state, 'BLOCKED_TESTS');
+    await f.change({}, async run => { run.config.quality.commands[1].args = ['-e', 'process.exit(0)']; return {}; });
+    await f.change({}, run => f.engine.verify(run));
+    assert.equal(f.engine.status(f.created.runId).data.state, 'REVIEWING');
+    await f.change({}, async run => { run.config.quality.commands[1].args = ['-e', 'process.exit(2)']; return {}; });
+    await f.change({}, run => f.engine.verify(run));
+    await f.change({}, run => f.engine.repair(run, { acceptance: f.plan.acceptance, tasks: [{ ...f.plan.tasks[0], id: 'R1', role: 'repair' }] }, [], 'Fix failed integration gate.'));
+    assert.equal(f.engine.status(f.created.runId).data.state, 'EXECUTING');
+    assert.equal(f.engine.status(f.created.runId).data.reviewRound, 1);
+  } finally { await f.close(); }
+});
+
+
+test('finalization rejects missing task evidence and review limitations exactly as reporting does', async () => {
+  const f = await fixture();
+  try {
+    f.plan.tasks = [f.plan.tasks[0]];
+    await f.change({}, run => f.engine.plan(run, f.plan, true));
+    await finishFixtureTask(f, 'T1');
+    const current = f.engine.status(f.created.runId).data;
+    const review = { schema_version: 1, reviewed_sha: current.integrationSha, reviewer_id: 'reviewer', decision: 'approved', findings: [], reviewed_areas: ['all'], limitations: [], acceptance_ids: ['AC-1'] };
+    await f.change({}, run => f.engine.review(run, review));
+    await f.change({}, run => f.engine.review(run, { ...review, reviewer_id: 'auditor', limitations: ['acceptance was not executed'] }, true));
+    await assert.rejects(f.change({}, run => f.engine.finalize(run, true, run.targetBase)), /COMPLETION_UNVERIFIED/);
+    await f.change({}, async run => { run.reviews.at(-1)!.limitations = []; run.tasks.T1.acceptanceEvidence = []; return {}; });
+    await assert.rejects(f.change({}, run => f.engine.finalize(run, true, run.targetBase)), /COMPLETION_UNVERIFIED/);
+    assert.equal(await git(f.root, 'rev-parse', 'HEAD'), current.targetBase);
+  } finally { await f.close(); }
+});
+
+test('target drift is merged and invalidates reviews before fresh verification and finalization', async () => {
+  const f = await fixture();
+  try {
+    f.plan.tasks = [f.plan.tasks[0]];
+    await f.change({}, run => f.engine.plan(run, f.plan, true));
+    await finishFixtureTask(f, 'T1');
+    let current = f.engine.status(f.created.runId).data;
+    const review = { schema_version: 1, reviewed_sha: current.integrationSha, reviewer_id: 'reviewer', decision: 'approved', findings: [], reviewed_areas: ['all'], limitations: [], acceptance_ids: ['AC-1'] };
+    await f.change({}, run => f.engine.review(run, review));
+    await f.change({}, run => f.engine.review(run, { ...review, reviewer_id: 'auditor' }, true));
+    await writeFile(join(f.root, 'target.txt'), 'concurrent target change');
+    await git(f.root, 'add', 'target.txt'); await git(f.root, 'commit', '-m', 'target advanced');
+    const target = await git(f.root, 'rev-parse', 'HEAD');
+    await assert.rejects(f.change({}, run => f.engine.finalize(run, true, run.targetBase)), /TARGET_DRIFT/);
+    const save = f.engine.store.save.bind(f.engine.store);
+    f.engine.store.save = () => { throw new Error('reintegrate DB crash'); };
+    await assert.rejects(f.engine.change(current.id, 'reintegrate-crash', f.engine.status(current.id).version, { tool: 'orch_reintegrate', input: { expected_target_sha: target } }, run => f.engine.reintegrateTarget(run, target)), /reintegrate DB crash/);
+    f.engine.store.save = save;
+    await f.engine.reconcile(current.id, 'reintegrate-crash', true);
+    current = f.engine.status(f.created.runId).data;
+    assert.equal(current.state, 'VERIFYING'); assert.deepEqual(current.reviews, []);
+    assert.equal(current.targetBase, target); assert.notEqual(current.integrationSha, review.reviewed_sha);
+    assert.equal(await readFile(join(current.integrationPath, 'target.txt'), 'utf8'), 'concurrent target change');
+    await f.change({}, run => f.engine.verify(run));
+    const updated = { ...review, reviewed_sha: current.integrationSha };
+    await f.change({}, run => f.engine.review(run, updated));
+    await f.change({}, run => f.engine.review(run, { ...updated, reviewer_id: 'auditor' }, true));
+    await f.change({}, run => f.engine.finalize(run, true, target));
+    assert.equal(f.engine.status(f.created.runId).data.state, 'COMPLETED');
+  } finally { await f.close(); }
+});
+
+test('cleanup retries a remaining owned branch after its worktree was already removed', async () => {
+  const f = await fixture();
+  try {
+    await f.change({}, run => f.engine.plan(run, f.plan, true));
+    const current = f.engine.status(f.created.runId).data;
+    const branch = `orch/${current.id}/conflict/removed-tree`, path = join(current.managedRoot, current.id, 'removed-tree');
+    await git(f.root, 'worktree', 'add', '-b', branch, path, current.targetBase);
+    await git(f.root, 'worktree', 'remove', path);
+    await f.change({}, async run => { run.state = 'COMPLETED'; run.candidates = [{ path, branch }]; return {}; });
+    await f.change({}, run => f.engine.cleanup(run, false));
+    await assert.rejects(git(f.root, 'show-ref', '--verify', `refs/heads/${branch}`));
+    await f.change({}, run => f.engine.cleanup(run, false));
+    assert.ok(f.engine.status(current.id).data.cleanup.every(item => ['removed', 'absent'].includes(item.status)));
+  } finally { await f.close(); }
+});
+
+test('finding dispositions require user approval and reason, preserve audit evidence and require rereview', async () => {
+  const f = await fixture();
+  try {
+    await f.change({}, async run => { run.state = 'REPAIR_PLANNING'; run.findings.push({ id: 'F1', severity: 'high', category: 'correctness', path: 'T1.txt', symbol: 'feature', line_start: 1, line_end: 1, summary: 'risk', evidence: 'fixture', reproduction: 'fixture', acceptance: 'works', suggested_test: 'assert', acceptance_ids: ['AC-1'], status: 'open', fingerprint: 'fixture', lifecycle: 'OPEN' }); return {}; });
+    await assert.rejects(f.change({}, run => f.engine.disposeFinding(run, 'F1', 'ACCEPTED_RISK', 'accepted fixture risk', false)), /APPROVAL_REQUIRED/);
+    await assert.rejects(f.change({}, run => f.engine.disposeFinding(run, 'F1', 'NOT_A_BUG', ' ', true)), /APPROVAL_REQUIRED/);
+    for (const status of ['DEFERRED', 'NOT_A_BUG', 'ACCEPTED_RISK'] as const) {
+      await f.change({}, run => f.engine.disposeFinding(run, 'F1', status, 'User reviewed the original evidence.', true));
+      const current = f.engine.status(f.created.runId).data;
+      assert.equal(current.findings[0].lifecycle, status);
+      assert.equal(current.findings[0].dispositions?.at(-1)?.actor, 'user');
+      assert.equal(current.state, 'REVIEWING');
+      const { findingBlocks } = await import('../../packages/core/src/runtime/completion.ts');
+      assert.equal(findingBlocks(current, current.findings[0]), status === 'DEFERRED');
+    }
+    assert.equal(f.engine.status(f.created.runId).data.findings[0].dispositions?.length, 3);
+  } finally { await f.close(); }
+});
+
+test('target conflict resolves through the existing stopped-worker path and repeated unchanged findings retain scoped disposition', async () => {
+  const f = await fixture();
+  try {
+    f.plan.tasks = [f.plan.tasks[0]];
+    await f.change({}, run => f.engine.plan(run, f.plan, true)); await finishFixtureTask(f, 'T1');
+    await writeFile(join(f.root, 'T1.txt'), 'target version'); await git(f.root, 'add', 'T1.txt'); await git(f.root, 'commit', '-m', 'target conflict');
+    await f.change({}, async run => f.engine.reintegrateTarget(run, await git(f.root, 'rev-parse', 'HEAD')));
+    let current = f.engine.status(f.created.runId).data;
+    assert.equal(current.state, 'BLOCKED_CONFLICT'); assert.ok(current.targetConflict);
+    await assert.rejects(f.change({}, run => f.engine.resolveConflict(run, false)), /CONFLICT_RESOLUTION_NOT_READY/);
+    await writeFile(join(current.targetConflict!.path, 'T1.txt'), 'resolved feature');
+    await f.change({}, run => f.engine.resolveConflict(run, true));
+    assert.equal(f.engine.status(current.id).data.state, 'VERIFYING');
+    await f.change({}, run => f.engine.verify(run)); current = f.engine.status(current.id).data;
+    const finding = { id: 'F1', severity: 'high', category: 'correctness', path: 'T1.txt', symbol: 'feature', line_start: 1, line_end: 1, summary: 'known risk', evidence: 'exact fixture evidence', reproduction: 'fixture', acceptance: 'works', suggested_test: 'assert', acceptance_ids: ['AC-1'], status: 'open' };
+    const review = { schema_version: 1, reviewed_sha: current.integrationSha, reviewer_id: 'reviewer', decision: 'changes_requested', findings: [finding], reviewed_areas: ['all'], limitations: [], acceptance_ids: ['AC-1'] };
+    await f.change({}, run => f.engine.review(run, review));
+    await f.change({}, run => f.engine.disposeFinding(run, 'F1', 'ACCEPTED_RISK', 'User accepts the evidenced risk.', true));
+    await f.change({}, run => f.engine.review(run, { ...review, decision: 'approved' }));
+    assert.equal(f.engine.status(current.id).data.findings[0].lifecycle, 'ACCEPTED_RISK');
+    assert.equal(f.engine.status(current.id).data.state, 'FINAL_AUDIT');
+    await f.change({}, run => f.engine.review(run, { ...review, reviewer_id: 'auditor', decision: 'approved', findings: [{ ...finding, severity: 'critical' }] }, true));
+    assert.equal(f.engine.status(current.id).data.state, 'REPAIR_PLANNING');
+  } finally { await f.close(); }
+});
+
+test('final gate branch switching cannot finalize an unrelated checkout', async () => {
+  const switchCode = "const cp=require('node:child_process');const origin=cp.execFileSync('git',['worktree','list','--porcelain'],{encoding:'utf8'}).split('\\n')[0].slice(9);cp.execFileSync('git',['-C',origin,'switch','-c','other']);";
+  const f = await fixture(true, { quality: { commands: [
+    { id: 'unit', executable: process.execPath, args: ['-e', 'process.exit(0)'], cwd: '.', stages: ['baseline', 'task', 'integration'], required: true, timeout_seconds: 5 },
+    { id: 'switch', executable: process.execPath, args: ['-e', switchCode], cwd: '.', stages: ['final'], required: true, timeout_seconds: 5 },
+  ] } });
+  try {
+    f.plan.tasks = [f.plan.tasks[0]]; await f.change({}, run => f.engine.plan(run, f.plan, true)); await finishFixtureTask(f, 'T1');
+    const current = f.engine.status(f.created.runId).data;
+    const review = { schema_version: 1, reviewed_sha: current.integrationSha, reviewer_id: 'reviewer', decision: 'approved', findings: [], reviewed_areas: ['all'], limitations: [], acceptance_ids: ['AC-1'] };
+    await f.change({}, run => f.engine.review(run, review)); await f.change({}, run => f.engine.review(run, { ...review, reviewer_id: 'auditor' }, true));
+    await assert.rejects(f.change({}, run => f.engine.finalize(run, true, run.targetBase)), /TARGET_DRIFT/);
+    assert.equal(await git(f.root, 'branch', '--show-current'), 'other');
+    assert.equal(await git(f.root, 'rev-parse', 'HEAD'), current.targetBase);
+    assert.notEqual(f.engine.status(current.id).data.state, 'COMPLETED');
   } finally { await f.close(); }
 });

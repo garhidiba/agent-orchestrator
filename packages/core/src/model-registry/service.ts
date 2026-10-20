@@ -5,7 +5,7 @@ import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { discoverCodexModels } from '../../../host-codex/src/catalog.ts';
-import { discoverClaudeModels } from '../../../host-claude/src/catalog.ts';
+import { type ClaudeMetadataAdapter, discoverClaudeModels } from '../../../host-claude/src/catalog.ts';
 import { globalConfigPath, loadConfig } from '../config/index.ts';
 import { catalogCacheKey, createCatalogCache, readCatalogCache } from './cache.ts';
 import type { CatalogContext } from './cache.ts';
@@ -15,7 +15,7 @@ import { resolveExecutable } from '../process/executable.ts';
 const exec = promisify(execFile);
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 type Host = 'codex' | 'claude';
-export type CatalogOptions = { refresh?: boolean; executable?: string; cacheRoot?: string; timeout?: number; now?: number; env?: NodeJS.ProcessEnv };
+export type CatalogOptions = { refresh?: boolean; readOnly?: boolean; claudeMetadata?: ClaudeMetadataAdapter; executable?: string; cacheRoot?: string; timeout?: number; now?: number; env?: NodeJS.ProcessEnv };
 export type CatalogResult = {
   status: 'partial' | 'failed'; models: Model[]; contextMatches: false; source: 'live' | 'cache' | 'none';
   stale: boolean | null; fetchedAt: string | null; expiresAt: string | null;
@@ -76,11 +76,12 @@ export async function getCatalogForHost(origin: string | null, host: Host, optio
     stale: cached!.stale, fetchedAt: cached!.fetchedAt, expiresAt: cached!.expiresAt });
   if (cached && !cached.stale && !options.refresh) return useCache();
   try {
-    const live = host === 'codex' ? await discoverCodexModels(context.executable, timeout, { env, cwd: context.originRoot ?? undefined }) : discoverClaudeModels();
-    if ('status' in live && live.status === 'partial') throw new Error('NATIVE_MODEL_METADATA_UNAVAILABLE');
+    const live = host === 'codex' ? await discoverCodexModels(context.executable, timeout, { env, cwd: context.originRoot ?? undefined }) : await discoverClaudeModels(options.claudeMetadata);
+    if ('reason' in live && live.reason === 'NATIVE_MODEL_METADATA_UNAVAILABLE') throw new Error('NATIVE_MODEL_METADATA_UNAVAILABLE');
     const cache = createCatalogCache(context, [...live.models], ttl, now);
     result.status = 'partial'; result.models = cache.models; result.source = 'live'; result.stale = false;
     result.fetchedAt = cache.fetchedAt; result.expiresAt = cache.expiresAt;
+    if (options.readOnly) return result;
     const temp = `${cacheFile}.${randomUUID()}.tmp`;
     try {
       await mkdir(dirname(cacheFile), { recursive: true, mode: 0o700 });

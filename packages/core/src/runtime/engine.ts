@@ -15,21 +15,29 @@ import type { Config } from '../../../protocol/src/config.ts';
 import { id, nativeAgentId, requirementsSchema, requireCondition as check, validatePlan, reviewSchema, taskResultSchema, gateResultSchema } from '../../../protocol/src/runtime.ts';
 import type { Task, Plan, Review, GateResult, Requirements } from '../../../protocol/src/runtime.ts';
 
+import { completionEvidence, findingBlocks } from './completion.ts';
+import { resolveRoleModel, observeRoleModel, type NativeModelContext } from './models.ts';
+import { enforceRunBudget, activeElapsedMs, reconcileExpiredTasks, confirmHostHeartbeat, type HostHeartbeat } from './lifecycle.ts';
+import { allocateAttemptResources, reservePort, type AttemptResources } from './resources.ts';
+
 const exec = promisify(execFile);
 type Gate = { id?: string; details?: GateResult[]; stage: string; task: string | null; sha: string; source: string; commands: string; status: string; results: { id: string; status: string; exitCode: number | null }[] };
-type Work = { spec: Task; state: string; base: string; path: string; branch: string; attempt: number; lease: string; expires: number; nativeId: string | null; nativeBootstrap?: { cwd: string; origin_root: string; common_dir: string; branch: string; head: string }; units: Record<string, string>; validated: string | null; pausedState?: string; dispatchBase?: string; configRevision?: number; observedModel?: string | null; observedEffort?: string | null; modelResolution?: { requestedModel: string; requestedEffort: string; resolvedModel: string | null; resolvedEffort: string | null }; acceptanceEvidence?: { acceptanceId: string; evidenceRefs: string[] }[]; changedPaths?: string[]; reportedModel?: string | null; recoveryHead?: string; lastCommitSha?: string; attempts?: { number: number; path: string; branch: string; nativeId: string | null; stopped: boolean; reason: string }[] };
-type Finding = Review['findings'][number] & { fingerprint: string; lifecycle: string; seenRounds?: number[] };
+type Work = { nativeContext?: NativeCapability; resources?: AttemptResources; deadline?: number; heartbeat?: { observedAt: number; evidenceRef: string }; modelObservation?: ReturnType<typeof observeRoleModel>; spec: Task; state: string; base: string; path: string; branch: string; attempt: number; lease: string; expires: number; nativeId: string | null; nativeBootstrap?: { cwd: string; origin_root: string; common_dir: string; branch: string; head: string }; units: Record<string, string>; validated: string | null; pausedState?: string; dispatchBase?: string; configRevision?: number; observedModel?: string | null; observedEffort?: string | null; modelResolution?: { requestedModel: string; requestedEffort: string; resolvedModel: string | null; resolvedEffort: string | null }; acceptanceEvidence?: { acceptanceId: string; evidenceRefs: string[] }[]; changedPaths?: string[]; reportedModel?: string | null; recoveryHead?: string; lastCommitSha?: string; attempts?: { number: number; path: string; branch: string; nativeId: string | null; stopped: boolean; reason: string; configRevision?: number; modelResolution?: Work['modelResolution']; observedModel?: string | null; observedEffort?: string | null; modelObservation?: Work['modelObservation']; resources?: AttemptResources }[] };
+type Finding = Review['findings'][number] & { fingerprint: string; lifecycle: string; seenRounds?: number[]; dispositions?: { status: 'ACCEPTED_RISK' | 'NOT_A_BUG' | 'DEFERRED'; reason: string; actor: 'user'; approvedAt: string; sha: string | null }[] };
+const attemptKey = (taskId: string, attempt: number) => { const key = `${taskId}-${attempt}`; return key.length <= 80 ? key : `attempt-${hash([taskId, attempt])}`; };
 const acceptedGate = (gate: { status: string }) => ['passed', 'waived'].includes(gate.status);
 const activePhases = new Set(['ANALYZING', 'EXECUTING', 'INTEGRATING', 'VERIFYING', 'REVIEWING', 'REPAIR_PLANNING', 'FINAL_AUDIT', 'FINALIZING', 'CLEANING']);
 export type Run = {
   id: string; host: 'codex' | 'claude'; origin: string; commonDir: string; target: string; targetBase: string;
   integration: string; integrationPath: string; managedRoot: string; state: string; config: Config;
+  reviewDispatches?: Record<string, ReviewDispatch>;
   requirements?: Requirements; requirementRefs?: { json: string; markdown: string };
   hostEvidence?: NativeCapability;
   plan: Plan | null; tasks: Record<string, Work>; gates: Gate[]; findings: Finding[];
   reviews: { sha: string; reviewer: string; final: boolean; acceptanceIds?: string[]; decision?: string; limitations?: string[] }[]; reviewRound: number; implementers?: string[]; integrationSha?: string;
   conflict?: { path: string; branch: string; taskId: string; expected: string; taskHead: string };
   candidates?: { path: string; branch: string }[];
+  targetConflict?: { path: string; branch: string; expected: string; target: string };
   runtimeRoot?: string; configRevision?: number; configRevisions?: { revision: number; hash: string; roles: Config['hosts']; timestamp: string }[];
   finalizationApproval?: { actor: 'user'; target: string; runId: string; approvedAt: string };
   activeTimeMs?: number; activeSince?: number | null; pauseTimeMs?: number; pauseStartedAt?: number; finalizedAt?: string;
@@ -38,12 +46,11 @@ export type Run = {
   waivers?: { stage: string; taskId: string | null; gateId: string; sha: string; source: string; command: string; reason: string; actor: 'user'; approvedAt: string }[];
   createdAt: string; pausedFrom?: string; cleanup: { path: string; status: string; reason: string | null }[];
 };
-export type NativeCapability = {
-  host: 'codex' | 'claude'; model: string | null; effort: string | null; evidence: string[];
-  verified: boolean; contextMatches: boolean; source?: 'coordinator_native_receipt';
-};
+export type NativeCapability = NativeModelContext & { source?: 'coordinator_native_receipt' };
+type ReviewDispatch = { role: 'reviewer' | 'final_auditor'; sha: string; source: string; expires: number; nativeId: string | null; state: string; configRevision: number; resolution: ReturnType<typeof resolveRoleModel>; nativeContext: NativeCapability; observation?: ReturnType<typeof observeRoleModel> };
 
 export class Engine {
+  private portReservations = new Map<string, { runId: string; taskId: string; generation: number; reservation: Awaited<ReturnType<typeof reservePort>> }>();
   store: Store;
   native: NativeCapability | null;
   activeOperation: string | null = null;
@@ -86,9 +93,11 @@ export class Engine {
       integration, integrationPath, managedRoot: managed, hostEvidence: this.native ? structuredClone(this.native) : undefined, state: 'PREFLIGHT', config, plan: null, tasks: {}, gates: [], findings: [], reviews: [], reviewRound: 0,
       activeTimeMs: 0, activeSince: null, pauseTimeMs: 0, missingTestsWaiver: missingWaiver && config.quality.commands.length === 0 ? { actor: 'user', reason: missingWaiver.reason, approvedAt: new Date().toISOString() } : undefined, runtimeRoot: this.runtimeRoot, configRevision: 1, configRevisions: [{ revision: 1, hash: hash(config), roles: structuredClone(config.hosts), timestamp: new Date().toISOString() }], integrationSha: repo.head, createdAt: new Date().toISOString(), cleanup: [] };
     this.store.create(runId, run);
+    this.store.snapshot(runId, 'config', 'revision-1', config);
+    if (this.native) this.store.snapshot(runId, 'catalog', `host-${hash(this.native)}`, this.native);
     return { runId, version: 0 };
   }
-  async change(runId: string, operation: string, expected: number, input: unknown, fn: (run: Run) => Promise<unknown>) {
+  async change<T>(runId: string, operation: string, expected: number, input: unknown, fn: (run: Run) => Promise<T>) {
     id.parse(operation);
     const snapshot = this.status(runId);
     const mutex = join(snapshot.data.commonDir, 'orch', 'locks', 'operation');
@@ -105,13 +114,13 @@ export class Engine {
       if (previous) {
         if (previous.status === 'rejected') throw new Error((previous.result as { code: string }).code);
         check(previous.status === 'complete', 'RECONCILIATION_REQUIRED');
-        return previous.result;
+        return previous.result as { version: number; result: T };
       }
       const started = Date.now();
       current.data.activeTimeMs = (current.data.activeTimeMs ?? 0) + (current.data.activeSince == null ? 0 : Math.max(0, started - current.data.activeSince));
-      current.data.activeSince = null;
+      current.data.activeSince = started;
       this.activeOperation = operation; this.effectPrepared = false;
-      let result: unknown;
+      let result: T;
       try { result = await fn(current.data); }
       catch (error) {
         if (!this.effectPrepared) this.store.reject(runId, operation, error instanceof Error && /^[A-Z][A-Z0-9_]+$/.test(error.message) ? error.message : 'ORCH_OPERATION_FAILED');
@@ -146,7 +155,7 @@ export class Engine {
       const pending = this.store.pending(runId).find(item => item.id === operationId); check(pending, 'OPERATION_NOT_PENDING');
       const prior = pending.snapshot as { version: number; data: Run } | null;
       check(prior && prior.version === current.version, 'RECONCILIATION_STATE_DIVERGED');
-      const request = pending.input as { tool?: string; input?: { task_id?: string; unit_id?: string; expected_integration_sha?: string } };
+      const request = pending.input as { tool?: string; input?: { task_id?: string; unit_id?: string; expected_integration_sha?: string; expected_target_sha?: string } };
       const run = prior.data, task = request.input?.task_id ? run.tasks[request.input.task_id] : null;
       let result: unknown;
       if (request.tool === 'orch_plan_submit') {
@@ -172,31 +181,50 @@ export class Engine {
         check(repo.commonDir === run.commonDir && repo.branch === task.branch && repo.head === (task.dispatchBase ?? task.base) && !repo.dirty && task.state === 'LEASED', 'RECOVERY_WORKTREE_NOT_PROVEN');
         // The caller never received the lost dispatch; retain its lease, do not start another worker.
         result = { recovered: true, task, requiresNativeStateCheck: true };
+      } else if (request.tool === 'orch_reintegrate') {
+        const expected = request.input?.expected_target_sha, candidate = run.candidates?.at(-1);
+        check(expected && candidate?.branch === `orch/${run.id}/target/${operationId}`, 'RECOVERY_REINTEGRATE_NOT_PROVEN');
+        const target = await inspectRepository(run.origin), merged = await inspectRepository(candidate.path);
+        check(target.branch === run.target && target.head === expected && !target.dirty && merged.commonDir === run.commonDir && merged.branch === candidate.branch && !merged.dirty, 'RECOVERY_REINTEGRATE_NOT_PROVEN');
+        await git(candidate.path, 'merge-base', '--is-ancestor', expected, merged.head);
+        await git(candidate.path, 'merge-base', '--is-ancestor', run.integrationSha!, merged.head);
+        const integration = await inspectRepository(run.integrationPath);
+        check(integration.commonDir === run.commonDir && integration.branch === run.integration && !integration.dirty && [run.integrationSha, merged.head].includes(integration.head), 'RECOVERY_REINTEGRATE_NOT_PROVEN');
+        await git(run.integrationPath, 'merge', '--ff-only', candidate.branch);
+        run.integrationSha = merged.head; run.targetBase = expected; run.reviews = []; run.finalizationApproval = undefined; run.state = 'VERIFYING';
+        result = { state: run.state, sha: merged.head, targetBase: expected, recovered: true };
       } else if (request.tool === 'orch_finalize') {
         const head = await git(run.integrationPath, 'rev-parse', 'HEAD');
         check(await git(run.origin, 'rev-parse', 'HEAD') === head && run.gates.some(gate => gate.stage === 'final' && gate.sha === head && acceptedGate(gate)), 'RECOVERY_FINALIZE_NOT_PROVEN');
-        run.state = 'COMPLETED'; result = { sha: head, recovered: true };
+        check(completionEvidence(run, head).blockers.length === 0, 'RECOVERY_FINALIZE_NOT_PROVEN');
+        run.finalizedAt ??= new Date().toISOString(); run.state = 'COMPLETED'; result = { sha: head, recovered: true };
       } else throw new Error('RECOVERY_REQUIRES_MANUAL_RECONCILIATION');
       return this.store.save(runId, current.version, run, 'run.reconciled', operationId, { version: current.version + 1, result });
     } finally { await rmdir(mutex); }
   }
   async gate(run: Run, stage: string, path: string, task: string | null = null) {
+    enforceRunBudget(run);
     let commands = run.config.quality.commands.filter(command => command.stages.includes(stage as 'baseline') && (task === null || run.tasks[task].spec.verification_ids.includes(command.id)));
     if (!commands.length && run.missingTestsWaiver) commands = [{ id: 'missing-tests', executable: process.execPath, args: [], cwd: '.', stages: ['baseline', 'task', 'integration', 'final'], required: true, timeout_seconds: 1 }];
     check(commands.some(command => command.required), 'REQUIRED_GATES_MISSING');
     const fingerprint = await sourceFingerprint(path);
     const result: Gate = { id: `gate-${randomUUID()}`, details: [], stage, task, sha: await git(path, 'rev-parse', 'HEAD'), source: fingerprint,
       commands: hash(run.config.quality.commands), status: 'passed', results: [] };
+    const resources = task ? run.tasks[task].resources : await allocateAttemptResources(run.origin, run.id, result.id!);
+    check(resources, 'ATTEMPT_RESOURCES_REQUIRED');
+    const environment = { ...process.env, ...resources.environment };
     for (const command of commands) {
+      const budgetExpired = activeElapsedMs(run) >= run.config.execution.run_timeout_minutes * 60000 || task !== null && Date.now() >= run.tasks[task].deadline!;
       const cwd = await realpath(resolve(path, command.cwd));
       check(cwd === await realpath(path) || within(await realpath(path), cwd), 'GATE_CWD_OUTSIDE_ROOT');
       this.checkpointIntent(run);
       const startedAt = new Date().toISOString();
       let status: GateResult['status'] = 'passed', exitCode: number | null = 0, output = '';
       const waiver = (run.waivers ?? []).find(item => item.stage === stage && item.taskId === task && item.gateId === command.id && item.sha === result.sha && item.source === fingerprint && item.command === hash(command)) ?? (command.id === 'missing-tests' ? run.missingTestsWaiver : undefined);
-      if (waiver) { status = 'waived'; exitCode = null; output = `User waiver: ${waiver.reason}`; if (result.status === 'passed') result.status = 'waived'; }
+      if (budgetExpired) { status = 'not_run'; exitCode = null; output = 'Not run: execution budget exhausted'; result.status = 'timed_out'; }
+      else if (waiver) { status = 'waived'; exitCode = null; output = `User waiver: ${waiver.reason}`; if (result.status === 'passed') result.status = 'waived'; }
       else try {
-        const response = await exec(command.executable, command.args, { cwd, timeout: command.timeout_seconds * 1000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 });
+        const response = await exec(command.executable, command.args, { cwd, env: environment, timeout: Math.max(1, Math.min(command.timeout_seconds * 1000, run.config.execution.run_timeout_minutes * 60000 - activeElapsedMs(run), task ? run.tasks[task].deadline! - Date.now() : Infinity)), killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 });
         output = `${response.stdout}\n${response.stderr}`;
       } catch (error) {
         const failure = error as { killed?: boolean; code?: number; stdout?: string; stderr?: string };
@@ -204,11 +232,12 @@ export class Engine {
         output = `${failure.stdout ?? ''}\n${failure.stderr ?? ''}`;
         if (command.required) result.status = status;
       }
+      if (activeElapsedMs(run) >= run.config.execution.run_timeout_minutes * 60000 || task && Date.now() >= run.tasks[task].deadline!) { if (status !== 'not_run') status = 'timed_out'; result.status = 'timed_out'; }
       const recordId = `quality-${randomUUID()}`;
       const logRef = await writeStateArtifact(run.origin, run.id, `${recordId}.log`, redact(output), 'logs');
       result.details!.push(gateResultSchema.parse({ id: recordId, runId: run.id, taskId: task, gateId: command.id,
         stage, commitSha: result.sha, sourceFingerprint: fingerprint, commandFingerprint: hash(command),
-        environmentFingerprint: hash({ node: process.version, platform: process.platform, arch: process.arch, env: process.env }),
+        environmentFingerprint: hash({ node: process.version, platform: process.platform, arch: process.arch, env: environment }),
         status, exitCode, startedAt, finishedAt: new Date().toISOString(), logRef, waiverReason: waiver?.reason ?? null }));
       result.results.push({ id: command.id, status, exitCode });
     }
@@ -226,6 +255,7 @@ export class Engine {
     return { state: run.state, ...saved };
   }
   async plan(run: Run, input: unknown, approved: boolean) {
+    enforceRunBudget(run);
     check(run.state === 'PREFLIGHT' || run.state === 'PLAN_READY', 'INVALID_RUN_STATE');
     const plan = validatePlan(input);
     check(run.requirements, 'REQUIREMENTS_REQUIRED');
@@ -242,18 +272,7 @@ export class Engine {
     await git(run.origin, 'worktree', 'add', '-b', run.integration, run.integrationPath, run.targetBase);
     return { state: run.state };
   }
-  async prepare(run: Run, taskId: string) {
-    check(run.state === 'EXECUTING', 'INVALID_RUN_STATE');
-    check(this.native?.verified && this.native.contextMatches && this.native.host === run.host && this.native.evidence.length, 'BLOCKED_CAPABILITY');
-    run.hostEvidence ??= structuredClone(this.native);
-    check((run.activeTimeMs ?? Math.max(0, Date.now() - Date.parse(run.createdAt))) < run.config.execution.run_timeout_minutes * 60000, 'RUN_TIMEOUT');
-    const task = run.tasks[taskId]; check(task, 'TASK_NOT_FOUND');
-    check(['PENDING', 'RETRYABLE_FAILED'].includes(task.state), 'TASK_NOT_READY');
-    check(task.attempt < run.config.execution.max_task_attempts, 'TASK_ATTEMPT_LIMIT');
-    check(task.spec.depends_on.every(key => run.tasks[key].state === 'INTEGRATED'), 'DEPENDENCY_NOT_INTEGRATED');
-    const active = Object.values(run.tasks).filter(work => ['LEASED', 'RUNNING', 'VALIDATING', 'ORPHANED_UNKNOWN', 'MERGE_QUEUED'].includes(work.state));
-    check(active.filter(work => work.state !== 'MERGE_QUEUED').length < run.config.execution.max_parallel_workers, 'WORKER_LIMIT');
-    check(!active.some(work => overlaps(work.spec.write_paths, task.spec.write_paths) || work.spec.exclusive_resources.some(resource => task.spec.exclusive_resources.includes(resource))), 'OWNERSHIP_CONFLICT');
+  async syncConfig(run: Run) {
     if (this.readConfig) {
       const next = configSchema.parse(await this.readConfig());
       const policies = (value: Config) => ({ ...value, hosts: undefined, model_selection: undefined });
@@ -263,9 +282,23 @@ export class Engine {
         run.configRevisions.push({ revision: run.configRevision, hash: hash(next), roles: structuredClone(next.hosts), timestamp: new Date().toISOString() });
       }
     }
-    const requested = run.config.hosts[run.host].roles[task.spec.role];
-    check(['auto', 'inherit', this.native.model].includes(requested.model), 'MODEL_NOT_SUPPORTED');
-    check(['auto', 'inherit', this.native.effort].includes(requested.effort), 'EFFORT_NOT_SUPPORTED');
+    this.store.snapshot(run.id, 'config', `revision-${run.configRevision ?? 1}`, run.config);
+    if (this.native) this.store.snapshot(run.id, 'catalog', `host-${hash(this.native)}`, this.native);
+  }
+  async prepare(run: Run, taskId: string) {
+    check(run.state === 'EXECUTING', 'INVALID_RUN_STATE');
+    check(this.native?.verified && this.native.contextMatches && this.native.host === run.host && this.native.evidence.length, 'BLOCKED_CAPABILITY');
+    run.hostEvidence ??= structuredClone(this.native);
+    enforceRunBudget(run);
+    const task = run.tasks[taskId]; check(task, 'TASK_NOT_FOUND');
+    check(['PENDING', 'RETRYABLE_FAILED'].includes(task.state), 'TASK_NOT_READY');
+    check(task.attempt < run.config.execution.max_task_attempts, 'TASK_ATTEMPT_LIMIT');
+    check(task.spec.depends_on.every(key => run.tasks[key].state === 'INTEGRATED'), 'DEPENDENCY_NOT_INTEGRATED');
+    const active = Object.values(run.tasks).filter(work => ['LEASED', 'RUNNING', 'VALIDATING', 'ORPHANED_UNKNOWN', 'MERGE_QUEUED'].includes(work.state));
+    check(active.filter(work => work.state !== 'MERGE_QUEUED').length < run.config.execution.max_parallel_workers, 'WORKER_LIMIT');
+    check(!active.some(work => overlaps(work.spec.write_paths, task.spec.write_paths) || work.spec.exclusive_resources.some(resource => task.spec.exclusive_resources.includes(resource))), 'OWNERSHIP_CONFLICT');
+    await this.syncConfig(run);
+    const resolution = resolveRoleModel({ config: run.config, host: run.host, role: task.spec.role, native: this.native });
     check(await git(run.integrationPath, 'rev-parse', 'HEAD') === (run.integrationSha ?? run.targetBase), 'INTEGRATION_DRIFT');
     const reuse = Object.keys(task.units).length > 0;
     const createRecovered = reuse && !!task.recoveryHead;
@@ -284,15 +317,97 @@ export class Engine {
       task.branch = `orch/${run.id}/task/${taskId}-${task.attempt + 1}`;
       task.path = join(run.managedRoot, run.id, `${taskId}-${task.attempt + 1}`);
     }
-    task.attempt++; task.lease = randomUUID(); task.expires = Date.now() + run.config.execution.task_timeout_minutes * 60000;
+    task.attempt++; task.lease = randomUUID(); task.deadline = Date.now() + run.config.execution.task_timeout_minutes * 60000; task.expires = task.deadline; task.heartbeat = undefined;
     check(within(run.managedRoot, task.path), 'WORKTREE_ROOT_UNSAFE');
-    task.configRevision = run.configRevision ?? 1; task.modelResolution = { requestedModel: requested.model, requestedEffort: requested.effort, resolvedModel: this.native.model, resolvedEffort: this.native.effort };
-    task.validated = null; task.observedModel = null; task.observedEffort = null;
+    task.configRevision = run.configRevision ?? 1; task.modelResolution = resolution; task.nativeContext = structuredClone(this.native);
+    task.validated = null; task.observedModel = null; task.observedEffort = null; task.modelObservation = undefined; task.nativeBootstrap = undefined; task.resources = undefined;
     task.state = 'LEASED'; task.nativeId = null; this.checkpointIntent(run);
     if (!reuse || createRecovered) await git(run.origin, 'worktree', 'add', '-b', task.branch, task.path, task.dispatchBase ?? task.base);
-    return { runId: run.id, taskId, attemptId: `${taskId}-${task.attempt}`, host: run.host, role: task.spec.role,
-      modelId: this.native.model, effort: this.native.effort, configRevision: task.configRevision, baseSha: task.dispatchBase ?? task.base, lineageBaseSha: task.base, worktreePath: task.path,
+    const reservation = await reservePort();
+    try { task.resources = await allocateAttemptResources(run.origin, run.id, attemptKey(taskId, task.attempt), { host: reservation.host, port: reservation.port }); }
+    catch (error) { await reservation.release(); throw error; }
+    this.portReservations.set(task.lease, { runId: run.id, taskId, generation: task.attempt, reservation });
+    this.checkpointIntent(run);
+    this.store.snapshot(run.id, 'model', `${attemptKey(taskId, task.attempt)}-resolved`, { configRevision: task.configRevision, resolution, host: this.native });
+    this.store.snapshot(run.id, 'attempt', `${attemptKey(taskId, task.attempt)}-prepared`, task);
+    return { runId: run.id, taskId, attemptId: attemptKey(taskId, task.attempt), host: run.host, role: task.spec.role,
+      modelId: resolution.resolvedModel, effort: resolution.resolvedEffort, nativeArguments: resolution.nativeArguments, resources: task.resources, configRevision: task.configRevision, baseSha: task.dispatchBase ?? task.base, lineageBaseSha: task.base, worktreePath: task.path,
       isolation: 'core_managed', leaseId: task.lease, fencingToken: task.attempt, expiresAt: new Date(task.expires).toISOString(), taskBrief: task.spec };
+  }
+  async attemptPort(run: Run, taskId: string, lease: string, generation: number, action: 'status' | 'release_for_claim') {
+    const task = run.tasks[taskId]; check(task, 'TASK_NOT_FOUND');
+    check(task.lease === lease && task.attempt === generation, 'STALE_LEASE');
+    check(action === 'status' || action === 'release_for_claim', 'INVALID_PORT_ACTION');
+    const entry = this.portReservations.get(lease);
+    const reservation = entry?.runId === run.id && entry.taskId === taskId && entry.generation === generation ? entry.reservation : null;
+    if (action === 'release_for_claim') {
+      this.leased(run, taskId, lease, generation);
+      check(['LEASED', 'RUNNING', 'VALIDATING'].includes(task.state), 'INVALID_TASK_STATE');
+      check(reservation, 'PORT_RESERVATION_UNKNOWN');
+      if (reservation.state === 'reserved') await reservation.releaseForClaim();
+    }
+    return { host: task.resources?.service?.host ?? null, port: task.resources?.service?.port ?? null,
+      state: reservation?.state ?? 'unknown', reserved: reservation ? reservation.state === 'reserved' : null,
+      claimRequiresBindEvidence: true as const };
+  }
+  private async releaseTaskPort(run: Run, taskId: string) {
+    const task = run.tasks[taskId], entry = this.portReservations.get(task.lease);
+    if (entry?.runId === run.id && entry.taskId === taskId && entry.generation === task.attempt) {
+      await entry.reservation.release(); this.portReservations.delete(task.lease);
+    }
+  }
+  async disposePorts() {
+    for (const entry of this.portReservations.values()) await entry.reservation.release();
+    this.portReservations.clear();
+  }
+  async prepareReview(run: Run, role: 'reviewer' | 'final_auditor') {
+    enforceRunBudget(run);
+    check(role === 'reviewer' || role === 'final_auditor', 'INVALID_REVIEW_ROLE');
+    check(run.state === (role === 'reviewer' ? 'REVIEWING' : 'FINAL_AUDIT'), 'INVALID_RUN_STATE');
+    check(this.native, 'BLOCKED_CAPABILITY');
+    await this.syncConfig(run);
+    const resolution = resolveRoleModel({ config: run.config, host: run.host, role, native: this.native });
+    check(!Object.values(run.reviewDispatches ?? {}).some(item => item.role === role && ['LEASED', 'RUNNING', 'BLOCKED_MODEL_POLICY'].includes(item.state)), 'REVIEW_ALREADY_ACTIVE');
+    const repo = await inspectRepository(run.integrationPath);
+    check(repo.commonDir === run.commonDir && repo.branch === run.integration && repo.head === run.integrationSha && !repo.dirty, 'INTEGRATION_DRIFT');
+    const dispatchId = `review-${randomUUID()}`, expires = Date.now() + run.config.execution.task_timeout_minutes * 60000;
+    const dispatch: ReviewDispatch = { role, sha: repo.head, source: await sourceFingerprint(repo.root), expires, nativeId: null, state: 'LEASED', configRevision: run.configRevision ?? 1, resolution, nativeContext: structuredClone(this.native) };
+    run.reviewDispatches ??= {}; run.reviewDispatches[dispatchId] = dispatch;
+    this.store.snapshot(run.id, 'model', `${dispatchId}-resolved`, { ...dispatch, host: this.native });
+    return { dispatchId, role, readOnly: true, writePaths: [], reviewedSha: repo.head, worktreePath: repo.root,
+      modelId: resolution.resolvedModel, effort: resolution.resolvedEffort, nativeArguments: resolution.nativeArguments,
+      configRevision: dispatch.configRevision, expiresAt: new Date(expires).toISOString() };
+  }
+  async bindReview(run: Run, dispatchId: string, nativeId: string, observedModel: string | null, observedEffort: string | null, reviewedSha: string) {
+    enforceRunBudget(run);
+    check(this.native?.verified && this.native.contextMatches && this.native.host === run.host, 'BLOCKED_CAPABILITY');
+    const dispatch = run.reviewDispatches?.[dispatchId];
+    check(dispatch && dispatch.state === 'LEASED' && dispatch.expires > Date.now(), 'REVIEW_DISPATCH_REQUIRED');
+    check(run.state === (dispatch.role === 'reviewer' ? 'REVIEWING' : 'FINAL_AUDIT'), 'INVALID_RUN_STATE');
+    check(dispatch.sha === reviewedSha && await git(run.integrationPath, 'rev-parse', 'HEAD') === reviewedSha && dispatch.source === await sourceFingerprint(run.integrationPath), 'REVIEW_STALE');
+    nativeAgentId.parse(nativeId);
+    check(!run.implementers?.includes(nativeId) && !Object.values(run.tasks).some(task => task.nativeId === nativeId) && !run.reviews.some(review => review.reviewer === nativeId), 'REVIEW_NOT_INDEPENDENT');
+    const observation = observeRoleModel(dispatch.resolution, { model: observedModel, effort: observedEffort }, dispatch.nativeContext.models);
+    dispatch.nativeId = nativeId; dispatch.observation = observation; dispatch.state = observation.policyViolation ? 'BLOCKED_MODEL_POLICY' : 'RUNNING';
+    this.store.snapshot(run.id, 'model', `${dispatchId}-observed`, { nativeId, observation });
+    return { state: dispatch.state, observation };
+  }
+  async stopReview(run: Run, dispatchId: string, nativeStopped: boolean, nativeId: string | null) {
+    const dispatch = run.reviewDispatches?.[dispatchId]; check(dispatch, 'REVIEW_DISPATCH_REQUIRED');
+    check(nativeStopped && dispatch.nativeId === nativeId, 'WORKER_STOP_UNCONFIRMED');
+    if (dispatch.state !== 'COMPLETED') dispatch.state = 'STOPPED';
+    return { state: dispatch.state };
+  }
+  async heartbeat(run: Run, taskId: string, lease: string, generation: number, nativeId: string, receipt: HostHeartbeat) {
+    enforceRunBudget(run);
+    const task = run.tasks[taskId]; check(task, 'TASK_NOT_FOUND');
+    const previous = task.expires;
+    const confirmed = confirmHostHeartbeat(task, { leaseId: lease, generation, nativeId }, receipt, this.native?.source === 'coordinator_native_receipt',
+      run.config.execution.task_timeout_minutes * 60000, Date.now(), task.deadline ?? task.expires);
+    return { ...confirmed, leaseRenewed: task.expires > previous, deadlinePreserved: true };
+  }
+  async reconcileLiveness(run: Run) {
+    return { orphanedTasks: reconcileExpiredTasks(run.tasks), preserved: true, hostStopInferred: false };
   }
   ready(run: Run) {
     if (run.state !== 'EXECUTING') return [];
@@ -320,7 +435,8 @@ export class Engine {
     check(nativeStopped && reason.trim().length > 0, 'WORKER_STOP_UNCONFIRMED');
     check(['RUNNING', 'LEASED', 'ORPHANED_UNKNOWN'].includes(task.state), 'INVALID_TASK_STATE');
     await this.taskIdentity(run, task);
-    task.attempts ??= []; task.attempts.push({ number: task.attempt, path: task.path, branch: task.branch, nativeId: task.nativeId, stopped: true, reason });
+    await this.releaseTaskPort(run, taskId);
+    task.attempts ??= []; task.attempts.push({ number: task.attempt, path: task.path, branch: task.branch, nativeId: task.nativeId, stopped: true, reason, configRevision: task.configRevision, modelResolution: structuredClone(task.modelResolution), observedModel: task.observedModel, observedEffort: task.observedEffort, modelObservation: structuredClone(task.modelObservation), resources: task.resources });
     task.recoveryHead = Object.keys(task.units).length ? await git(task.path, 'rev-parse', 'HEAD') : undefined;
     task.validated = null; task.expires = 0;
     task.state = task.attempt < run.config.execution.max_task_attempts ? 'RETRYABLE_FAILED' : 'BLOCKED_ATTEMPT_LIMIT';
@@ -339,11 +455,18 @@ export class Engine {
     const repo = await inspectRepository(task.path);
     check(repo.root === await realpath(task.path) && repo.commonDir === run.commonDir && repo.branch === task.branch && repo.head === (task.dispatchBase ?? task.base) && !repo.dirty, 'BASE_SHA_MISMATCH');
     if (this.native.source === 'coordinator_native_receipt') check(bootstrap && bootstrap.cwd === repo.root && bootstrap.origin_root === repo.root && bootstrap.common_dir === repo.commonDir && bootstrap.branch === repo.branch && bootstrap.head === repo.head, 'WORKER_BOOTSTRAP_MISMATCH');
-    check((observedModel === null || observedModel === task.modelResolution?.resolvedModel) && (observedEffort === null || observedEffort === task.modelResolution?.resolvedEffort), 'MODEL_OBSERVATION_MISMATCH');
+    check(task.modelResolution, 'MODEL_RESOLUTION_REQUIRED');
+    const observation = observeRoleModel(task.modelResolution, { model: observedModel, effort: observedEffort }, task.nativeContext?.models);
+    task.modelObservation = observation;
     if (bootstrap) task.nativeBootstrap = structuredClone(bootstrap);
     task.observedModel = observedModel; task.observedEffort = observedEffort;
     task.nativeId = nativeAgentId.parse(nativeId); run.implementers ??= []; run.implementers.push(task.nativeId); task.state = 'RUNNING';
-    return { state: task.state };
+    this.store.snapshot(run.id, 'model', `${attemptKey(taskId, task.attempt)}-observed`, { nativeId: task.nativeId, observation });
+    if (observation.policyViolation) {
+      task.pausedState = 'RUNNING'; task.state = 'ORPHANED_UNKNOWN'; run.pausedFrom = run.state; run.state = 'PAUSED'; run.pauseStartedAt = Date.now();
+      return { state: task.state, reason: 'MODEL_OBSERVATION_MISMATCH', observation };
+    }
+    return { state: task.state, observation };
   }
   async taskIdentity(run: Run, task: Work) {
     const repo = await inspectRepository(task.path);
@@ -351,6 +474,7 @@ export class Engine {
     return repo;
   }
   async validate(run: Run, taskId: string, lease: string, generation: number) {
+    enforceRunBudget(run);
     check(run.state === 'EXECUTING', 'INVALID_RUN_STATE');
     const task = this.leased(run, taskId, lease, generation);
     check(task.state === 'RUNNING', 'INVALID_TASK_STATE');
@@ -362,6 +486,7 @@ export class Engine {
     return gate;
   }
   async commit(run: Run, taskId: string, lease: string, generation: number, unit: string) {
+    enforceRunBudget(run);
     check(run.state === 'EXECUTING', 'INVALID_RUN_STATE');
     const task = this.leased(run, taskId, lease, generation);
     check(task.state === 'RUNNING', 'INVALID_TASK_STATE');
@@ -406,7 +531,7 @@ export class Engine {
     await this.verifySubmission(run, task);
     if (submittedResult !== null) {
       const result = taskResultSchema.parse(submittedResult);
-      check(result.runId === run.id && result.taskId === taskId && result.attemptId === `${taskId}-${task.attempt}` && result.baseSha === (task.dispatchBase ?? task.base) && await realpath(result.worktreePath) === await realpath(task.path), 'TASK_RESULT_IDENTITY_MISMATCH');
+      check(result.runId === run.id && result.taskId === taskId && result.attemptId === attemptKey(taskId, task.attempt) && result.baseSha === (task.dispatchBase ?? task.base) && await realpath(result.worktreePath) === await realpath(task.path), 'TASK_RESULT_IDENTITY_MISMATCH');
       check(result.status === 'ready_for_validation' && result.completedUnits.length === Object.keys(task.units).length && result.completedUnits.every(unit => task.units[unit.unitId] === unit.commitSha), 'TASK_RESULT_MISMATCH');
       const actual = await changedPaths(task.path, task.dispatchBase ?? task.base);
       check(result.changedPaths.length === actual.length && result.changedPaths.every(path => actual.includes(path)), 'TASK_RESULT_MISMATCH');
@@ -418,6 +543,7 @@ export class Engine {
     task.state = 'MERGE_QUEUED'; return { state: task.state };
   }
   async integrate(run: Run, taskId: string, expectedSha: string) {
+    enforceRunBudget(run);
     check(run.state === 'EXECUTING', 'INVALID_RUN_STATE');
     const task = run.tasks[taskId]; check(task?.state === 'MERGE_QUEUED', 'TASK_NOT_READY');
     await this.verifySubmission(run, task);
@@ -441,6 +567,26 @@ export class Engine {
     return { sha: await git(run.integrationPath, 'rev-parse', 'HEAD'), state: run.state };
   }
   async resolveConflict(run: Run, nativeStopped: boolean) {
+    if (run.targetConflict) {
+      check(run.state === 'BLOCKED_CONFLICT' && nativeStopped, 'CONFLICT_RESOLUTION_NOT_READY');
+      const conflict = run.targetConflict, repo = await inspectRepository(conflict.path), target = await inspectRepository(run.origin), integration = await inspectRepository(run.integrationPath);
+      check(repo.commonDir === run.commonDir && repo.branch === conflict.branch && repo.head === conflict.expected, 'CONFLICT_BASE_MISMATCH');
+      check(target.branch === run.target && target.head === conflict.target && !target.dirty && integration.commonDir === run.commonDir && integration.branch === run.integration && integration.head === conflict.expected && !integration.dirty, 'TARGET_DRIFT');
+      check(await git(conflict.path, 'rev-parse', '--verify', 'MERGE_HEAD') === conflict.target, 'CONFLICT_PARENT_MISMATCH');
+      const paths = await changedPaths(conflict.path), allowed = [...Object.values(run.tasks).flatMap(task => task.spec.write_paths), ...await changedPaths(run.origin, run.targetBase)];
+      check(paths.every(path => owns(allowed, path)), 'OWNERSHIP_VIOLATION');
+      if (paths.length) await git(conflict.path, 'add', '--', ...paths);
+      await git(conflict.path, 'diff', '--cached', '--check');
+      check(await git(conflict.path, 'diff', '--name-only', '--diff-filter=U') === '', 'CONFLICT_UNRESOLVED');
+      this.checkpointIntent(run);
+      await git(conflict.path, 'commit', '--no-edit');
+      const parents = (await git(conflict.path, 'show', '-s', '--format=%P', 'HEAD')).split(' ');
+      check(parents.length === 2 && parents[0] === conflict.expected && parents[1] === conflict.target, 'MERGE_PARENTS_MISMATCH');
+      await git(run.integrationPath, 'merge', '--ff-only', conflict.branch);
+      run.integrationSha = await git(run.integrationPath, 'rev-parse', 'HEAD'); run.targetBase = conflict.target;
+      run.targetConflict = undefined; run.reviews = []; run.finalizationApproval = undefined; run.state = 'VERIFYING';
+      return { state: run.state, sha: run.integrationSha, targetBase: run.targetBase };
+    }
     check(run.state === 'BLOCKED_CONFLICT' && run.conflict && nativeStopped, 'CONFLICT_RESOLUTION_NOT_READY');
     const conflict = run.conflict, task = run.tasks[conflict.taskId];
     const repo = await inspectRepository(conflict.path);
@@ -465,13 +611,23 @@ export class Engine {
     return { state: run.state, sha: await git(run.integrationPath, 'rev-parse', 'HEAD') };
   }
   async verify(run: Run) {
-    check(run.state === 'VERIFYING' || run.state === 'REVIEWING', 'INVALID_RUN_STATE');
+    enforceRunBudget(run);
+    check(['VERIFYING', 'REVIEWING', 'BLOCKED_TESTS'].includes(run.state), 'INVALID_RUN_STATE');
     const gate = await this.gate(run, 'integration', run.integrationPath);
-    run.state = acceptedGate(gate) ? 'REVIEWING' : 'BLOCKED_TESTS'; return gate;
+    run.reviews = []; run.state = acceptedGate(gate) ? 'REVIEWING' : 'BLOCKED_TESTS'; return gate;
   }
-  async review(run: Run, input: unknown, final = false) {
+  async review(run: Run, input: unknown, final = false, nativeStopped = false) {
+    enforceRunBudget(run);
     check(run.state === (final ? 'FINAL_AUDIT' : 'REVIEWING'), 'INVALID_RUN_STATE');
     const review = reviewSchema.parse(input), current = await git(run.integrationPath, 'rev-parse', 'HEAD');
+    if (run.hostEvidence?.source === 'coordinator_native_receipt' || this.native?.source === 'coordinator_native_receipt') {
+      check(this.native?.verified && this.native.contextMatches && this.native.host === run.host, 'BLOCKED_CAPABILITY');
+      check(nativeStopped, 'WORKER_STOP_UNCONFIRMED');
+      const dispatch = Object.values(run.reviewDispatches ?? {}).find(item => item.nativeId === review.reviewer_id && item.role === (final ? 'final_auditor' : 'reviewer') && item.sha === current && item.state === 'RUNNING');
+      check(dispatch && dispatch.expires > Date.now(), 'REVIEW_DISPATCH_REQUIRED');
+      check(dispatch.source === await sourceFingerprint(run.integrationPath), 'REVIEW_SOURCE_CHANGED');
+      dispatch.state = 'COMPLETED';
+    }
     check(review.reviewed_sha === current, 'REVIEW_STALE');
     check(run.gates.some(gate => gate.stage === 'integration' && gate.sha === current && acceptedGate(gate) && gate.commands === hash(run.config.quality.commands)), 'VALIDATION_STALE');
     check(run.gates.filter(gate => gate.stage === 'integration').at(-1)?.source === await sourceFingerprint(run.integrationPath), 'VALIDATION_STALE');
@@ -486,28 +642,40 @@ export class Engine {
       if (old) {
         const rank = { low: 0, medium: 1, high: 2, critical: 3 };
         check(rank[finding.severity] >= rank[old.severity], 'FINDING_SEVERITY_DOWNGRADE');
-        Object.assign(old, finding, { seenRounds: [...new Set([...(old.seenRounds ?? [0]), run.reviewRound])], id: old.id, lifecycle: old.lifecycle === 'VERIFIED_FIXED' ? 'REOPENED' : 'OPEN' });
+        const disposition = old.dispositions?.at(-1);
+        const keepDisposition = old.fingerprint === finding.fingerprint && old.severity === finding.severity && disposition?.sha === current && disposition.status === old.lifecycle && ['ACCEPTED_RISK', 'NOT_A_BUG', 'DEFERRED'].includes(old.lifecycle) && (['evidence', 'reproduction', 'summary', 'acceptance', 'suggested_test', 'acceptance_ids'] as const).every(key => hash(old[key]) === hash(finding[key]));
+        Object.assign(old, finding, { seenRounds: [...new Set([...(old.seenRounds ?? [0]), run.reviewRound])], id: old.id, lifecycle: keepDisposition ? old.lifecycle : old.lifecycle === 'VERIFIED_FIXED' ? 'REOPENED' : 'OPEN' });
       } else run.findings.push(finding);
     }
     // Absence is only accepted after an independent full review of the same verified SHA.
     for (const finding of run.findings) if (finding.lifecycle === 'FIX_PROPOSED' && !incoming.some(item => item.fingerprint === finding.fingerprint || item.id === finding.id)) finding.lifecycle = 'VERIFIED_FIXED';
-    const blocking = run.findings.some(finding => finding.lifecycle !== 'VERIFIED_FIXED' && run.config.review.block_on.includes(finding.severity));
+    const blocking = run.findings.some(finding => findingBlocks(run, finding));
     run.reviews.push({ sha: current, reviewer: review.reviewer_id, final, acceptanceIds: review.acceptance_ids, decision: review.decision, limitations: review.limitations });
     if (blocking || review.decision === 'changes_requested') run.state = run.reviewRound >= run.config.execution.max_review_rounds ? 'BLOCKED_REVIEW_LIMIT' : run.findings.some(finding => finding.lifecycle !== 'VERIFIED_FIXED' && (finding.seenRounds?.length ?? 1) >= run.config.execution.max_repeated_finding_rounds) ? 'BLOCKED_REPEATED_FINDING' : 'REPAIR_PLANNING';
     else run.state = final ? 'READY_TO_FINALIZE' : 'FINAL_AUDIT';
     return { state: run.state, findings: run.findings };
   }
   async repair(run: Run, input: unknown, findingIds: string[], analysis?: string) {
-    check(['REPAIR_PLANNING', 'BLOCKED_REPEATED_FINDING'].includes(run.state) && run.reviewRound < run.config.execution.max_review_rounds, 'BLOCKED_REVIEW_LIMIT');
+    enforceRunBudget(run);
+    check(['REPAIR_PLANNING', 'BLOCKED_REPEATED_FINDING', 'BLOCKED_TESTS'].includes(run.state) && run.reviewRound < run.config.execution.max_review_rounds, 'BLOCKED_REVIEW_LIMIT');
     if (run.state === 'BLOCKED_REPEATED_FINDING') { check(typeof analysis === 'string' && analysis.trim(), 'REANALYSIS_REQUIRED'); run.repairAnalyses ??= []; run.repairAnalyses.push({ round: run.reviewRound, analysis }); }
     const plan = validatePlan(input);
     check(run.requirements && plan.acceptance.every(item => run.requirements!.acceptance.some(required => required.id === item.id && required.text === item.text)), 'REQUIREMENTS_PLAN_MISMATCH');
     check(plan.tasks.every(task => !run.tasks[task.id]), 'DUPLICATE_ID');
-    const unresolved = run.findings.filter(finding => finding.lifecycle !== 'VERIFIED_FIXED' && run.config.review.block_on.includes(finding.severity));
+    const unresolved = run.findings.filter(finding => findingBlocks(run, finding));
     check(unresolved.every(finding => findingIds.includes(finding.id) && plan.tasks.some(task => owns(task.write_paths, finding.path))), 'FINDING_UNMAPPED');
     for (const finding of unresolved) finding.lifecycle = 'FIX_PROPOSED';
     for (const spec of plan.tasks) run.tasks[spec.id] = { spec, state: 'PENDING', base: '', path: '', branch: '', attempt: 0, lease: '', expires: 0, nativeId: null, units: {}, validated: null };
     run.reviewRound++; run.state = 'EXECUTING'; return { state: run.state, round: run.reviewRound };
+  }
+  async disposeFinding(run: Run, findingId: string, status: 'ACCEPTED_RISK' | 'NOT_A_BUG' | 'DEFERRED', reason: string, approved: boolean) {
+    check(['REPAIR_PLANNING', 'BLOCKED_REPEATED_FINDING', 'BLOCKED_REVIEW_LIMIT', 'REVIEWING', 'FINAL_AUDIT', 'READY_TO_FINALIZE'].includes(run.state), 'INVALID_RUN_STATE');
+    check(approved && reason.trim(), 'APPROVAL_REQUIRED');
+    check(['ACCEPTED_RISK', 'NOT_A_BUG', 'DEFERRED'].includes(status), 'INVALID_FINDING_DISPOSITION');
+    const finding = run.findings.find(item => item.id === findingId); check(finding, 'FINDING_NOT_FOUND');
+    finding.dispositions ??= []; finding.dispositions.push({ status, reason, actor: 'user', approvedAt: new Date().toISOString(), sha: run.integrationSha ?? null });
+    finding.lifecycle = status; run.reviews = []; run.state = 'REVIEWING';
+    return { state: run.state, finding };
   }
   async waiveGate(run: Run, stage: 'baseline' | 'task' | 'integration' | 'final', gateId: string, taskId: string | null, reason: string, approved: boolean) {
     check(approved && reason.trim(), 'APPROVAL_REQUIRED');
@@ -527,21 +695,49 @@ export class Engine {
     return { policy: 'auto_on_success', approval: run.finalizationApproval };
   }
   async finalize(run: Run, approved: boolean, expectedTarget: string) {
+    enforceRunBudget(run);
     check(run.state === 'READY_TO_FINALIZE', 'INVALID_RUN_STATE');
     check(approved || run.finalizationApproval?.actor === 'user' && run.finalizationApproval.runId === run.id && run.finalizationApproval.target === run.target, 'APPROVAL_REQUIRED');
     const repo = await inspectRepository(run.origin), head = await git(run.integrationPath, 'rev-parse', 'HEAD');
     check(repo.branch === run.target && repo.head === run.targetBase && repo.head === expectedTarget, 'TARGET_DRIFT');
     check(!repo.dirty && !(await inspectRepository(run.integrationPath)).dirty, 'DIRTY_CHECKOUT');
-    check(run.reviews.some(review => review.sha === head && review.final), 'REVIEW_STALE');
+    check(run.integrationSha === head, 'INTEGRATION_DRIFT');
+    check(completionEvidence(run, null, { beforeFinalGate: true, beforeTarget: true }).blockers.length === 0, 'COMPLETION_UNVERIFIED');
+    check(run.gates.filter(gate => gate.stage === 'integration' && gate.task === null).at(-1)?.source === await sourceFingerprint(run.integrationPath), 'VALIDATION_STALE');
     const gate = await this.gate(run, 'final', run.integrationPath);
     if (!acceptedGate(gate)) { run.state = 'BLOCKED_TESTS'; return gate; }
+    const targetNow = await inspectRepository(run.origin), integrationNow = await inspectRepository(run.integrationPath);
+    check(targetNow.branch === run.target && targetNow.head === expectedTarget && targetNow.head === run.targetBase && !targetNow.dirty, 'TARGET_DRIFT');
+    check(integrationNow.branch === run.integration && integrationNow.head === head && !integrationNow.dirty, 'INTEGRATION_DRIFT');
+    check(completionEvidence(run, null, { beforeTarget: true }).blockers.length === 0, 'COMPLETION_UNVERIFIED');
     this.checkpointIntent(run);
+    enforceRunBudget(run);
     await git(run.origin, 'merge', '--ff-only', run.integration);
     check(await git(run.origin, 'rev-parse', 'HEAD') === head, 'FINALIZE_MISMATCH');
     run.finalizedAt = new Date().toISOString(); run.state = 'COMPLETED'; return { sha: head, cleanupStatus: 'not_requested' };
   }
+  async reintegrateTarget(run: Run, expectedTarget: string) {
+    enforceRunBudget(run);
+    check(['READY_TO_FINALIZE', 'VERIFYING', 'REVIEWING', 'FINAL_AUDIT', 'BLOCKED_TESTS'].includes(run.state), 'INVALID_RUN_STATE');
+    check(Object.values(run.tasks).every(task => task.state === 'INTEGRATED'), 'TASKS_UNINTEGRATED');
+    const target = await inspectRepository(run.origin), integration = await inspectRepository(run.integrationPath);
+    check(target.branch === run.target && target.head === expectedTarget, 'TARGET_DRIFT');
+    check(integration.commonDir === run.commonDir && integration.branch === run.integration && integration.head === run.integrationSha, 'INTEGRATION_DRIFT');
+    check(!target.dirty && !integration.dirty, 'DIRTY_CHECKOUT');
+    const candidate = { path: join(run.managedRoot, run.id, `target-${this.activeOperation}`), branch: `orch/${run.id}/target/${this.activeOperation}` };
+    run.candidates ??= []; run.candidates.push(candidate);
+    this.checkpointIntent(run);
+    await git(run.origin, 'worktree', 'add', '-b', candidate.branch, candidate.path, integration.head);
+    try { await git(candidate.path, 'merge', '--no-ff', '--no-edit', expectedTarget); }
+    catch { run.targetConflict = { ...candidate, expected: integration.head, target: expectedTarget }; run.state = 'BLOCKED_CONFLICT'; run.reviews = []; run.finalizationApproval = undefined; return { state: run.state, preserved: candidate.path, reason: 'TARGET_CONFLICT' }; }
+    check((await inspectRepository(run.origin)).head === expectedTarget, 'TARGET_DRIFT');
+    await git(run.integrationPath, 'merge', '--ff-only', candidate.branch);
+    run.integrationSha = await git(run.integrationPath, 'rev-parse', 'HEAD'); run.targetBase = expectedTarget;
+    run.reviews = []; run.finalizationApproval = undefined; run.state = 'VERIFYING';
+    return { state: run.state, sha: run.integrationSha, targetBase: run.targetBase };
+  }
   async cleanup(run: Run, dryRun = true) {
-    const resources = [...(run.candidates ?? []).map(candidate => ({ ...candidate, active: false })), ...Object.values(run.tasks).filter(task => task.path).map(task => ({ path: task.path, branch: task.branch, active: ['LEASED', 'RUNNING', 'ORPHANED_UNKNOWN'].includes(task.state) })), { path: run.integrationPath, branch: run.integration, active: false }];
+    const resources = [...(run.candidates ?? []).map(candidate => ({ ...candidate, active: false })), ...Object.values(run.tasks).filter(task => task.path).map(task => ({ path: task.path, branch: task.branch, active: ['LEASED', 'RUNNING', 'ORPHANED_UNKNOWN'].includes(task.state) })), { path: run.integrationPath, branch: run.integration, active: Object.values(run.reviewDispatches ?? {}).some(item => !['COMPLETED', 'STOPPED'].includes(item.state)) }];
     const results: Run['cleanup'] = [];
     for (const item of resources) {
       let reason: string | null = null;
@@ -549,7 +745,18 @@ export class Engine {
       else if (item.active) reason = 'worker_stop_unconfirmed';
       else {
         const path = await realpath(item.path).catch(() => null);
-        if (!path) { results.push({ path: item.path, status: 'absent', reason: null }); continue; }
+        if (!path) {
+          if (!within(run.managedRoot, resolve(item.path)) || !item.branch.startsWith(`orch/${run.id}/`)) { results.push({ path: item.path, status: 'preserved', reason: 'ownership_mismatch' }); continue; }
+          const branchHead = await git(run.origin, 'rev-parse', '--verify', `refs/heads/${item.branch}`).catch(() => null);
+          if (!branchHead) { results.push({ path: item.path, status: 'absent', reason: null }); continue; }
+          try { await git(run.origin, 'merge-base', '--is-ancestor', branchHead, run.target); }
+          catch { results.push({ path: item.path, status: 'preserved', reason: 'unmerged' }); continue; }
+          if (dryRun) { results.push({ path: item.path, status: 'candidate', reason: null }); continue; }
+          this.checkpointIntent(run);
+          try { await git(run.origin, 'branch', '-d', item.branch); results.push({ path: item.path, status: 'removed', reason: null }); }
+          catch { results.push({ path: item.path, status: 'preserved', reason: 'remove_failed' }); }
+          continue;
+        }
         const repo = await inspectRepository(path);
         if (!within(run.managedRoot, path) || path === run.origin || repo.commonDir !== run.commonDir || repo.branch !== item.branch) reason = 'ownership_mismatch';
         else if (repo.dirty) reason = 'dirty';
@@ -560,6 +767,9 @@ export class Engine {
       catch { results.push({ path: item.path, status: 'preserved', reason: 'remove_failed' }); }
     }
     if (!dryRun) {
+      if (run.state === 'COMPLETED') for (const [taskId, task] of Object.entries(run.tasks)) {
+        if (!['LEASED', 'RUNNING', 'VALIDATING', 'ORPHANED_UNKNOWN'].includes(task.state)) await this.releaseTaskPort(run, taskId);
+      }
       run.cleanup = results;
       if (results.every(item => ['removed', 'absent'].includes(item.status))) {
         const lock = join(run.commonDir, 'orch', 'locks', 'write.json');
@@ -580,9 +790,11 @@ export class Engine {
       check(['PAUSED', 'CANCELLED'].includes(run.state), 'INVALID_RUN_STATE');
       for (const task of Object.values(run.tasks)) if (task.state === 'ORPHANED_UNKNOWN') {
         check(task.nativeId ? stoppedAgents.includes(task.nativeId) : task.pausedState === 'LEASED' && neverStartedTasks.includes(task.spec.id), 'ORPHANED_UNKNOWN');
-        check(!(await inspectRepository(task.path)).dirty, 'DIRTY_RECOVERY_PRESERVED');
-        if (task.spec.commit_units.every(unit => task.units[unit.id])) { await this.verifySubmission(run, task); task.state = 'MERGE_QUEUED'; }
-        else task.state = 'RETRYABLE_FAILED';
+        check(!(await this.taskIdentity(run, task)).dirty, 'DIRTY_RECOVERY_PRESERVED');
+        const complete = task.spec.commit_units.every(unit => task.units[unit.id]);
+        if (complete) await this.verifySubmission(run, task);
+        await this.releaseTaskPort(run, task.spec.id);
+        task.state = complete ? 'MERGE_QUEUED' : 'RETRYABLE_FAILED';
       }
       run.pauseTimeMs = (run.pauseTimeMs ?? 0) + (run.pauseStartedAt === undefined ? 0 : Math.max(0, Date.now() - run.pauseStartedAt));
       run.pauseStartedAt = undefined; run.state = run.pausedFrom || 'EXECUTING';

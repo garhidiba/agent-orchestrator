@@ -24,6 +24,14 @@ export const findingSchema = z.strictObject({
   acceptance: z.string().min(1), suggested_test: z.string().min(1), acceptance_ids: z.array(id).min(1),
   status: z.literal('open'),
 });
+export const hostHeartbeatSchema = z.strictObject({
+  source: z.enum(['host_status', 'host_event']), status: z.literal('running'),
+  observedAt: z.number().finite().nonnegative(), evidenceRef: z.string().trim().min(1).max(4096),
+});
+export const findingDispositionSchema = z.strictObject({
+  finding_id: id, status: z.enum(['ACCEPTED_RISK', 'NOT_A_BUG', 'DEFERRED']),
+  reason: z.string().trim().min(1).max(4096), approved: z.literal(true),
+});
 export const reviewSchema = z.strictObject({
   schema_version: z.literal(1), reviewed_sha: sha, reviewer_id: nativeAgentId,
   decision: z.enum(['approved', 'changes_requested']), findings: z.array(findingSchema),

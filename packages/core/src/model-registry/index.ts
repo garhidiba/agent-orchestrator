@@ -23,7 +23,8 @@ export function validateModels(config: Config, catalog: Model[], previous?: Conf
     const model = models.find(candidate => candidate.host === host && candidate.id === policy.model);
     check(model && model.support !== 'unsupported' && model.family === (host === 'codex' ? 'openai' : 'claude'), 'MODEL_NOT_SUPPORTED');
     check(model.access !== 'denied', 'MODEL_ACCESS_DENIED');
-    check(model.availability !== 'unavailable', 'MODEL_UNAVAILABLE');
+    check(!['unavailable', 'rate_limited'].includes(model.availability), 'MODEL_UNAVAILABLE');
+    check(model.defaultEffort === null || model.efforts === null || model.efforts.includes(model.defaultEffort), 'EFFORT_METADATA_INVALID');
     check(!model.expiresAt || Date.parse(model.expiresAt) > Date.now(), 'CATALOG_EXPIRED');
     if (!['auto', 'inherit'].includes(policy.effort)) check(model.efforts?.includes(policy.effort), 'EFFORT_NOT_SUPPORTED');
   }

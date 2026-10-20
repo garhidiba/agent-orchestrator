@@ -4,6 +4,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep, posix } from 'node:p
 import { isDeepStrictEqual } from 'node:util';
 import * as TOML from '@iarna/toml';
 import { z } from 'zod';
+import { probeMcp } from '../diagnostics/mcp.ts';
 import { parseConfig } from '../../../core/src/config/index.ts';
 
 const hash = (data: string | Buffer) => createHash('sha256').update(data).digest('hex');
@@ -16,6 +17,7 @@ export type Host = 'codex' | 'claude';
 export interface InstallOptions {
   root: string; home: string; scope: 'user' | 'project'; project?: string; configFile?: string;
   hosts: readonly Host[]; bundle: string; checksum: string; runtime?: string; dryRun?: boolean;
+  verifyMetadata?: (host: Host) => Promise<unknown>;
   // Migration runs only against the backed-up ORCH config; host settings and run data are not migration inputs.
   migrate?: (configFile: string, previousVersion: string | null) => Promise<void>;
 }
@@ -36,12 +38,21 @@ async function safe(file: string, base: string) {
   }
 }
 async function filesAt(root: string, prefix = ''): Promise<Record<string, string>> {
+  const names: string[] = [];
+  const collect = async (directory: string) => {
+    for (const entry of (await readdir(join(root, directory), { withFileTypes: true })).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
+      const name = directory ? `${directory}/${entry.name}` : entry.name;
+      if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) throw new Error('RELEASE_UNSAFE_FILE');
+      if (entry.isDirectory()) await collect(name); else names.push(name);
+    }
+  };
+  await collect(prefix);
   const files: Record<string, string> = {};
-  for (const entry of (await readdir(join(root, prefix), { withFileTypes: true })).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
-    const name = prefix ? `${prefix}/${entry.name}` : entry.name;
-    if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) throw new Error('RELEASE_UNSAFE_FILE');
-    if (entry.isDirectory()) Object.assign(files, await filesAt(root, name));
-    else files[name] = hash(await readFile(join(root, name)));
+  // Bound open files while preserving deterministic path order and checking every byte.
+  for (let offset = 0; offset < names.length; offset += 32) {
+    const batch = names.slice(offset, offset + 32);
+    const hashes = await Promise.all(batch.map(async name => hash(await readFile(join(root, name)))));
+    batch.forEach((name, index) => { files[name] = hashes[index]!; });
   }
   return files;
 }
@@ -152,9 +163,19 @@ export async function packRelease(source: string, bundle: string, version?: stri
       catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
     }
     const lock = await optional(join(source, 'package-lock.json')); if (lock) await writeFile(join(bundle, 'package-lock.json'), lock);
+    const plugin = await optional(join(bundle, 'templates/claude/plugin/.claude-plugin/plugin.json'));
+    const preparePlugin = async (pluginVersion: string) => {
+      if (!plugin) return; // Historical releases remain installable without a plugin.
+      await mkdir(join(bundle, '.claude-plugin'), { recursive: true });
+      await writeFile(join(bundle, '.claude-plugin/plugin.json'), JSON.stringify({ ...JSON.parse(plugin.toString()), version: pluginVersion }, null, 2) + '\n');
+      await cp(join(bundle, 'templates/claude/plugin/.mcp.json'), join(bundle, '.mcp.json'));
+      await cp(join(bundle, 'templates/claude/plugin/hooks'), join(bundle, 'hooks'), { recursive: true });
+    };
+    await preparePlugin(version ?? JSON.parse(await readFile(join(source, 'package.json'), 'utf8')).version);
     const files = await filesAt(bundle);
     // Content-derived versions make unchanged local installs idempotent, including outside Git.
     version ??= `${versionSchema.parse(JSON.parse(await readFile(join(source, 'package.json'), 'utf8')).version)}-local.${hash(JSON.stringify([process.platform, process.arch, files])).slice(0, 16)}`;
+    if (plugin) { await preparePlugin(version); files['.claude-plugin/plugin.json'] = hash(await readFile(join(bundle, '.claude-plugin/plugin.json'))); }
     const release: Release = { schema: 1, version, nodeMajor: 24, platform: process.platform, arch: process.arch, hostExecution: 'UNVERIFIED', sqlite: 'node:sqlite', skippedOptionalPackages, files };
     const bytes = JSON.stringify(release, null, 2) + '\n';
     await writeFile(join(bundle, 'release.json'), bytes);
@@ -310,14 +331,20 @@ export async function install(options: InstallOptions) {
     else changes.push({ file: orchConfig, before: null, after: await readAsset(options.bundle, release, 'templates/defaults/config.yaml') });
     newManifest.activeVersion = release.version;
     newManifest.releases[release.version] = options.checksum;
-    const result = { installation: 'READY', version: release.version, hosts: [...new Set(options.hosts)], scope: options.scope, packagePath: versionDir, dryRun: !!options.dryRun, reload: 'NEEDS_RELOAD', execution: 'UNVERIFIED', mcp: 'CONFIGURED_NOT_HANDSHAKE_VERIFIED', authentication: 'NOT_CHECKED', preservedRunVersions: true };
+    const result = { installation: options.dryRun ? 'PLANNED' : 'READY', version: release.version, hosts: [...new Set(options.hosts)], scope: options.scope, packagePath: versionDir, dryRun: !!options.dryRun, reload: 'NEEDS_RELOAD', execution: 'UNVERIFIED', mcp: options.dryRun ? 'NOT_RUN' : 'HANDSHAKE_VERIFIED', modelMetadata: {} as Partial<Record<Host, unknown>>, nativeCapability: 'UNVERIFIED', authentication: 'NOT_CHECKED', preservedRunVersions: true, ...(release.files['.claude-plugin/plugin.json'] ? { pluginPath: versionDir, pluginActivation: 'LOAD_WITH_CLAUDE_PLUGIN_DIR', standaloneAlias: releaseSkills(release)[0] } : {}) };
     if (options.dryRun) return result;
     if (!existingVersion) {
       await mkdir(dirname(versionDir), { recursive: true });
       const stage = `${versionDir}.${randomUUID()}.staging`;
-      try { await cp(options.bundle, stage, { recursive: true }); await verifyRelease(stage, options.checksum); await rename(stage, versionDir); }
+      try {
+        await cp(options.bundle, stage, { recursive: true }); await verifyRelease(stage, options.checksum);
+        for (const host of new Set(options.hosts)) if ((await probeMcp({ command: runtime, args: [join(stage, 'packages/mcp-server/src/stdio.ts'), '--host', host] })).status !== 'verified') throw new Error('INSTALL_MCP_VERIFICATION_FAILED');
+        await rename(stage, versionDir);
+      }
       finally { await rm(stage, { recursive: true, force: true }); }
     }
+    if (existingVersion) for (const host of new Set(options.hosts)) if ((await probeMcp({ command: runtime, args: [join(versionDir, 'packages/mcp-server/src/stdio.ts'), '--host', host] })).status !== 'verified') throw new Error('INSTALL_MCP_VERIFICATION_FAILED');
+    for (const host of new Set(options.hosts)) result.modelMetadata[host] = options.verifyMetadata ? await options.verifyMetadata(host) : { status: 'NOT_CHECKED' };
     const backup = oldConfig === null ? null : join(root, 'backups', `${randomUUID()}.config.yaml`);
     if (backup) await atomic(backup, oldConfig!);
     try {

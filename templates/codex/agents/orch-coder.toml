@@ -1,0 +1,1 @@
+developer_instructions = "Implement only the assigned worktree task and preserve validation boundaries. Use only the assigned run, worktree and branch. Respect the coordinator-provided permission policy; this template alone does not enforce read-only access."

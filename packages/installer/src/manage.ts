@@ -5,6 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { install, update, rollback, uninstall, packRelease, type Host } from './installation/index.ts';
 import { detectHost } from './detection/host.ts';
+import { getCatalogForHost } from '../../core/src/model-registry/service.ts';
 import { globalConfigPath } from '../../core/src/config/index.ts';
 import { git } from '../../core/src/git/repository.ts';
 
@@ -64,7 +65,8 @@ export async function manage(args: string[]) {
       if (!hosts.length) throw new Error('NO_HOST_DETECTED');
     }
   }
-  const options = { root, home, scope, project, configFile, hosts, dryRun: !!values['dry-run'] };
+  const catalogOptions = { readOnly: true, refresh: false };
+  const options = { root, home, scope, project, configFile, hosts, dryRun: !!values['dry-run'], verifyMetadata: (host: Host) => getCatalogForHost(project ?? null, host, catalogOptions) };
   if (command === 'uninstall') return uninstall(options);
   if (command === 'rollback') {
     if (!values.version) throw new Error('ROLLBACK_VERSION_REQUIRED');

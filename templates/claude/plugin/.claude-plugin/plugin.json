@@ -1,0 +1,16 @@
+{
+  "name": "orch",
+  "version": "0.1.0",
+  "description": "ORCH native host coordination",
+  "skills": "./templates/claude/plugin/skills/",
+  "agents": [
+    "./templates/claude/plugin/agents/orch-coordinator.md",
+    "./templates/claude/plugin/agents/orch-requirements.md",
+    "./templates/claude/plugin/agents/orch-planner.md",
+    "./templates/claude/plugin/agents/orch-coder.md",
+    "./templates/claude/plugin/agents/orch-tester.md",
+    "./templates/claude/plugin/agents/orch-reviewer.md",
+    "./templates/claude/plugin/agents/orch-repair.md",
+    "./templates/claude/plugin/agents/orch-final-auditor.md"
+  ]
+}

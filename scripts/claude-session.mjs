@@ -1,0 +1,1 @@
+console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: 'ORCH plugin and standalone skills use the same orch MCP server and project .orch state. Read the canonical workflow before starting work; native execution and permissions require current-host receipts.' } }));

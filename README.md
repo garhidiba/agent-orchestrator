@@ -2,7 +2,7 @@
 
 ORCH is a local coordination runtime for work started inside an existing Codex or Claude Code conversation. The current session stays in charge; MCP manages configuration, task state, Git worktrees, checks, reviews and recovery.
 
-**Development implementation, not a completed v1 release.** Installation readies the MCP; the current conversation connects its native Agent tool automatically before running workers. Defaults inherit host model/effort; unverified concrete pins remain blocked. Deterministic tests alone do not prove native host execution. See [compatibility](docs/compatibility.md) and [acceptance evidence](docs/acceptance.md).
+**Development implementation, not a completed v1 release.** Installation readies the MCP; the current conversation connects its native Agent tool automatically before running workers. Each role resolves its own model/effort from authenticated host capabilities; unsupported pins remain blocked and actual observations stay separate. Deterministic tests alone do not prove native host execution. See [compatibility](docs/compatibility.md) and [acceptance evidence](docs/acceptance.md). The [completion audit](docs/prd-completion.md) tracks the current findings and pending evidence.
 
 ## Install
 
@@ -80,7 +80,7 @@ On an execution request, `$agent-orch` first connects this conversation’s nati
 
 ## CLI and development checks
 
-From the source checkout, these commands inspect settings and hosts. The role listing shows requested policy; metadata does not prove same-session model access.
+From the source checkout, these commands inspect settings and hosts. The role listing shows requested policy; metadata does not prove same-session model access. In the conversation, `orch_doctor` provides a separate read-only composite diagnostic; native readiness still requires the current-host handshake.
 
 ```sh
 npm run orch -- --help
@@ -93,7 +93,7 @@ npm run orch -- configure --profile quality --dry-run
 npm run check
 ```
 
-Remove `--dry-run` only when you intend to apply that project configuration change. Explicit `--global` selects user settings; role pins are preserved by profile configuration. [Configuration](references/configuration.md) covers set/unset, field precedence, session overrides and model validation. No `orch run` command or global `orch` shell executable is installed; use the conversation skills or the source commands above.
+Remove `--dry-run` only when you intend to apply that project configuration change. Explicit `--global` selects user settings; role pins are preserved by profile configuration. The Advisor uses validated catalog/default or comparative evidence to recommend role selections, then applies an authorized recommendation with a fresh configuration hash; a profile label alone does not prove native model application. [Configuration](references/configuration.md) covers set/unset, field precedence, session overrides and model validation. No `orch run` command or global `orch` shell executable is installed; use the conversation skills or the source commands above.
 
 To preview removal and then uninstall both host integrations from this source checkout:
 

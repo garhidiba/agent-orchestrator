@@ -27,3 +27,8 @@ export function readCatalogCache(value: unknown, context: CatalogContext, now = 
   return { ...cache, stale: Date.parse(cache.expiresAt) <= now || cache.models.some(model => model.expiresAt !== null && Date.parse(model.expiresAt) <= now),
     contextMatches: false as const };
 }
+
+export function sameCatalogContext(left: CatalogContext, right: CatalogContext) {
+  const a=catalogContextSchema.parse(left), b=catalogContextSchema.parse(right);
+  return [a,b].every(context=>context.scope==='verified' && context.account!==null && context.workspace!==null && context.authFingerprint!==null && !!context.settingsFingerprint && context.policyFingerprint!=='unknown') && catalogCacheKey(a)===catalogCacheKey(b);
+}

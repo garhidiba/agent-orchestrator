@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "source": {
+      "type": "string",
+      "enum": [
+        "host_status",
+        "host_event"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "const": "running"
+    },
+    "observedAt": {
+      "type": "number",
+      "minimum": 0
+    },
+    "evidenceRef": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    }
+  },
+  "required": [
+    "source",
+    "status",
+    "observedAt",
+    "evidenceRef"
+  ],
+  "additionalProperties": false
+}

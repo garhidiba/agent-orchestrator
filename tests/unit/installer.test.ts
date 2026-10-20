@@ -10,7 +10,12 @@ async function fixture() {
   const source = join(dir, 'source'), bundle = join(dir, 'bundle'), home = join(dir, 'home'), root = join(dir, 'installed');
   for (const path of ['packages/mcp-server/src', 'skills/orch', 'skills/orch-configure', 'references', 'templates/defaults']) await mkdir(join(source, path), { recursive: true });
   await writeFile(join(source, 'package.json'), '{"type":"module","dependencies":{}}');
-  await writeFile(join(source, 'packages/mcp-server/src/stdio.ts'), 'console.log("fixture transport");');
+  await writeFile(join(source, 'packages/mcp-server/src/stdio.ts'), `import readline from 'node:readline';
+for await (const line of readline.createInterface({input:process.stdin})) {
+ const m=JSON.parse(line); if(m.id===undefined) continue;
+ const result=m.method==='initialize'?{protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'orch',version:'fixture'}}:{tools:[{name:'orch_environment',inputSchema:{type:'object'}}]};
+ console.log(JSON.stringify({jsonrpc:'2.0',id:m.id,result}));
+}`);
   await writeFile(join(source, 'skills/orch/SKILL.md'), '# ORCH\n');
   await writeFile(join(source, 'skills/orch-configure/SKILL.md'), '# Configure\n');
   await writeFile(join(source, 'references/workflow.md'), '# Workflow\n');
@@ -35,6 +40,14 @@ test('AT-047: verified immutable install is idempotent and preserves other host 
     assert.match(config, /--host/);
     assert.match(config, /--origin/);
     assert.equal(first.reload, 'NEEDS_RELOAD');
+    const { doctor } = await import('../../packages/installer/src/diagnostics/index.ts');
+    const project = join(f.dir, 'project');
+    await mkdir(join(project, '.codex'), { recursive: true });
+    await writeFile(join(project, '.codex/config.toml'), '[mcp_servers.other]\ncommand="other"\n');
+    const diagnosis = await doctor(project, 'codex', { home: f.home, root: f.root, executable: process.execPath, catalog: false });
+    assert.equal(diagnosis.installation, 'integrity_verified');
+    assert.equal(diagnosis.mcp.status, 'not_run_untrusted');
+    assert.equal(diagnosis.executionReady, false);
     assert.equal(await readFile(join(f.home, '.agents/skills/orch/references/workflow.md'), 'utf8'), '# Workflow\n');
   } finally { await rm(f.dir, { recursive: true, force: true }); }
 });
@@ -142,7 +155,7 @@ test('AT-053/056: shell launcher installs copy assets from a space/Korean path w
     const result = JSON.parse(stdout);
     assert.equal(result.authentication, 'NOT_CHECKED');
     assert.equal(result.execution, 'UNVERIFIED');
-    assert.equal(result.mcp, 'CONFIGURED_NOT_HANDSHAKE_VERIFIED');
+    assert.equal(result.mcp, 'HANDSHAKE_VERIFIED');
     assert.match(await readFile(join(f.home, '.codex/config.toml'), 'utf8'), /orch 설치 space/);
   } finally { await rm(f.dir, { recursive: true, force: true }); }
 });
@@ -323,5 +336,53 @@ test('renaming entry skills migrates owned installs, supports rollback and prese
     assert.equal(await readFile(edited, 'utf8'), 'user-owned edits');
     assert.equal(await readFile(join(f.home, '.codex/config.toml'), 'utf8'), config);
     await assert.rejects(access(join(f.home, '.agents/skills/agent-orch')), { code: 'ENOENT' });
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
+
+test('a broken staged MCP release cannot activate or change existing host files', async () => {
+  const f = await fixture();
+  try {
+    const options = { ...f, hosts: ['codex'] as const, scope: 'user' as const };
+    await install(options);
+    const before = await readFile(join(f.home, '.codex/config.toml'));
+    await writeFile(join(f.source, 'packages/mcp-server/src/stdio.ts'), 'process.exit(3)');
+    const bundle = join(f.dir, 'broken'), checksum = await packRelease(f.source, bundle, '0.2.0');
+    await assert.rejects(install({ ...options, bundle, checksum }), /INSTALL_MCP_VERIFICATION_FAILED/);
+    assert.deepEqual(await readFile(join(f.home, '.codex/config.toml')), before);
+    assert.equal(JSON.parse(await readFile(join(f.root, 'installation.json'), 'utf8')).activeVersion, '0.1.0');
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
+
+test('packaged plugin is self-contained and deterministic after source removal', async () => {
+  const { cp } = await import('node:fs/promises');
+  const { fileURLToPath } = await import('node:url');
+  const f = await fixture();
+  try {
+    const repo = fileURLToPath(new URL('../../', import.meta.url));
+    await cp(join(repo, 'templates/claude'), join(f.source, 'templates/claude'), { recursive: true });
+    await mkdir(join(f.source, 'scripts'));
+    await cp(join(repo, 'scripts/claude-session.mjs'), join(f.source, 'scripts/claude-session.mjs'));
+    const { rename } = await import('node:fs/promises');
+    await rename(join(f.source, 'skills/orch'), join(f.source, 'skills/agent-orch'));
+    await rename(join(f.source, 'skills/orch-configure'), join(f.source, 'skills/agent-orch-configure'));
+    const first = join(f.dir, 'plugin-one'), second = join(f.dir, 'plugin-two');
+    const checksum = await packRelease(f.source, first, '0.3.0');
+    assert.equal(await packRelease(f.source, second, '0.3.0'), checksum);
+    await rm(f.source, { recursive: true, force: true });
+    const manifest = JSON.parse(await readFile(join(first, '.claude-plugin/plugin.json'), 'utf8'));
+    assert.equal(manifest.name, 'orch');
+    assert.equal(manifest.version, '0.3.0');
+    const config = JSON.parse(await readFile(join(first, '.mcp.json'), 'utf8'));
+    assert.deepEqual(config.mcpServers.orch.args, ['${CLAUDE_PLUGIN_ROOT}/packages/mcp-server/src/stdio.ts', '--host', 'claude']);
+    assert.equal(config.mcpServers.orch.command, 'node');
+    assert.match(await readFile(join(first, 'templates/claude/plugin/skills/run/SKILL.md'), 'utf8'), /CLAUDE_PLUGIN_ROOT/);
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const hook = JSON.parse((await promisify(execFile)(process.execPath, [join(first, 'scripts/claude-session.mjs')])).stdout);
+    assert.equal(hook.hookSpecificOutput.hookEventName, 'SessionStart');
+    assert.equal(manifest.agents.length, 8);
+    assert.equal(await readFile(join(first, 'skills/agent-orch/SKILL.md'), 'utf8'), '# ORCH\n');
+    assert.match(await readFile(join(first, 'templates/claude/plugin/agents/orch-reviewer.md'), 'utf8'), /tools: Read, Grep, Glob/);
+    await install({ ...f, bundle: first, checksum, hosts: ['claude'], scope: 'user' });
   } finally { await rm(f.dir, { recursive: true, force: true }); }
 });

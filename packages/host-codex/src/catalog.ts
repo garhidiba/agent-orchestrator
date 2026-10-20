@@ -17,7 +17,8 @@ export async function discoverCodexModels(executable?: string, timeout = 10000, 
   return new Promise((resolve, reject) => {
     const child = spawn(resolved.command, [...resolved.args, 'app-server'], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, cwd: options.cwd, env: resolved.env });
     const decoder = new TextDecoder('utf-8', { fatal: true });
-    let buffer = '', bytes = 0, request = 0, done = false;
+    let buffer = '', bytes = 0, request = 0, done = false, stage = 'initialize';
+    let family: Model['family'] = 'unknown';
     const models = new Map<string, Model>(), cursors = new Set<string>();
     const timer = setTimeout(() => finish(new Error('CATALOG_TIMEOUT')), timeout);
     function finish(error?: Error) {
@@ -40,15 +41,23 @@ export async function discoverCodexModels(executable?: string, timeout = 10000, 
           const raw = buffer.slice(0, line); buffer = buffer.slice(line + 1); if (!raw.trim()) continue;
           const message = z.object({ id: z.number().optional(), error: z.unknown().optional(), result: z.unknown().optional() }).parse(JSON.parse(raw));
           if (message.id !== request) continue;
+          if (stage === 'config') {
+            const config = z.object({ config: z.object({ model_provider: z.string().nullable().optional(), model_providers: z.record(z.string(), z.object({ base_url: z.string().optional() }).passthrough()).optional() }).passthrough() }).safeParse(message.result);
+            if (config.success && config.data.config.model_provider === 'openai') {
+              const override = config.data.config.model_providers?.openai?.base_url;
+              if (override === undefined || override === 'https://api.openai.com/v1') family = 'openai';
+            }
+            stage = 'models'; send('model/list', { limit: 100, includeHidden: true }); continue;
+          }
           check(!message.error && message.result, 'CATALOG_RPC_FAILED');
-          if (request === 1) { send('initialized', {}, true); send('model/list', { limit: 100, includeHidden: true }); continue; }
+          if (stage === 'initialize') { send('initialized', {}, true); stage = 'config'; send('config/read', { includeLayers: false }); continue; }
           const page = pageSchema.parse(message.result);
           for (const entry of page.data) {
             const fetchedAt = new Date().toISOString();
             models.set(entry.id, { host: 'codex', id: entry.id, displayName: entry.displayName ?? entry.id, resolvedId: entry.model ?? null,
-              family: 'unknown', support: 'advertised', access: 'unknown', availability: 'unknown',
+              family, support: 'advertised', access: 'unknown', availability: 'unknown',
               efforts: entry.supportedReasoningEfforts?.map(item => item.reasoningEffort) ?? null, defaultEffort: entry.defaultReasoningEffort ?? null,
-              hidden: entry.hidden ?? false, source: 'codex app-server model/list', sourceVersion: null, fetchedAt, expiresAt: new Date(Date.parse(fetchedAt) + 86400000).toISOString(), evidence: [] });
+              hidden: entry.hidden ?? false, source: 'codex app-server model/list', sourceVersion: null, fetchedAt, expiresAt: new Date(Date.parse(fetchedAt) + 86400000).toISOString(), evidence: family === 'openai' ? [{ kind: 'provider', ref: 'codex app-server config/read:openai' }] : [] });
           }
           const cursor = page.nextCursor;
           if (cursor == null) { finish(); return; }
