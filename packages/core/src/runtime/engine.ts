@@ -19,6 +19,8 @@ export type Run = {
   integration: string; integrationPath: string; managedRoot: string; state: string; config: Config;
   plan: Plan | null; tasks: Record<string, Work>; gates: Gate[]; findings: Finding[];
   reviews: { sha: string; reviewer: string; final: boolean }[]; reviewRound: number;
+  conflict?: { path: string; branch: string; taskId: string; expected: string; taskHead: string };
+  candidates?: { path: string; branch: string }[];
   createdAt: string; pausedFrom?: string; cleanup: { path: string; status: string; reason: string | null }[];
 };
 export type NativeCapability = {
@@ -29,6 +31,7 @@ export type NativeCapability = {
 export class Engine {
   store: Store;
   readonly native: NativeCapability | null;
+  activeOperation: string | null = null;
   constructor(statePath: string, native: NativeCapability | null = null) { this.store = new Store(statePath); this.native = native; }
   status(run: string) { return this.store.get<Run>(id.parse(run)); }
   async create(origin: string, configInput: unknown, host: 'codex' | 'claude', managedRoot: string, trustedCommandsHash: string) {
@@ -59,15 +62,62 @@ export class Engine {
     await mkdir(mutex).catch(() => { throw new Error('OPERATION_LOCKED'); });
     try {
       const current = this.status(runId);
-      const previous = this.store.intent(runId, operation, input);
+      const prior = this.store.operation(runId, operation);
+      if (!prior) check(current.version === expected, 'STATE_CONFLICT');
+      const previous = this.store.intent(runId, operation, input, current);
       if (previous) {
         check(previous.status === 'complete', 'RECONCILIATION_REQUIRED');
         return previous.result;
       }
-      check(current.version === expected, 'STATE_CONFLICT');
+      this.activeOperation = operation;
       const result = await fn(current.data);
       const response = { version: current.version + 1, result };
       return this.store.save(runId, current.version, current.data, 'run.changed', operation, response);
+    } finally { this.activeOperation = null; await rmdir(mutex); }
+  }
+  checkpointIntent(run: Run) {
+    check(this.activeOperation, 'OPERATION_REQUIRED');
+    const version = this.status(run.id).version;
+    this.store.db.prepare('UPDATE operations SET snapshot=? WHERE run_id=? AND id=?').run(JSON.stringify({ version, data: run }), run.id, this.activeOperation);
+  }
+  async reconcile(runId: string, operationId: string, previousCoordinatorStopped: boolean) {
+    check(previousCoordinatorStopped, 'COORDINATOR_STOP_UNCONFIRMED');
+    const current = this.status(runId);
+    const mutex = join(current.data.commonDir, 'orch', 'locks', 'operation');
+    const owner = JSON.parse(await readFile(join(current.data.commonDir, 'orch', 'locks', 'write.json'), 'utf8')) as { runId: string };
+    check(owner.runId === runId, 'LOCK_OWNERSHIP_MISMATCH');
+    // Explicit host confirmation permits removing only this empty operation mutex.
+    await rmdir(mutex).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    await mkdir(mutex);
+    try {
+      const pending = this.store.pending(runId).find(item => item.id === operationId); check(pending, 'OPERATION_NOT_PENDING');
+      const prior = pending.snapshot as { version: number; data: Run } | null;
+      check(prior && prior.version === current.version, 'RECONCILIATION_STATE_DIVERGED');
+      const request = pending.input as { tool?: string; input?: { task_id?: string; unit_id?: string; expected_integration_sha?: string } };
+      const run = prior.data, task = request.input?.task_id ? run.tasks[request.input.task_id] : null;
+      let result: unknown;
+      if (request.tool === 'orch_task_commit' && task) {
+        const unit = request.input?.unit_id; check(unit && task.spec.commit_units.some(item => item.id === unit), 'UNKNOWN_UNIT');
+        const head = await git(task.path, 'rev-parse', 'HEAD'), message = await git(task.path, 'show', '-s', '--format=%B', head);
+        check(message.includes(`Orch-Run: ${run.id}\n`) && message.includes(`Orch-Task: ${task.spec.id}\n`) && `${message}\n`.includes(`Orch-Unit: ${unit}\n`), 'RECOVERY_COMMIT_NOT_PROVEN');
+        check((await changedPaths(task.path, task.base)).every(path => owns(task.spec.write_paths, path)), 'OWNERSHIP_VIOLATION');
+        task.units[unit] = head; task.validated = null; result = { sha: head, recovered: true };
+      } else if (request.tool === 'orch_integrate' && task) {
+        const head = await git(run.integrationPath, 'rev-parse', 'HEAD'), parents = (await git(run.integrationPath, 'show', '-s', '--format=%P', head)).split(' ');
+        check(parents.length === 2 && parents[0] === request.input?.expected_integration_sha && parents[1] === await git(task.path, 'rev-parse', 'HEAD'), 'RECOVERY_MERGE_NOT_PROVEN');
+        task.state = 'INTEGRATED'; run.reviews = [];
+        run.state = Object.values(run.tasks).every(item => item.state === 'INTEGRATED') ? 'VERIFYING' : 'EXECUTING'; result = { sha: head, recovered: true };
+      } else if (request.tool === 'orch_task_prepare' && task) {
+        const repo = await inspectRepository(task.path);
+        check(repo.commonDir === run.commonDir && repo.branch === task.branch && repo.head === task.base && !repo.dirty && task.state === 'LEASED', 'RECOVERY_WORKTREE_NOT_PROVEN');
+        // The caller never received the lost dispatch; retain its lease, do not start another worker.
+        result = { recovered: true, task, requiresNativeStateCheck: true };
+      } else if (request.tool === 'orch_finalize') {
+        const head = await git(run.integrationPath, 'rev-parse', 'HEAD');
+        check(await git(run.origin, 'rev-parse', 'HEAD') === head && run.gates.some(gate => gate.stage === 'final' && gate.sha === head && gate.status === 'passed'), 'RECOVERY_FINALIZE_NOT_PROVEN');
+        run.state = 'COMPLETED'; result = { sha: head, recovered: true };
+      } else throw new Error('RECOVERY_REQUIRES_MANUAL_RECONCILIATION');
+      return this.store.save(runId, current.version, run, 'run.reconciled', operationId, { version: current.version + 1, result });
     } finally { await rmdir(mutex); }
   }
   async gate(run: Run, stage: string, path: string, task: string | null = null) {
@@ -101,9 +151,10 @@ export class Engine {
     if (!approved) { run.state = 'PLAN_READY'; return { state: run.state }; }
     const baseline = await this.gate(run, 'baseline', run.origin);
     if (baseline.status !== 'passed') { run.state = 'BLOCKED_BASELINE'; return baseline; }
-    await git(run.origin, 'worktree', 'add', '-b', run.integration, run.integrationPath, run.targetBase);
     for (const task of plan.tasks) run.tasks[task.id] = { spec: task, state: 'PENDING', base: '', path: '', branch: '', attempt: 0, lease: '', expires: 0, nativeId: null, units: {}, validated: null };
-    run.state = 'EXECUTING'; return { state: run.state };
+    run.state = 'EXECUTING'; this.checkpointIntent(run);
+    await git(run.origin, 'worktree', 'add', '-b', run.integration, run.integrationPath, run.targetBase);
+    return { state: run.state };
   }
   async prepare(run: Run, taskId: string) {
     check(run.state === 'EXECUTING', 'INVALID_RUN_STATE');
@@ -124,8 +175,8 @@ export class Engine {
     task.branch = `orch/${run.id}/task/${taskId}-${task.attempt}`;
     task.path = join(run.managedRoot, run.id, `${taskId}-${task.attempt}`);
     check(within(run.managedRoot, task.path), 'WORKTREE_ROOT_UNSAFE');
+    task.state = 'LEASED'; this.checkpointIntent(run);
     await git(run.origin, 'worktree', 'add', '-b', task.branch, task.path, task.base);
-    task.state = 'LEASED';
     return { runId: run.id, taskId, attemptId: `${taskId}-${task.attempt}`, host: run.host, role: task.spec.role,
       modelId: this.native.model, effort: this.native.effort, baseSha: task.base, worktreePath: task.path,
       isolation: 'core_managed', leaseId: task.lease, fencingToken: task.attempt, expiresAt: new Date(task.expires).toISOString(), taskBrief: task.spec };
@@ -145,6 +196,7 @@ export class Engine {
     return { state: task.state };
   }
   async validate(run: Run, taskId: string, lease: string, generation: number) {
+    check(run.state === 'EXECUTING', 'INVALID_RUN_STATE');
     const task = this.leased(run, taskId, lease, generation);
     check(task.state === 'RUNNING', 'INVALID_TASK_STATE');
     const paths = await changedPaths(task.path, task.base);
@@ -154,6 +206,7 @@ export class Engine {
     return gate;
   }
   async commit(run: Run, taskId: string, lease: string, generation: number, unit: string) {
+    check(run.state === 'EXECUTING', 'INVALID_RUN_STATE');
     const task = this.leased(run, taskId, lease, generation);
     check(task.state === 'RUNNING', 'INVALID_TASK_STATE');
     const spec = task.spec.commit_units.find(candidate => candidate.id === unit); check(spec, 'UNKNOWN_UNIT');
@@ -164,6 +217,7 @@ export class Engine {
     check((await changedPaths(task.path, task.base)).every(path => owns(task.spec.write_paths, path)), 'OWNERSHIP_VIOLATION');
     await git(task.path, 'add', '--', ...paths);
     await git(task.path, 'diff', '--cached', '--check');
+    this.checkpointIntent(run);
     await git(task.path, 'commit', '-m', `${spec.purpose}\n\nOrch-Run: ${run.id}\nOrch-Task: ${taskId}\nOrch-Unit: ${unit}`);
     const sha = await git(task.path, 'rev-parse', 'HEAD'); task.units[unit] = sha; task.validated = null;
     return { sha };
@@ -179,16 +233,50 @@ export class Engine {
     task.state = 'MERGE_QUEUED'; return { state: task.state };
   }
   async integrate(run: Run, taskId: string, expectedSha: string) {
+    check(run.state === 'EXECUTING', 'INVALID_RUN_STATE');
     const task = run.tasks[taskId]; check(task?.state === 'MERGE_QUEUED', 'TASK_NOT_READY');
     check(await git(run.integrationPath, 'rev-parse', 'HEAD') === expectedSha, 'INTEGRATION_DRIFT');
     check(!(await inspectRepository(run.integrationPath)).dirty, 'DIRTY_CHECKOUT');
-    try { await git(run.integrationPath, 'merge', '--no-ff', '--no-edit', task.branch); }
-    catch { run.state = 'BLOCKED_CONFLICT'; return { state: run.state, preserved: run.integrationPath, expectedSha, taskHead: await git(task.path, 'rev-parse', 'HEAD') }; }
+    const taskHead = await git(task.path, 'rev-parse', 'HEAD');
+    const candidate = { path: join(run.managedRoot, run.id, `conflict-${this.activeOperation}`), branch: `orch/${run.id}/conflict/${this.activeOperation}` };
+    run.candidates ??= []; run.candidates.push(candidate);
+    this.checkpointIntent(run);
+    await git(run.origin, 'worktree', 'add', '-b', candidate.branch, candidate.path, expectedSha);
+    try { await git(candidate.path, 'merge', '--no-ff', '--no-edit', task.branch); }
+    catch {
+      run.conflict = { ...candidate, taskId, expected: expectedSha, taskHead }; run.state = 'BLOCKED_CONFLICT';
+      return { state: run.state, preserved: candidate.path, expectedSha, taskHead };
+    }
+    await git(run.integrationPath, 'merge', '--ff-only', candidate.branch);
     const parents = (await git(run.integrationPath, 'show', '-s', '--format=%P', 'HEAD')).split(' ');
     check(parents.includes(expectedSha) && parents.includes(await git(task.path, 'rev-parse', 'HEAD')), 'MERGE_PARENTS_MISMATCH');
     task.state = 'INTEGRATED'; run.reviews = [];
     if (Object.values(run.tasks).every(work => work.state === 'INTEGRATED')) run.state = 'VERIFYING';
     return { sha: await git(run.integrationPath, 'rev-parse', 'HEAD'), state: run.state };
+  }
+  async resolveConflict(run: Run, nativeStopped: boolean) {
+    check(run.state === 'BLOCKED_CONFLICT' && run.conflict && nativeStopped, 'CONFLICT_RESOLUTION_NOT_READY');
+    const conflict = run.conflict, task = run.tasks[conflict.taskId];
+    const repo = await inspectRepository(conflict.path);
+    check(repo.commonDir === run.commonDir && repo.branch === conflict.branch && repo.head === conflict.expected, 'CONFLICT_BASE_MISMATCH');
+    check(await git(run.integrationPath, 'rev-parse', 'HEAD') === conflict.expected, 'INTEGRATION_DRIFT');
+    check(await git(conflict.path, 'rev-parse', '--verify', 'MERGE_HEAD') === conflict.taskHead, 'CONFLICT_PARENT_MISMATCH');
+    const paths = await changedPaths(conflict.path);
+    const allowed = Object.values(run.tasks).filter(work => work.state === 'INTEGRATED' || work === task).flatMap(work => work.spec.write_paths);
+    check(paths.every(path => owns(allowed, path)), 'OWNERSHIP_VIOLATION');
+    if (paths.length) await git(conflict.path, 'add', '--', ...paths);
+    await git(conflict.path, 'diff', '--cached', '--check');
+    check(await git(conflict.path, 'diff', '--name-only', '--diff-filter=U') === '', 'CONFLICT_UNRESOLVED');
+    const gate = await this.gate(run, 'integration', conflict.path);
+    if (gate.status !== 'passed') return gate;
+    this.checkpointIntent(run);
+    await git(conflict.path, 'commit', '--no-edit');
+    const parents = (await git(conflict.path, 'show', '-s', '--format=%P', 'HEAD')).split(' ');
+    check(parents.length === 2 && parents[0] === conflict.expected && parents[1] === conflict.taskHead, 'MERGE_PARENTS_MISMATCH');
+    await git(run.integrationPath, 'merge', '--ff-only', conflict.branch);
+    task.state = 'INTEGRATED'; run.conflict = undefined; run.reviews = [];
+    run.state = Object.values(run.tasks).every(work => work.state === 'INTEGRATED') ? 'VERIFYING' : 'EXECUTING';
+    return { state: run.state, sha: await git(run.integrationPath, 'rev-parse', 'HEAD') };
   }
   async verify(run: Run) {
     check(run.state === 'VERIFYING' || run.state === 'REVIEWING', 'INVALID_RUN_STATE');
@@ -238,12 +326,13 @@ export class Engine {
     check(run.reviews.some(review => review.sha === head && review.final), 'REVIEW_STALE');
     const gate = await this.gate(run, 'final', run.integrationPath);
     if (gate.status !== 'passed') { run.state = 'BLOCKED_TESTS'; return gate; }
+    this.checkpointIntent(run);
     await git(run.origin, 'merge', '--ff-only', run.integration);
     check(await git(run.origin, 'rev-parse', 'HEAD') === head, 'FINALIZE_MISMATCH');
     run.state = 'COMPLETED'; return { sha: head, cleanupStatus: 'not_requested' };
   }
   async cleanup(run: Run, dryRun = true) {
-    const resources = [...Object.values(run.tasks).filter(task => task.path).map(task => ({ path: task.path, branch: task.branch, active: ['LEASED', 'RUNNING', 'ORPHANED_UNKNOWN'].includes(task.state) })), { path: run.integrationPath, branch: run.integration, active: false }];
+    const resources = [...(run.candidates ?? []).map(candidate => ({ ...candidate, active: false })), ...Object.values(run.tasks).filter(task => task.path).map(task => ({ path: task.path, branch: task.branch, active: ['LEASED', 'RUNNING', 'ORPHANED_UNKNOWN'].includes(task.state) })), { path: run.integrationPath, branch: run.integration, active: false }];
     const results: Run['cleanup'] = [];
     for (const item of resources) {
       let reason: string | null = null;

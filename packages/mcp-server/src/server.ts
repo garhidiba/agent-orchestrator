@@ -76,6 +76,8 @@ export async function createServer(origin: string, host: 'codex' | 'claude', man
   mutation('orch_task_commit', { ...lease, unit_id: id }, (run, data) => runtime().commit(run, data.task_id, data.lease_id, data.fencing_token, data.unit_id));
   mutation('orch_task_complete', { ...lease, native_stopped: z.boolean() }, (run, data) => runtime().complete(run, data.task_id, data.lease_id, data.fencing_token, data.native_stopped));
   mutation('orch_integrate', { task_id: id, expected_integration_sha: z.string() }, (run, data) => runtime().integrate(run, data.task_id, data.expected_integration_sha));
+  mutation('orch_conflict_resolve', { native_stopped: z.boolean() }, (run, data) => runtime().resolveConflict(run, data.native_stopped));
+  register('orch_reconcile', { ...auth, run_id: id, operation_id: id, previous_coordinator_stopped: z.boolean() }, async data => { authenticate(data.coordinator_token); return runtime().reconcile(data.run_id, data.operation_id, data.previous_coordinator_stopped); });
   mutation('orch_verify', {}, run => runtime().verify(run));
   register('orch_review_snapshot', scoped, async data => {
     const snapshot = runtime().status(data.run_id); return { version: snapshot.version, plan: snapshot.data.plan, gates: snapshot.data.gates, findings: snapshot.data.findings, integrationPath: snapshot.data.integrationPath };

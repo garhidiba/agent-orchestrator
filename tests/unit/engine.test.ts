@@ -66,3 +66,61 @@ test('unverified capabilities block dispatch and stale lease cannot bind', async
     assert.equal(f.engine.status(f.created.runId).data.tasks.T1.state, 'PENDING');
   } finally { await f.close(); }
 });
+
+test('crash after Git commit or merge reconciles durable intent without repeating history', async () => {
+  const f = await fixture();
+  try {
+    f.plan.tasks = [f.plan.tasks[0]];
+    await f.change({ action: 'plan' }, run => f.engine.plan(run, f.plan, true));
+    await f.change({ action: 'prepare' }, run => f.engine.prepare(run, 'T1'));
+    const task = f.engine.status(f.created.runId).data.tasks.T1;
+    await f.change({ action: 'bind' }, run => f.engine.bind(run, 'T1', task.lease, task.attempt, 'native-T1', 'fixture-model', 'high'));
+    await writeFile(join(task.path, 'T1.txt'), 'feature');
+    await f.change({ action: 'validate' }, run => f.engine.validate(run, 'T1', task.lease, task.attempt));
+    const save = f.engine.store.save.bind(f.engine.store);
+    const commitInput = { tool: 'orch_task_commit', input: { task_id: 'T1', unit_id: 'U1' } };
+    f.engine.store.save = () => { throw new Error('simulated DB crash'); };
+    const before = f.engine.status(f.created.runId).version;
+    await assert.rejects(f.engine.change(f.created.runId, 'crashed-commit', before, commitInput, run => f.engine.commit(run, 'T1', task.lease, task.attempt, 'U1')), /simulated DB crash/);
+    f.engine.store.save = save;
+    const sha = await git(task.path, 'rev-parse', 'HEAD');
+    await f.engine.reconcile(f.created.runId, 'crashed-commit', true);
+    assert.equal(f.engine.status(f.created.runId).data.tasks.T1.units.U1, sha);
+    await f.engine.change(f.created.runId, 'crashed-commit', before, commitInput, async () => { throw new Error('must not replay'); });
+    assert.equal(await git(task.path, 'rev-parse', 'HEAD'), sha);
+    await f.change({ action: 'complete' }, run => f.engine.complete(run, 'T1', task.lease, task.attempt, true));
+    const expected = await git(f.engine.status(f.created.runId).data.integrationPath, 'rev-parse', 'HEAD');
+    f.engine.store.save = () => { throw new Error('simulated DB crash'); };
+    await assert.rejects(f.engine.change(f.created.runId, 'crashed-merge', f.engine.status(f.created.runId).version,
+      { tool: 'orch_integrate', input: { task_id: 'T1', expected_integration_sha: expected } }, run => f.engine.integrate(run, 'T1', expected)), /simulated DB crash/);
+    f.engine.store.save = save;
+    const merged = await git(f.engine.status(f.created.runId).data.integrationPath, 'rev-parse', 'HEAD');
+    await f.engine.reconcile(f.created.runId, 'crashed-merge', true);
+    assert.equal(f.engine.status(f.created.runId).data.tasks.T1.state, 'INTEGRATED');
+    assert.equal(await git(f.engine.status(f.created.runId).data.integrationPath, 'rev-parse', 'HEAD'), merged);
+  } finally { await f.close(); }
+});
+
+test('dirty original, task ownership violations, unconfirmed stop and source changes fail closed', async () => {
+  const f = await fixture();
+  try {
+    await f.change({ action: 'plan' }, run => f.engine.plan(run, f.plan, true));
+    await f.change({ action: 'prepare' }, run => f.engine.prepare(run, 'T1'));
+    const task = f.engine.status(f.created.runId).data.tasks.T1;
+    await f.change({ action: 'bind' }, run => f.engine.bind(run, 'T1', task.lease, task.attempt, 'native-T1', 'fixture-model', 'high'));
+    await writeFile(join(task.path, 'outside.txt'), 'keep');
+    await assert.rejects(f.change({ action: 'validate-outside' }, run => f.engine.validate(run, 'T1', task.lease, task.attempt)), /OWNERSHIP_VIOLATION/);
+    await rm(join(task.path, 'outside.txt'));
+    await writeFile(join(task.path, 'T1.txt'), 'feature');
+    await f.change({ action: 'validate' }, run => f.engine.validate(run, 'T1', task.lease, task.attempt));
+    await writeFile(join(task.path, 'T1.txt'), 'changed after validation');
+    await assert.rejects(f.change({ action: 'commit' }, run => f.engine.commit(run, 'T1', task.lease, task.attempt, 'U1')), /VALIDATION_STALE/);
+    await assert.rejects(f.change({ action: 'complete' }, run => f.engine.complete(run, 'T1', task.lease, task.attempt, false)), /WORKER_STOP_UNCONFIRMED/);
+    await f.change({ action: 'pause' }, run => f.engine.control(run, 'pause'));
+    assert.equal(f.engine.status(f.created.runId).data.tasks.T1.state, 'ORPHANED_UNKNOWN');
+    await assert.rejects(f.change({ action: 'resume' }, run => f.engine.control(run, 'resume')), /ORPHANED_UNKNOWN/);
+    const dry = await f.engine.cleanup(f.engine.status(f.created.runId).data);
+    assert.equal(dry.every(item => item.status === 'preserved'), true);
+    assert.equal(await import('node:fs/promises').then(fs => fs.readFile(join(task.path, 'T1.txt'), 'utf8')), 'changed after validation');
+  } finally { await f.close(); }
+});
