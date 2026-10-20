@@ -11,3 +11,4 @@ coverage/
 .orch/generated/
 *.log
 .orch/installation/
+.orch/config.yaml
