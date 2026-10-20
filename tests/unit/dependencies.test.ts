@@ -1,16 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, writeFile, readFile, lstat, realpath, rm, symlink } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, lstat, realpath, rm, rename, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { runtimeFixture } from '../fixtures/runtime.ts';
 import { git } from '../../packages/core/src/git/repository.ts';
 
-async function nodeFixture(ignore: boolean | string = true) {
+async function nodeFixture(ignore: boolean | string = true, manifest: object = { dependencies: { 'orch-disposable-dependency': '1.0.0' } }) {
   const f = await runtimeFixture(true, { quality: { commands: [{ id: 'unit', executable: process.execPath,
     args: ['-e', 'if (require("orch-disposable-dependency") !== 42) process.exit(1)'], cwd: '.',
     stages: ['baseline', 'task', 'integration', 'final'], required: true, timeout_seconds: 5 }] } });
   await writeFile(join(f.root, '.gitignore'), `.orch/state/\n${typeof ignore === 'string' ? ignore : ignore ? 'node_modules\n' : ''}`);
-  await writeFile(join(f.root, 'package.json'), '{"dependencies":{"orch-disposable-dependency":"1.0.0"}}');
+  await writeFile(join(f.root, 'package.json'), JSON.stringify(manifest));
   await writeFile(join(f.root, 'package-lock.json'), '{"lockfileVersion":3}');
   await mkdir(join(f.root, 'packages', 'child'), { recursive: true });
   await writeFile(join(f.root, 'packages', 'child', 'package.json'), '{"name":"child"}');
@@ -100,6 +100,72 @@ test('gates report an origin dependency directory removed after preparation', as
     const task = f.engine.status(f.created.runId).data.tasks.T1;
     await rm(join(f.root, 'node_modules'), { recursive: true });
     await assert.rejects(f.change({ action: 'gate' }, run => f.engine.gate(run, 'task', task.path, 'T1')), /BLOCKED_DEPENDENCY_SETUP_ORIGIN_MISSING/);
+  } finally { await f.close(); }
+});
+
+for (const manifest of [{ workspaces: ['packages/*'] }, ...['workspace:*', 'file:packages/child', 'link:packages/child'].map(version => ({ dependencies: { child: version } }))]) {
+  test(`prepare rejects local source dependency declarations ${JSON.stringify(manifest)}`, async () => {
+    const f = await nodeFixture(true, manifest);
+    try {
+      await assert.rejects(f.change({ action: 'prepare' }, run => f.engine.prepare(run, 'T1')), /BLOCKED_DEPENDENCY_SETUP_LOCAL_SOURCE/);
+      assert.equal(f.engine.status(f.created.runId).data.tasks.T1.state, 'PENDING');
+    } finally { await f.close(); }
+  });
+}
+
+test('prepare rejects installed dependency links to origin workspace code', async () => {
+  const f = await nodeFixture();
+  try {
+    await writeFile(join(f.root, 'packages', 'child', 'index.js'), 'module.exports = 42;');
+    await symlink(join(f.root, 'packages', 'child'), join(f.root, 'node_modules', 'orch-local-source'), process.platform === 'win32' ? 'junction' : 'dir');
+    await writeFile(join(f.root, 'node_modules', 'orch-disposable-dependency', 'index.js'), 'module.exports = require("orch-local-source");');
+    await assert.rejects(f.change({ action: 'prepare' }, run => f.engine.prepare(run, 'T1')), /BLOCKED_DEPENDENCY_SETUP_EXTERNAL_LINK/);
+  } finally { await f.close(); }
+});
+
+test('prepare accepts dependency links contained within the installed dependency root', async () => {
+  const f = await nodeFixture();
+  try {
+    const installed = join(f.root, 'node_modules'), stored = join(installed, '.store', 'orch-disposable-dependency');
+    await mkdir(join(installed, '.store'));
+    await rename(join(installed, 'orch-disposable-dependency'), stored);
+    await symlink(stored, join(installed, 'orch-disposable-dependency'), process.platform === 'win32' ? 'junction' : 'dir');
+    await f.change({ action: 'prepare' }, run => f.engine.prepare(run, 'T1'));
+    const task = f.engine.status(f.created.runId).data.tasks.T1;
+    const gate = await f.change({ action: 'gate' }, run => f.engine.gate(run, 'task', task.path, 'T1'));
+    assert.equal(gate.result.status, 'passed');
+  } finally { await f.close(); }
+});
+
+test('gates block a shared dependency link when the origin dependency alias loses its target', async () => {
+  const f = await nodeFixture();
+  try {
+    const dependencies = join(f.dir, 'installed-dependencies');
+    await rename(join(f.root, 'node_modules'), dependencies);
+    await symlink(dependencies, join(f.root, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
+    await f.change({ action: 'prepare' }, run => f.engine.prepare(run, 'T1'));
+    const task = f.engine.status(f.created.runId).data.tasks.T1;
+    await rm(dependencies, { recursive: true });
+    await assert.rejects(f.change({ action: 'gate' }, run => f.engine.gate(run, 'task', task.path, 'T1')), /BLOCKED_DEPENDENCY_SETUP_ORIGIN_MISSING/);
+    await assert.rejects(f.change({ action: 'integration-gate' }, run => f.engine.gate(run, 'integration', run.integrationPath)), /BLOCKED_DEPENDENCY_SETUP_ORIGIN_MISSING/);
+  } finally { await f.close(); }
+});
+
+test('gates reject a previously shared canonical link when the origin installation changes', async () => {
+  const f = await nodeFixture();
+  try {
+    const previous = join(f.dir, 'previous');
+    await rename(join(f.root, 'node_modules'), previous);
+    await symlink(previous, join(f.root, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
+    await f.change({ action: 'prepare' }, run => f.engine.prepare(run, 'T1'));
+    const task = f.engine.status(f.created.runId).data.tasks.T1;
+    await rm(join(task.path, 'node_modules'));
+    await symlink(task.dependencySetup!.source, join(task.path, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
+    const replacement = join(f.dir, 'replacement');
+    await mkdir(replacement);
+    await rm(join(f.root, 'node_modules'));
+    await symlink(replacement, join(f.root, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
+    await assert.rejects(f.change({ action: 'gate' }, run => f.engine.gate(run, 'task', task.path, 'T1')), /BLOCKED_DEPENDENCY_SETUP_SOURCE_CHANGED/);
   } finally { await f.close(); }
 });
 

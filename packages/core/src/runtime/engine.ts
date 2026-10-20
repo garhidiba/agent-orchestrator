@@ -180,7 +180,7 @@ export class Engine {
       } else if (request.tool === 'orch_task_prepare' && task) {
         const repo = await inspectRepository(task.path);
         check(repo.commonDir === run.commonDir && repo.branch === task.branch && repo.head === (task.dispatchBase ?? task.base) && !repo.dirty && task.state === 'LEASED', 'RECOVERY_WORKTREE_NOT_PROVEN');
-        task.dependencySetup = await prepareNodeDependencies(run.origin, task.path);
+        task.dependencySetup = await prepareNodeDependencies(run.origin, task.path, task.dependencySetup);
         // The caller never received the lost dispatch; retain its lease, do not start another worker.
         result = { recovered: true, task, requiresNativeStateCheck: true };
       } else if (request.tool === 'orch_reintegrate') {
@@ -206,7 +206,7 @@ export class Engine {
   }
   async gate(run: Run, stage: string, path: string, task: string | null = null) {
     enforceRunBudget(run);
-    await prepareNodeDependencies(run.origin, path);
+    await prepareNodeDependencies(run.origin, path, task ? run.tasks[task].dependencySetup : null);
     let commands = run.config.quality.commands.filter(command => command.stages.includes(stage as 'baseline') && (task === null || run.tasks[task].spec.verification_ids.includes(command.id)));
     if (!commands.length && run.missingTestsWaiver) commands = [{ id: 'missing-tests', executable: process.execPath, args: [], cwd: '.', stages: ['baseline', 'task', 'integration', 'final'], required: true, timeout_seconds: 1 }];
     check(commands.some(command => command.required), 'REQUIRED_GATES_MISSING');
@@ -327,7 +327,7 @@ export class Engine {
     task.validated = null; task.observedModel = null; task.observedEffort = null; task.modelObservation = undefined; task.nativeBootstrap = undefined; task.resources = undefined;
     task.state = 'LEASED'; task.nativeId = null; this.checkpointIntent(run);
     if (!reuse || createRecovered) await git(run.origin, 'worktree', 'add', '-b', task.branch, task.path, task.dispatchBase ?? task.base);
-    task.dependencySetup = await prepareNodeDependencies(run.origin, task.path);
+    task.dependencySetup = await prepareNodeDependencies(run.origin, task.path, task.dependencySetup);
     const reservation = await reservePort();
     try { task.resources = await allocateAttemptResources(run.origin, run.id, attemptKey(taskId, task.attempt), { host: reservation.host, port: reservation.port }); }
     catch (error) { await reservation.release(); throw error; }

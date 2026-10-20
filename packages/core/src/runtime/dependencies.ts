@@ -1,6 +1,6 @@
-import { lstat, readFile, readlink, realpath, stat, symlink } from 'node:fs/promises';
-import { basename, join } from 'node:path';
-import { git } from '../git/repository.ts';
+import { lstat, readFile, readdir, readlink, realpath, stat, symlink } from 'node:fs/promises';
+import { basename, join, resolve, toNamespacedPath } from 'node:path';
+import { git, within } from '../git/repository.ts';
 import { hash } from '../state/store.ts';
 import { requireCondition as check } from '../../../protocol/src/runtime.ts';
 
@@ -17,20 +17,31 @@ async function entry(path: string) {
 
 export type DependencySetup = { method: 'shared_origin_symlink'; source: string; target: string; inputsFingerprint: string; mutationPolicy: 'preserve_source_dependencies' };
 
-export async function prepareNodeDependencies(origin: string, target: string): Promise<DependencySetup | null> {
+export async function prepareNodeDependencies(origin: string, target: string, previous?: DependencySetup | null): Promise<DependencySetup | null> {
   if (origin === target || !await optionalFile(join(target, 'package.json'))) return null;
   const sourcePath = join(origin, 'node_modules'), targetPath = join(target, 'node_modules');
   const existing = await entry(targetPath);
   const source = await realpath(sourcePath).catch(() => null);
-  const shared = existing?.isSymbolicLink() && (source && await realpath(targetPath).catch(() => null) === source || await readlink(targetPath) === sourcePath);
+  const targetSource = existing?.isSymbolicLink() ? await realpath(targetPath).catch(() => null) : null;
+  const linked = existing?.isSymbolicLink() ? toNamespacedPath(resolve(target, await readlink(targetPath))) : null;
+  const shared = existing?.isSymbolicLink() && (source && targetSource === source ||
+    linked === toNamespacedPath(sourcePath) || previous && linked === toNamespacedPath(previous.source));
   // Keep user-owned directories and links, including dangling links, untouched.
   if (existing && !shared) return null;
+  check(!existing || !source || targetSource === source, 'BLOCKED_DEPENDENCY_SETUP_SOURCE_CHANGED');
+  const manifest = JSON.parse(await readFile(join(target, 'package.json'), 'utf8'));
+  const versions = Object.values({ ...manifest.dependencies, ...manifest.devDependencies, ...manifest.optionalDependencies, ...manifest.peerDependencies });
+  check(!('workspaces' in manifest) && !versions.some(version => typeof version === 'string' && /^(workspace:|file:|link:|\.\.?[\\/]|[\\/])/.test(version)), 'BLOCKED_DEPENDENCY_SETUP_LOCAL_SOURCE');
   if (!source) {
-    const manifest = JSON.parse((await readFile(join(target, 'package.json'))).toString());
-    check(!Object.keys({ ...manifest.dependencies, ...manifest.devDependencies, ...manifest.optionalDependencies }).length, 'BLOCKED_DEPENDENCY_SETUP_ORIGIN_MISSING');
+    check(!versions.length, 'BLOCKED_DEPENDENCY_SETUP_ORIGIN_MISSING');
     return null;
   }
   check((await stat(source)).isDirectory(), 'BLOCKED_DEPENDENCY_SETUP_ORIGIN_INVALID');
+  for (const file of await readdir(source, { recursive: true, withFileTypes: true })) {
+    if (!file.isSymbolicLink()) continue;
+    const linked = await realpath(join(file.parentPath, file.name)).catch(() => null);
+    check(linked && (linked === source || within(source, linked)), 'BLOCKED_DEPENDENCY_SETUP_EXTERNAL_LINK');
+  }
   const tracked = await Promise.all([origin, target].map(path => git(path, 'ls-files', '-z')));
   const files = [...new Set([...rootInputs, ...tracked.flatMap(paths => paths.split('\0').filter(dependencyInput))])].sort();
   const inputs: [string, string | null][] = [];
@@ -41,6 +52,6 @@ export async function prepareNodeDependencies(origin: string, target: string): P
   }
   check(!tracked[1].split('\0').some(path => path === 'node_modules' || path.startsWith('node_modules/')), 'BLOCKED_DEPENDENCY_SETUP_TRACKED_TARGET');
   await git(target, 'check-ignore', '--quiet', 'node_modules').catch(() => { throw new Error('BLOCKED_DEPENDENCY_SETUP_IGNORE_REQUIRED'); });
-  if (!existing) await symlink(source, targetPath, process.platform === 'win32' ? 'junction' : 'dir');
+  if (!existing) await symlink(sourcePath, targetPath, process.platform === 'win32' ? 'junction' : 'dir');
   return { method: 'shared_origin_symlink', source, target: targetPath, inputsFingerprint: hash(inputs), mutationPolicy: 'preserve_source_dependencies' };
 }
