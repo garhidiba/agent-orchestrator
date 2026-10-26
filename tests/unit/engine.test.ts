@@ -1,11 +1,29 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFile, readFile, rm, mkdir } from 'node:fs/promises';
+import { writeFile, readFile, rm, mkdir, mkdtemp } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Engine } from '../../packages/core/src/runtime/engine.ts';
 import { runtimeFixture as fixture, fixtureTaskResult } from '../fixtures/runtime.ts';
 import { git } from '../../packages/core/src/git/repository.ts';
+import { resolveConfig } from '../../packages/core/src/config/index.ts';
+import { hash } from '../../packages/core/src/state/store.ts';
+
+test('run creation ignores untracked run state locally instead of failing or dirtying the checkout', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'orch-ignore-')), root = join(dir, 'repo');
+  try {
+    await mkdir(root); await git(root, 'init'); await git(root, 'config', 'user.name', 'ORCH Test'); await git(root, 'config', 'user.email', 'test@example.invalid');
+    await writeFile(join(root, 'base'), 'base'); await git(root, 'add', 'base'); await git(root, 'commit', '-m', 'base');
+    const config = resolveConfig({ project: {} }).config;
+    const engine = new Engine(join(root, '.orch/state/state.db'), null);
+    try {
+      const created = await engine.create(root, config, 'codex', join(dir, 'managed'), hash(config.quality.commands), { missingTestsWaiver: { approved: true, reason: 'no tests yet' } });
+      assert.match(created.runId, /^run-/);
+      assert.match(await readFile(join(root, '.git/info/exclude'), 'utf8'), /^\/\.orch\/state\/$/m);
+      assert.equal(await git(root, 'status', '--porcelain=v1', '--untracked-files=all'), '');
+    } finally { await engine.disposePorts(); engine.store.close(); }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
 
 
 test('two tasks use isolated worktrees, preserve commits, require independent review and finalize approval', async () => {
@@ -148,6 +166,28 @@ test('resuming a partial unit cannot bypass completion, and never-started leases
   } finally { await f.close(); }
 });
 
+
+test('commit paths split one task diff across units and bare directory write paths own their contents', async () => {
+  const f = await fixture();
+  try {
+    f.plan.tasks = [{ ...f.plan.tasks[0], write_paths: ['pkg'], commit_units: [{ id: 'U1', purpose: 'first' }, { id: 'U2', purpose: 'second' }] }];
+    await f.change({ action: 'plan' }, run => f.engine.plan(run, f.plan, true));
+    await f.change({ action: 'prepare' }, run => f.engine.prepare(run, 'T1'));
+    const task = f.engine.status(f.created.runId).data.tasks.T1;
+    await f.change({ action: 'bind' }, run => f.engine.bind(run, 'T1', task.lease, task.attempt, 'native-T1', 'fixture-model', 'high'));
+    await mkdir(join(task.path, 'pkg')); await writeFile(join(task.path, 'pkg/one.txt'), 'one'); await writeFile(join(task.path, 'pkg/two.txt'), 'two');
+    const validate = () => f.change({ action: 'validate' }, run => f.engine.validate(run, 'T1', task.lease, task.attempt));
+    await validate();
+    await assert.rejects(f.change({ action: 'outside' }, run => f.engine.commit(run, 'T1', task.lease, task.attempt, 'U1', ['base'])), /OWNERSHIP_VIOLATION/);
+    await f.change({ action: 'commit-1' }, run => f.engine.commit(run, 'T1', task.lease, task.attempt, 'U1', ['pkg/one.txt']));
+    assert.equal(await git(task.path, 'show', '--name-only', '--format=', 'HEAD'), 'pkg/one.txt');
+    await validate();
+    await f.change({ action: 'commit-2' }, run => f.engine.commit(run, 'T1', task.lease, task.attempt, 'U2', ['pkg/two.txt']));
+    assert.equal(await git(task.path, 'show', '--name-only', '--format=', 'HEAD'), 'pkg/two.txt');
+    await validate();
+    await f.change({ action: 'complete' }, async run => f.engine.complete(run, 'T1', task.lease, task.attempt, true, await fixtureTaskResult(run, 'T1')));
+  } finally { await f.close(); }
+});
 
 async function finishFixtureTask(f: Awaited<ReturnType<typeof fixture>>, taskId: string) {
   await f.change({ action: 'prepare', taskId }, run => f.engine.prepare(run, taskId));

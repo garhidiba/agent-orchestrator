@@ -18,7 +18,7 @@ import { exportRunEvidence } from '../../core/src/runtime/snapshots.ts';
 import { buildReport, writeReport } from '../../core/src/reporting/index.ts';
 import { git, inspectRepository } from '../../core/src/git/repository.ts';
 import { roleIds } from '../../protocol/src/config.ts';
-import { envelopeSchema, id, nativeAgentId, sha, requirementsSchema, planSchema, planAmendmentSchema, runAbandonmentSchema, reviewSchema, taskResultSchema, hostHeartbeatSchema, findingDispositionSchema, requireCondition as check } from '../../protocol/src/runtime.ts';
+import { envelopeSchema, id, nativeAgentId, sha, relativePath, requirementsSchema, planSchema, planAmendmentSchema, runAbandonmentSchema, reviewSchema, taskResultSchema, hostHeartbeatSchema, findingDispositionSchema, requireCondition as check } from '../../protocol/src/runtime.ts';
 import type { NativeCapability, Run } from '../../core/src/runtime/engine.ts';
 
 export async function createServer(origin: string | null, host: 'codex' | 'claude', managedRoot: string, tokenPath: string) {
@@ -203,7 +203,7 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
   });
   mutation('orch_task_retry', { ...lease, native_stopped: z.boolean(), reason: z.string().min(1).max(4096) }, (run, data) => runtime().retry(run, data.task_id, data.lease_id, data.fencing_token, data.native_stopped, data.reason));
   mutation('orch_task_validate', lease, (run, data) => runtime().validate(run, data.task_id, data.lease_id, data.fencing_token));
-  mutation('orch_task_commit', { ...lease, unit_id: id }, (run, data) => runtime().commit(run, data.task_id, data.lease_id, data.fencing_token, data.unit_id));
+  mutation('orch_task_commit', { ...lease, unit_id: id, paths: z.array(relativePath).min(1).optional() }, (run, data) => runtime().commit(run, data.task_id, data.lease_id, data.fencing_token, data.unit_id, data.paths));
   mutation('orch_task_complete', { ...lease, native_stopped: z.boolean(), result: taskResultSchema }, (run, data) => runtime().complete(run, data.task_id, data.lease_id, data.fencing_token, data.native_stopped, data.result ?? null));
   mutation('orch_integrate', { task_id: id, expected_integration_sha: z.string() }, (run, data) => runtime().integrate(run, data.task_id, data.expected_integration_sha));
   mutation('orch_conflict_resolve', { native_stopped: z.boolean() }, (run, data) => runtime().resolveConflict(run, data.native_stopped));

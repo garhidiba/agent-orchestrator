@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { lstat, mkdir, readFile, readdir, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises';
+import { appendFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { redact } from '../quality/redact.ts';
 import { assertNoStagedSecrets } from '../quality/secrets.ts';
@@ -30,6 +30,18 @@ type Work = { dependencySetup?: DependencySetup | null; nativeContext?: NativeCa
 type Finding = Review['findings'][number] & { fingerprint: string; lifecycle: string; seenRounds?: number[]; dispositions?: { status: 'ACCEPTED_RISK' | 'NOT_A_BUG' | 'DEFERRED'; reason: string; actor: 'user'; approvedAt: string; sha: string | null }[] };
 const attemptKey = (taskId: string, attempt: number) => { const key = `${taskId}-${attempt}`; return key.length <= 80 ? key : `attempt-${hash([taskId, attempt])}`; };
 const acceptedGate = (gate: { status: string }) => ['passed', 'waived'].includes(gate.status);
+// Run state must stay untracked. If the project does not ignore it, add a local-only exclude rather than failing or editing tracked files.
+async function ensureStateIgnored(root: string, commonDir: string) {
+  const ignored = () => git(root, 'check-ignore', '.orch/state/probe').then(() => true, () => false);
+  if (await ignored()) return;
+  const info = join(commonDir, 'info'), file = join(info, 'exclude');
+  await mkdir(info, { recursive: true });
+  const stat = await lstat(file).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  check(!stat || (stat.isFile() && !stat.isSymbolicLink()), 'STATE_IGNORE_REQUIRED');
+  const text = stat ? await readFile(file, 'utf8') : '';
+  await appendFile(file, `${text && !text.endsWith('\n') ? '\n' : ''}/.orch/state/\n`, { mode: 0o600 });
+  check(await ignored(), 'STATE_IGNORE_REQUIRED');
+}
 const activeWriterStates = new Set(['LEASED', 'RUNNING', 'VALIDATING', 'ORPHANED_UNKNOWN']);
 const activePhases = new Set(['ANALYZING', 'EXECUTING', 'INTEGRATING', 'VERIFYING', 'REVIEWING', 'REPAIR_PLANNING', 'FINAL_AUDIT', 'FINALIZING', 'CLEANING']);
 export type Run = {
@@ -79,8 +91,10 @@ export class Engine {
   }
   status(run: string) { return this.store.get<Run>(id.parse(run)); }
   async create(origin: string, configInput: unknown, host: 'codex' | 'claude', managedRoot: string, trustedCommandsHash: string, options: { missingTestsWaiver?: { approved: boolean; reason: string } } = {}) {
-    const repo = await inspectRepository(origin), config = configSchema.parse(configInput);
-    check(repo.root === this.origin, 'STATE_ORIGIN_MISMATCH');
+    const config = configSchema.parse(configInput), located = await inspectRepository(origin);
+    check(located.root === this.origin, 'STATE_ORIGIN_MISMATCH');
+    await ensureStateIgnored(located.root, located.commonDir);
+    const repo = await inspectRepository(origin); // re-read: the state directory shows as untracked until it is ignored
     check(!repo.dirty, 'DIRTY_CHECKOUT');
     const missingWaiver = options.missingTestsWaiver;
     check(!missingWaiver || missingWaiver.approved && missingWaiver.reason.trim(), 'APPROVAL_REQUIRED');
@@ -88,7 +102,6 @@ export class Engine {
     check(missingWaiver && config.quality.commands.length === 0 || config.quality.commands.some(command => command.required && command.stages.includes('baseline')) &&
       config.quality.commands.some(command => command.required && command.stages.includes('final')), 'REQUIRED_GATES_MISSING');
     check(!config.git.target_branch || config.git.target_branch === repo.branch, 'TARGET_BRANCH_MISMATCH');
-    await git(repo.root, 'check-ignore', '.orch/state/probe').catch(() => { throw new Error('STATE_IGNORE_REQUIRED'); });
     await mkdir(managedRoot, { recursive: true });
     const managed = await realpath(managedRoot);
     check(!within(repo.root, managed) && managed !== repo.root, 'WORKTREE_ROOT_UNSAFE');
@@ -703,7 +716,7 @@ export class Engine {
     task.validated = acceptedGate(gate) ? gate.source : null;
     return gate;
   }
-  async commit(run: Run, taskId: string, lease: string, generation: number, unit: string) {
+  async commit(run: Run, taskId: string, lease: string, generation: number, unit: string, only?: string[]) {
     enforceRunBudget(run);
     check(run.state === 'EXECUTING', 'INVALID_RUN_STATE');
     const task = this.leased(run, taskId, lease, generation);
@@ -716,8 +729,8 @@ export class Engine {
     check(gate && acceptedGate(gate) && gate.commands === hash(run.config.quality.commands) && gate.source === task.validated && await this.gateInputsFresh(gate, task.path), 'VALIDATION_STALE');
     const expectedHead = task.lastCommitSha ?? task.dispatchBase ?? task.base;
     check(await git(task.path, 'rev-parse', 'HEAD') === expectedHead, 'COMMIT_HEAD_MISMATCH');
-    const paths = await changedPaths(task.path);
-    check(paths.length && paths.every(path => owns(task.spec.write_paths, path)), 'OWNERSHIP_VIOLATION');
+    const changed = await changedPaths(task.path), paths = only ?? changed;
+    check(paths.length && paths.every(path => changed.includes(path)) && paths.every(path => owns(task.spec.write_paths, path)), 'OWNERSHIP_VIOLATION');
     check((await changedPaths(task.path, task.base)).every(path => owns(task.spec.write_paths, path)), 'OWNERSHIP_VIOLATION');
     await git(task.path, 'add', '--', ...paths);
     await assertNoStagedSecrets(task.path);

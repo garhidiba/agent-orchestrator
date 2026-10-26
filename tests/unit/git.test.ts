@@ -18,5 +18,10 @@ test('Git identity, dirty state, untracked changes and fingerprints use a real i
     assert.equal(owns(['src/**'], 'src/a.ts'), true); assert.equal(owns(['src/**'], 'src-other/a.ts'), false);
     assert.equal(overlaps(['src/**'], ['src/a.ts']), true);
     assert.equal(overlaps(['a.ts'], ['b.ts']), false);
+    assert.equal(overlaps(['a/**'], ['b/**']), false); assert.equal(overlaps(['a/**'], ['b/x.ts']), false); assert.equal(overlaps(['b/x.ts'], ['a/**']), false);
+    assert.equal(overlaps(['a/**'], ['a/b/**']), true); assert.equal(overlaps(['a/b/x.ts'], ['a/**']), true); assert.equal(overlaps(['a/**'], ['ab/**']), false);
+    assert.equal(owns(['a/b'], 'a/b/c.ts'), true); assert.equal(owns(['a/b'], 'a/bc.ts'), false); assert.equal(owns(['*.kt'], 'x/*.kt'), false); assert.equal(owns(['a/b'], 'a/b'), true);
+    assert.equal(overlaps(['a'], ['a/b.ts']), true); assert.equal(overlaps(['a'], ['ab/c.ts']), false); assert.equal(overlaps(['a'], ['a/**']), true); assert.equal(overlaps(['a/b'], ['a/c']), false);
+    assert.equal(overlaps(['*.kt'], ['b.ts']), true); assert.equal(overlaps(['a/**/x'], ['b.ts']), true);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

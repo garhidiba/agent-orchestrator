@@ -91,11 +91,18 @@ export function within(root: string, path: string) {
   const part = relative(root, path);
   return part !== '' && part !== '..' && !part.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) && !isAbsolute(part);
 }
+// A write path without `*` owns itself and everything beneath it as a directory; `dir/**` owns its prefix.
+const scope = (pattern: string) => pattern.endsWith('/**') ? pattern.slice(0, -2) : pattern.includes('*') ? null : `${pattern}/`;
 export function owns(patterns: string[], path: string) {
-  return patterns.some(pattern => pattern === path || pattern.endsWith('/**') && path.startsWith(pattern.slice(0, -2)));
+  return patterns.some(pattern => pattern === path || path.startsWith(scope(pattern) ?? '\0'));
 }
+// Scopes are prefixes, so two of them (or a scope and a file) are provably disjoint unless one prefix contains the other.
+// Any other wildcard cannot be proven disjoint and stays conservative, which serializes the tasks.
 export function overlaps(a: string[], b: string[]) {
-  return a.some(x => b.some(y => x === y || x.includes('*') || y.includes('*')));
+  return a.some(x => b.some(y => {
+    const dx = scope(x), dy = scope(y);
+    return x === y || !dx || !dy || dx.includes('*') || dy.includes('*') || y.startsWith(dx) || x.startsWith(dy);
+  }));
 }
 export async function changedPaths(cwd: string, base = 'HEAD') {
   const tracked = await git(cwd, 'diff', '--no-renames', '--name-only', '-z', base);
