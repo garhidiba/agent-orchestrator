@@ -26,6 +26,52 @@ test('run creation ignores untracked run state locally instead of failing or dir
 });
 
 
+test('a managed worktree root inside the project is allowed only under .orch/worktrees and is ignored locally', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'orch-inrepo-')), root = join(dir, 'repo');
+  try {
+    await mkdir(root); await git(root, 'init'); await git(root, 'config', 'user.name', 'ORCH Test'); await git(root, 'config', 'user.email', 'test@example.invalid');
+    await writeFile(join(root, 'base'), 'base'); await git(root, 'add', 'base'); await git(root, 'commit', '-m', 'base');
+    const config = resolveConfig({ project: {} }).config, waiver = { missingTestsWaiver: { approved: true, reason: 'no tests yet' } };
+    const unsafe = new Engine(join(root, '.orch/state/state.db'), null);
+    try { await assert.rejects(unsafe.create(root, config, 'codex', join(root, 'managed'), hash(config.quality.commands), waiver), /WORKTREE_ROOT_UNSAFE/); }
+    finally { await unsafe.disposePorts(); unsafe.store.close(); }
+    const engine = new Engine(join(root, '.orch/state/state.db'), null);
+    try {
+      const created = await engine.create(root, config, 'codex', join(root, '.orch', 'worktrees'), hash(config.quality.commands), waiver);
+      assert.match(created.runId, /^run-/);
+      const exclude = await readFile(join(root, '.git/info/exclude'), 'utf8');
+      assert.match(exclude, /^\/\.orch\/state\/$/m); assert.match(exclude, /^\/\.orch\/worktrees\/$/m);
+      assert.equal(await git(root, 'status', '--porcelain=v1', '--untracked-files=all'), '');
+    } finally { await engine.disposePorts(); engine.store.close(); }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('run creation sweeps merged ORCH worktrees and branches but preserves dirty or unmerged work', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'orch-sweep-')), root = join(dir, 'repo'), managed = join(root, '.orch', 'worktrees');
+  try {
+    await mkdir(root); await git(root, 'init'); await git(root, 'config', 'user.name', 'ORCH Test'); await git(root, 'config', 'user.email', 'test@example.invalid');
+    await writeFile(join(root, 'base'), 'base'); await git(root, 'add', 'base'); await git(root, 'commit', '-m', 'base');
+    await mkdir(join(managed, 'run-old'), { recursive: true });
+    const add = (name: string) => git(root, 'worktree', 'add', '-b', `orch/run-old/task/${name}`, join(managed, 'run-old', name), 'HEAD');
+    for (const name of ['merged', 'dirty', 'unmerged']) await add(name);
+    await git(root, 'branch', 'orch/run-old/conflict/orphan-merged');
+    await writeFile(join(managed, 'run-old', 'dirty', 'scratch.txt'), 'uncommitted');
+    const unmerged = join(managed, 'run-old', 'unmerged');
+    await git(unmerged, 'config', 'user.name', 'ORCH Test'); await git(unmerged, 'config', 'user.email', 'test@example.invalid');
+    await writeFile(join(unmerged, 'work.txt'), 'work'); await git(unmerged, 'add', 'work.txt'); await git(unmerged, 'commit', '-m', 'unmerged work');
+    const config = resolveConfig({ project: {} }).config;
+    const engine = new Engine(join(root, '.orch/state/state.db'), null);
+    try {
+      const created = await engine.create(root, config, 'codex', managed, hash(config.quality.commands), { missingTestsWaiver: { approved: true, reason: 'no tests yet' } });
+      const branches = (await git(root, 'branch', '--list', 'orch/run-old/*', '--format=%(refname:short)')).split('\n').filter(Boolean).sort();
+      assert.deepEqual(branches, ['orch/run-old/task/dirty', 'orch/run-old/task/unmerged']);
+      const worktrees = await git(root, 'worktree', 'list', '--porcelain');
+      assert.ok(!worktrees.includes(join('run-old', 'merged')) && worktrees.includes(join('run-old', 'dirty')) && worktrees.includes(join('run-old', 'unmerged')));
+      assert.ok(created.runId.startsWith('run-'));
+    } finally { await engine.disposePorts(); engine.store.close(); }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test('two tasks use isolated worktrees, preserve commits, require independent review and finalize approval', async () => {
   const f = await fixture();
   try {

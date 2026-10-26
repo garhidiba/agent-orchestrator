@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { runtimeFixture } from '../fixtures/runtime.ts';
 import { hash } from '../../packages/core/src/state/store.ts';
@@ -80,13 +80,14 @@ test('confirmed cancellation frees the writer lock while uncertain cancellation 
     await f.change({}, run => f.engine.prepare(run, 'T1'));
     const task = f.engine.status(f.created.runId).data.tasks.T1;
     await f.change({}, run => f.engine.bind(run, 'T1', task.lease, task.attempt, 'cancel-worker', null, null));
+    await writeFile(join(task.path, 'wip.txt'), 'uncommitted work'); // a clean merged worktree is swept by the next run; unfinished work must survive
     await f.change({}, run => f.engine.control(run, 'cancel'));
     const config = f.engine.status(f.created.runId).data.config;
     await assert.rejects(f.engine.create(f.root, config, 'codex', join(f.dir, 'managed'), hash(config.quality.commands)), /REPOSITORY_RUN_LOCKED/);
     await f.change({}, run => f.engine.control(run, 'cancel', ['cancel-worker']));
     assert.equal(f.engine.status(f.created.runId).data.tasks.T1.state, 'STOPPED');
     await f.engine.create(f.root, config, 'codex', join(f.dir, 'managed'), hash(config.quality.commands));
-    assert.ok(await readFile(join(task.path, 'base')));
+    assert.equal(await readFile(join(task.path, 'wip.txt'), 'utf8'), 'uncommitted work');
   } finally { await f.close(); }
 });
 

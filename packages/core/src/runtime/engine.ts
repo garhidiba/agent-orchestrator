@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { redact } from '../quality/redact.ts';
 import { assertNoStagedSecrets } from '../quality/secrets.ts';
 import { existsSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { writeRequirements } from '../requirements/index.ts';
 import { writeStateArtifact } from '../state/artifacts.ts';
 import { Store, hash } from '../state/store.ts';
@@ -31,16 +31,57 @@ type Finding = Review['findings'][number] & { fingerprint: string; lifecycle: st
 const attemptKey = (taskId: string, attempt: number) => { const key = `${taskId}-${attempt}`; return key.length <= 80 ? key : `attempt-${hash([taskId, attempt])}`; };
 const acceptedGate = (gate: { status: string }) => ['passed', 'waived'].includes(gate.status);
 // Run state must stay untracked. If the project does not ignore it, add a local-only exclude rather than failing or editing tracked files.
-async function ensureStateIgnored(root: string, commonDir: string) {
-  const ignored = () => git(root, 'check-ignore', '.orch/state/probe').then(() => true, () => false);
+async function ensureStateIgnored(root: string, commonDir: string, directory = '.orch/state') {
+  const ignored = () => git(root, 'check-ignore', `${directory}/probe`).then(() => true, () => false);
   if (await ignored()) return;
   const info = join(commonDir, 'info'), file = join(info, 'exclude');
   await mkdir(info, { recursive: true });
   const stat = await lstat(file).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
   check(!stat || (stat.isFile() && !stat.isSymbolicLink()), 'STATE_IGNORE_REQUIRED');
   const text = stat ? await readFile(file, 'utf8') : '';
-  await appendFile(file, `${text && !text.endsWith('\n') ? '\n' : ''}/.orch/state/\n`, { mode: 0o600 });
+  await appendFile(file, `${text && !text.endsWith('\n') ? '\n' : ''}/${directory}/\n`, { mode: 0o600 });
   check(await ignored(), 'STATE_IGNORE_REQUIRED');
+}
+// Housekeeping at run creation (no other run holds the repository lock then): drop ORCH linked worktrees and local `orch/*`
+// branches whose work is fully merged into the target. Dirty worktrees, unmerged branches and anything outside the managed
+// root are never touched. Best effort: a failure on one item only preserves it. Set ORCH_WORKTREE_SWEEP=0 to disable.
+async function sweepMergedWorktrees(origin: string, managed: string, target: string) {
+  const removed: { path: string | null; branch: string }[] = [], preserved: { path: string | null; branch: string; reason: string }[] = [];
+  if (process.env.ORCH_WORKTREE_SWEEP === '0') return { removed, preserved };
+  await git(origin, 'worktree', 'prune').catch(() => '');
+  const merged = (ref: string) => git(origin, 'merge-base', '--is-ancestor', ref, target).then(() => true, () => false);
+  const checkedOut = new Set<string>();
+  for (const block of (await git(origin, 'worktree', 'list', '--porcelain').catch(() => '')).split('\n\n')) {
+    const path = /^worktree (.+)$/m.exec(block)?.[1], branch = /^branch refs\/heads\/(.+)$/m.exec(block)?.[1];
+    if (!path || !branch || !branch.startsWith('orch/')) continue;
+    checkedOut.add(branch);
+    if (!within(managed, resolve(path))) continue;
+    try {
+      const repo = await inspectRepository(path);
+      if (repo.dirty) { preserved.push({ path, branch, reason: 'dirty' }); continue; }
+      if (!(await merged(repo.head))) { preserved.push({ path, branch, reason: 'unmerged' }); continue; }
+      await git(origin, 'worktree', 'remove', path); await git(origin, 'branch', '-d', branch);
+      removed.push({ path, branch }); checkedOut.delete(branch);
+      await rmdir(dirname(path)).catch(() => undefined); // the per-run folder, only when it is empty
+    } catch { preserved.push({ path, branch, reason: 'remove_failed' }); }
+  }
+  const refs = (await git(origin, 'for-each-ref', '--format=%(refname:short)', 'refs/heads/orch/').catch(() => '')).split('\n').filter(Boolean);
+  for (const branch of refs) {
+    if (checkedOut.has(branch)) continue;
+    if (!(await merged(branch))) { preserved.push({ path: null, branch, reason: 'unmerged' }); continue; }
+    try { await git(origin, 'branch', '-d', branch); removed.push({ path: null, branch }); }
+    catch { preserved.push({ path: null, branch, reason: 'remove_failed' }); }
+  }
+  return { removed, preserved };
+}
+// A managed worktree root may live inside the project only under `.orch/worktrees`, and only while git ignores it.
+// Any other in-repo location stays WORKTREE_ROOT_UNSAFE so linked worktrees can never show up as untracked source.
+function inRepositoryWorktreeDirectory(root: string, managedRoot: string): string | null {
+  const absolute = resolve(managedRoot);
+  if (!within(root, absolute)) return null;
+  const directory = relative(root, absolute).split(sep).join('/');
+  check(directory === '.orch/worktrees' || directory.startsWith('.orch/worktrees/'), 'WORKTREE_ROOT_UNSAFE');
+  return directory;
 }
 const activeWriterStates = new Set(['LEASED', 'RUNNING', 'VALIDATING', 'ORPHANED_UNKNOWN']);
 const activePhases = new Set(['ANALYZING', 'EXECUTING', 'INTEGRATING', 'VERIFYING', 'REVIEWING', 'REPAIR_PLANNING', 'FINAL_AUDIT', 'FINALIZING', 'CLEANING']);
@@ -94,6 +135,10 @@ export class Engine {
     const config = configSchema.parse(configInput), located = await inspectRepository(origin);
     check(located.root === this.origin, 'STATE_ORIGIN_MISMATCH');
     await ensureStateIgnored(located.root, located.commonDir);
+    await mkdir(managedRoot, { recursive: true }); // an empty directory never shows up as untracked
+    const managed = await realpath(managedRoot);
+    const inRepositoryWorktrees = inRepositoryWorktreeDirectory(located.root, managed);
+    if (inRepositoryWorktrees) await ensureStateIgnored(located.root, located.commonDir, inRepositoryWorktrees);
     const repo = await inspectRepository(origin); // re-read: the state directory shows as untracked until it is ignored
     check(!repo.dirty, 'DIRTY_CHECKOUT');
     const missingWaiver = options.missingTestsWaiver;
@@ -102,18 +147,18 @@ export class Engine {
     check(missingWaiver && config.quality.commands.length === 0 || config.quality.commands.some(command => command.required && command.stages.includes('baseline')) &&
       config.quality.commands.some(command => command.required && command.stages.includes('final')), 'REQUIRED_GATES_MISSING');
     check(!config.git.target_branch || config.git.target_branch === repo.branch, 'TARGET_BRANCH_MISMATCH');
-    await mkdir(managedRoot, { recursive: true });
-    const managed = await realpath(managedRoot);
-    check(!within(repo.root, managed) && managed !== repo.root, 'WORKTREE_ROOT_UNSAFE');
+    check(managed !== repo.root && (!within(repo.root, managed) || inRepositoryWorktrees !== null), 'WORKTREE_ROOT_UNSAFE');
     await preflightRepository(repo.root, [repo.root, repo.commonDir, managed]);
     const runId = `run-${randomUUID()}`;
     const lock = join(repo.commonDir, 'orch', 'locks'); await mkdir(lock, { recursive: true });
     await writeFile(join(lock, 'write.json'), JSON.stringify({ runId, origin: repo.root }), { flag: 'wx', mode: 0o600 }).catch(() => { throw new Error('REPOSITORY_RUN_LOCKED'); });
+    const swept = await sweepMergedWorktrees(repo.root, managed, repo.branch).catch(() => ({ removed: [], preserved: [] }));
     const integration = `orch/${runId}/integration`, integrationPath = join(managed, runId, 'integration');
     const run: Run = { id: runId, host, origin: repo.root, commonDir: repo.commonDir, target: repo.branch, targetBase: repo.head,
       integration, integrationPath, managedRoot: managed, hostEvidence: this.native ? structuredClone(this.native) : undefined, state: 'PREFLIGHT', config, plan: null, tasks: {}, gates: [], findings: [], reviews: [], reviewRound: 0,
       activeTimeMs: 0, activeSince: null, pauseTimeMs: 0, missingTestsWaiver: missingWaiver && config.quality.commands.length === 0 ? { actor: 'user', reason: missingWaiver.reason, approvedAt: new Date().toISOString() } : undefined, runtimeRoot: this.runtimeRoot, configRevision: 1, configRevisions: [{ revision: 1, hash: hash(config), roles: structuredClone(config.hosts), timestamp: new Date().toISOString() }], integrationSha: repo.head, createdAt: new Date().toISOString(), cleanup: [] };
     this.store.create(runId, run);
+    if (swept.removed.length || swept.preserved.length) this.store.event(runId, 'worktree_sweep', swept);
     this.store.snapshot(runId, 'config', 'revision-1', config);
     if (this.native) this.store.snapshot(runId, 'catalog', `host-${hash(this.native)}`, this.native);
     return { runId, version: 0 };

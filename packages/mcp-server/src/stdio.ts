@@ -18,5 +18,10 @@ catch (error) {
 }
 const localState = join(homedir(), '.local', 'state', 'orch');
 const token = join(localState, 'coordinators', `${hash([values.host, origin ?? invocation])}.token`);
-const server = await createServer(origin, values.host, join(homedir(), '.local', 'share', 'orch', 'worktrees'), token);
+// Linked worktrees live inside the project (`<repo>/.orch/worktrees`, git-ignored automatically) unless ORCH_WORKTREE_ROOT
+// points elsewhere (absolute, or relative to the repository). Outside a Git repository the legacy per-user location is kept.
+const worktreeRoot = process.env.ORCH_WORKTREE_ROOT
+  ? resolve(origin ?? invocation, process.env.ORCH_WORKTREE_ROOT)
+  : origin ? join(origin, '.orch', 'worktrees') : join(homedir(), '.local', 'share', 'orch', 'worktrees');
+const server = await createServer(origin, values.host, worktreeRoot, token);
 await server.connect(new StdioServerTransport());

@@ -9,3 +9,5 @@
 - Write-path overlap now proves disjointness for `dir/**` scopes and files, so such tasks run in parallel; other wildcards still serialize.
 - Documented write-path, commit-unit, verification-id, trusted-hash and worker-bootstrap rules in the workflow reference.
 - Bare directory `write_paths` now own everything beneath them, and `orch_task_commit` accepts optional `paths` to commit a subset of changed files per unit.
+- Linked worktrees now default to `<project>/.orch/worktrees` (auto-added to the local `.git/info/exclude`); `ORCH_WORKTREE_ROOT` overrides, and outside a Git repository the per-user location is kept. In-repository roots other than `.orch/worktrees` are still rejected.
+- Run creation sweeps worktrees and local `orch/*` branches of earlier runs once they are clean and fully merged into the target (unmerged or dirty work is preserved, `ORCH_WORKTREE_SWEEP=0` disables) and records a `worktree_sweep` event.
