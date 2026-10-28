@@ -18,6 +18,147 @@ before(async () => {
 });
 after(async () => { await rm(bundleParent, { recursive: true, force: true }); });
 
+async function refreshFixture() {
+  const f = await runtimeFixture(true, { execution: { max_task_attempts: 1 }, hosts: { codex: { roles: { coder: { model: 'fixture-model', effort: 'high' } } } } });
+  Object.assign(f.engine.native!, { perInvocationModel: true, perInvocationEffort: true, models: [modelSchema.parse({ host: 'codex', id: 'fixture-model', displayName: 'fixture-model', resolvedId: 'fixture-model',
+    family: 'openai', support: 'advertised', access: 'unknown', availability: 'unknown', efforts: ['high'], defaultEffort: 'high', hidden: false,
+    source: 'synthetic-native-tool-metadata', sourceVersion: null, fetchedAt: new Date().toISOString(), expiresAt: null, evidence: [] })] });
+  f.plan.tasks[0].commit_units.push({ id: 'U2', purpose: 'finish refreshed task' });
+  await f.change({}, run => f.engine.plan(run, f.plan, true));
+  for (const taskId of ['T1', 'T2']) {
+    const prepared = await f.change({}, run => f.engine.prepare(run, taskId));
+    await f.change({}, run => f.engine.bind(run, taskId, prepared.result.leaseId, prepared.result.fencingToken, `old-${taskId}`, null, null));
+    await writeFile(join(prepared.result.worktreePath, `${taskId}.txt`), `${taskId} old work\n`);
+    if (taskId === 'T1') {
+      await f.change({}, run => f.engine.validate(run, taskId, prepared.result.leaseId, prepared.result.fencingToken));
+      await f.change({}, run => f.engine.commit(run, taskId, prepared.result.leaseId, prepared.result.fencingToken, 'U1'));
+      await writeFile(join(prepared.result.worktreePath, 'T1.txt'), 'dirty original\n');
+    }
+  }
+  const run = f.engine.status(f.created.runId).data;
+  await writeFile(join(run.integrationPath, 'dependency.txt'), 'fixed baseline\n');
+  await git(run.integrationPath, 'add', 'dependency.txt'); await git(run.integrationPath, 'commit', '-m', 'controlled integration dependency fixture');
+  await f.change({}, async current => { current.integrationSha = await git(current.integrationPath, 'rev-parse', 'HEAD'); });
+  const before = f.engine.status(f.created.runId);
+  f.engine.runtimeRoot = bundle;
+  f.engine.native = { ...f.engine.native!, host: 'codex', model: 'fixture-model', effort: 'high', verified: true, contextMatches: true,
+    source: 'coordinator_native_receipt', evidence: ['spawn_agent', 'new-coordinator', before.data.origin, before.data.targetBase] };
+  const approval = { approved: true, reason: 'Refresh stopped work onto repaired integration without retrying', previous_coordinator_stopped: true,
+    expected_host: 'codex', target_host: 'codex', expected_runtime_root: before.data.runtimeRoot, target_runtime_root: bundle,
+    target_runtime_checksum: checksum, runtime_migration_approved: true, stopped_agents: ['old-T1', 'old-T2'], refresh_stopped_tasks: ['T1', 'T2'] };
+  return { ...f, before, approval };
+}
+
+test('approved same-host refresh fences stopped workers at their final attempt without extending deadlines', async () => {
+  const f = await refreshFixture();
+  try {
+    await f.engine.handoff(f.created.runId, 'refresh-stopped', f.before.version, f.approval);
+    const run = f.engine.status(f.created.runId).data;
+    for (const taskId of ['T1', 'T2']) {
+      const task = run.tasks[taskId], old = f.before.data.tasks[taskId];
+      assert.equal(task.attempt, 1); assert.equal(task.deadline, old.deadline); assert.equal(task.expires, old.expires);
+      assert.equal(task.state, 'LEASED'); assert.equal(task.nativeId, null); assert.notEqual(task.lease, old.lease);
+      assert.notEqual(task.path, old.path); assert.notEqual(task.resources!.root, old.resources!.root);
+      assert.deepEqual(task.modelResolution, old.modelResolution); assert.equal(task.configRevision, old.configRevision);
+      assert.equal(task.modelResolution!.resolvedEffort, 'high');
+      assert.equal(await readFile(join(task.path, 'dependency.txt'), 'utf8'), 'fixed baseline\n');
+      await assert.rejects(f.change({}, current => f.engine.bind(current, taskId, old.lease, old.attempt, 'stale-worker', null, null)), /STALE_LEASE/);
+      await assert.rejects(f.change({}, current => f.engine.bind(current, taskId, task.lease, task.attempt, `new-${taskId}`, null, null)), /WORKER_BOOTSTRAP_MISMATCH/);
+      const repo = await inspectRepository(task.path);
+      await f.change({}, current => f.engine.bind(current, taskId, task.lease, task.attempt, `new-${taskId}`, null, null,
+        { cwd: repo.root, origin_root: repo.root, common_dir: repo.commonDir, branch: repo.branch, head: repo.head }));
+    }
+    assert.equal(await readFile(join(f.before.data.tasks.T1.path, 'T1.txt'), 'utf8'), 'dirty original\n');
+    const task = f.engine.status(f.created.runId).data.tasks.T1;
+    await writeFile(join(task.path, 'T1.txt'), 'reconciled owned work\n');
+    await f.change({}, current => f.engine.validate(current, 'T1', task.lease, task.attempt));
+    await f.change({}, current => f.engine.commit(current, 'T1', task.lease, task.attempt, 'U2'));
+    await f.change({}, async current => f.engine.complete(current, 'T1', task.lease, task.attempt, true, await fixtureTaskResult(current, 'T1')));
+    assert.equal(f.engine.status(f.created.runId).data.tasks.T1.state, 'MERGE_QUEUED');
+  } finally { await f.close(); }
+});
+
+test('administrative refresh requires complete stopped scope and rejects expired deadlines before effects', async () => {
+  const f = await refreshFixture();
+  try {
+    await assert.rejects(f.engine.handoff(f.created.runId, 'partial-refresh', f.before.version, { ...f.approval, refresh_stopped_tasks: ['T1'] }), /REFRESH_SCOPE_MISMATCH/);
+    await assert.rejects(f.engine.handoff(f.created.runId, 'unconfirmed-refresh', f.before.version, { ...f.approval, stopped_agents: ['old-T1'] }), /WORKER_STOP_UNCONFIRMED/);
+    assert.deepEqual(f.engine.status(f.created.runId), f.before);
+    assert.equal(f.engine.store.pending(f.created.runId).length, 0);
+    f.engine.runtimeRoot = f.before.data.runtimeRoot!;
+    await f.change({}, async run => { run.tasks.T1.deadline = 1; run.tasks.T1.expires = 1; });
+    f.engine.runtimeRoot = bundle;
+    const expired = f.engine.status(f.created.runId);
+    await assert.rejects(f.engine.handoff(f.created.runId, 'expired-refresh', expired.version, f.approval), /REFRESH_DEADLINE_EXPIRED/);
+    assert.deepEqual(f.engine.status(f.created.runId), expired);
+    assert.equal(f.engine.store.pending(f.created.runId).length, 0);
+  } finally { await f.close(); }
+});
+
+test('administrative refresh rejects foreign commits before changing leases or worktrees', async () => {
+  const f = await refreshFixture();
+  try {
+    const task = f.before.data.tasks.T1;
+    await git(task.path, 'add', 'T1.txt'); await git(task.path, 'commit', '-m', 'foreign owned-path commit');
+    await assert.rejects(f.engine.handoff(f.created.runId, 'foreign-refresh', f.before.version, f.approval), /UNTRACKED_COMMIT/);
+    assert.deepEqual(f.engine.status(f.created.runId), f.before);
+    assert.equal(f.engine.store.pending(f.created.runId).length, 0);
+  } finally { await f.close(); }
+});
+
+test('a redacted second refresh source rejects the entire batch before leases, worktrees or ports change', async () => {
+  const f = await refreshFixture();
+  try {
+    f.engine.runtimeRoot = f.before.data.runtimeRoot!;
+    await f.change({}, async run => { run.tasks.T2.spec.title = 'token: validation'; });
+    f.engine.runtimeRoot = bundle;
+    const before = f.engine.status(f.created.runId), worktrees = await git(f.root, 'worktree', 'list', '--porcelain');
+    const ports = await Promise.all(['T1', 'T2'].map(taskId => { const task = before.data.tasks[taskId]; return f.engine.attemptPort(before.data, taskId, task.lease, task.attempt, 'status'); }));
+    await assert.rejects(f.engine.handoff(f.created.runId, 'redacted-second-source', before.version, f.approval), /REFRESH_EVIDENCE_REDACTED/);
+    assert.deepEqual(f.engine.status(f.created.runId), before);
+    assert.equal(await git(f.root, 'worktree', 'list', '--porcelain'), worktrees);
+    assert.equal(f.engine.store.pending(f.created.runId).length, 0);
+    assert.deepEqual(await Promise.all(['T1', 'T2'].map(taskId => { const task = before.data.tasks[taskId]; return f.engine.attemptPort(before.data, taskId, task.lease, task.attempt, 'status'); })), ports);
+  } finally { await f.close(); }
+});
+
+test('interrupted administrative refresh rebuilds at a new epoch from immutable original tasks', async () => {
+  const f = await refreshFixture();
+  try {
+    const save = f.engine.store.save.bind(f.engine.store);
+    f.engine.store.save = () => { throw new Error('SIMULATED_REFRESH_EXIT'); };
+    await assert.rejects(f.engine.handoff(f.created.runId, 'interrupted-refresh', f.before.version, f.approval), /SIMULATED_REFRESH_EXIT/);
+    f.engine.store.save = save;
+    const pending = f.engine.store.pending(f.created.runId)[0].snapshot as { data: { tasks: Record<string, { path: string }> } };
+    const partialPath = pending.data.tasks.T1.path;
+    await f.engine.reconcile(f.created.runId, 'interrupted-refresh', true, 'codex');
+    const task = f.engine.status(f.created.runId).data.tasks.T1;
+    assert.equal(task.refreshEpoch, 2); assert.notEqual(task.path, partialPath);
+    assert.equal(task.attempt, 1); assert.equal(task.deadline, f.before.data.tasks.T1.deadline);
+    assert.equal(await readFile(join(partialPath, 'dependency.txt'), 'utf8'), 'fixed baseline\n');
+    assert.equal(await readFile(join(f.before.data.tasks.T1.path, 'T1.txt'), 'utf8'), 'dirty original\n');
+    assert.equal(f.engine.store.pending(f.created.runId).length, 0);
+  } finally { await f.close(); }
+});
+
+test('conflicting administrative refresh reconciles to fenced orphan state with no runtime activation', async () => {
+  const f = await refreshFixture();
+  try {
+    await writeFile(join(f.before.data.integrationPath, 'T1.txt'), 'conflicting integration version\n');
+    await git(f.before.data.integrationPath, 'add', 'T1.txt'); await git(f.before.data.integrationPath, 'commit', '-m', 'controlled conflicting integration fixture');
+    f.engine.runtimeRoot = f.before.data.runtimeRoot!;
+    await f.change({}, async run => { run.integrationSha = await git(run.integrationPath, 'rev-parse', 'HEAD'); });
+    f.engine.runtimeRoot = bundle;
+    await assert.rejects(f.engine.handoff(f.created.runId, 'conflicting-refresh', f.engine.status(f.created.runId).version, f.approval), /RECOVERY_REPLAY_CONFLICT/);
+    await f.engine.reconcile(f.created.runId, 'conflicting-refresh', true, 'codex');
+    const run = f.engine.status(f.created.runId).data;
+    assert.equal(run.state, 'PAUSED'); assert.equal(run.runtimeRoot, f.before.data.runtimeRoot);
+    for (const taskId of ['T1', 'T2']) { assert.equal(run.tasks[taskId].state, 'ORPHANED_UNKNOWN'); assert.equal(run.tasks[taskId].expires, 0); }
+    assert.equal(await readFile(join(f.before.data.tasks.T1.path, 'T1.txt'), 'utf8'), 'dirty original\n');
+    assert.equal(f.engine.store.pending(f.created.runId).length, 0);
+  } finally { await f.close(); }
+});
+
 async function takeoverFixture(host: 'codex' | 'claude' = 'claude') {
   const f = await runtimeFixture();
   const previousHost = host === 'codex' ? 'claude' : 'codex';
@@ -224,18 +365,20 @@ for (const host of ['claude', 'codex'] as const) test(`a packaged ${host} MCP au
     const envelope = { ...auth, protocol_version: 1, run_id: f.created.runId, operation_id: 'mcp-takeover', expected_state_version: before.version,
       input: { approved: true, reason: 'Continue same run via authenticated MCP', previous_coordinator_stopped: true,
         expected_host: 'codex', target_host: host, expected_runtime_root: before.data.runtimeRoot,
-        target_runtime_root: `${bundle}/`, target_runtime_checksum: checksum, runtime_migration_approved: true, stopped_agents: host === 'codex' ? ['old-T1'] : [] } };
+        target_runtime_root: `${bundle}/`, target_runtime_checksum: checksum, runtime_migration_approved: true, stopped_agents: host === 'codex' ? ['old-T1'] : [], refresh_stopped_tasks: host === 'codex' ? ['T1'] : [] } };
     assert.equal((await call('orch_run_handoff', { ...envelope, coordinator_token: 'worker' })).error.code, 'COORDINATOR_RELAY_REQUIRED');
     assert.ok((await call('orch_run_handoff', { ...envelope, lease_id: 'unpaired' })).error);
     assert.equal((await call('orch_run_handoff', envelope)).error.code, 'HOST_CONTEXT_MISMATCH');
-    await call('orch_host_connect', { ...auth, native_tool: host === 'codex' ? 'spawn_agent' : 'Agent', native_agent_id: 'synthetic-native-probe', probe: {
+    await call('orch_host_connect', { ...auth, native_tool: host === 'codex' ? 'spawn_agent' : 'Agent', native_agent_id: 'synthetic-native-probe',
+      ...(host === 'codex' ? { native_context: { model: 'fixture-model', effort: 'high' } } : {}), probe: {
       challenge: environment.nativeHandshake.challenge, cwd: before.data.origin, origin_root: before.data.origin, branch: before.data.target, head: before.data.targetBase } });
     const handedOff = await call('orch_run_handoff', { ...envelope, operation_id: 'mcp-connected-takeover' });
     assert.equal(handedOff.error, undefined, JSON.stringify(handedOff));
     const noop = await call('orch_run_handoff', { ...envelope, operation_id: 'mcp-noop-takeover', expected_state_version: handedOff.data.version,
       input: { ...envelope.input, expected_host: host, expected_runtime_root: `${bundle}/` } });
     assert.equal(noop.error.code, 'HOST_HANDOFF_CONFLICT');
-    const prepared = await call('orch_task_prepare', { ...envelope, operation_id: 'mcp-next-worker', expected_state_version: handedOff.data.version, input: { task_id: 'T1' } });
+    const prepared = host === 'codex' ? { data: { version: handedOff.data.version, result: handedOff.data.result.refreshedTasks[0] }, error: undefined }
+      : await call('orch_task_prepare', { ...envelope, operation_id: 'mcp-next-worker', expected_state_version: handedOff.data.version, input: { task_id: 'T1' } });
     assert.equal(prepared.error, undefined, JSON.stringify(prepared));
     assert.equal(prepared.data.result.host, host);
     assert.equal(prepared.data.result.runId, f.created.runId);

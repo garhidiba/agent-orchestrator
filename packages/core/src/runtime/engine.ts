@@ -26,9 +26,10 @@ import { prepareNodeDependencies, dependencyFingerprint, environmentFingerprint,
 
 const exec = promisify(execFile);
 type Gate = { dependencies?: string; environment?: string; environmentOverrides?: Record<string, string>; id?: string; details?: GateResult[]; stage: string; task: string | null; sha: string; source: string; commands: string; status: string; results: { id: string; status: string; exitCode: number | null }[] };
-type Work = { recoveryReplay?: { path: string; branch: string; base: string }; dependencySetup?: DependencySetup | null; nativeContext?: NativeCapability; resources?: AttemptResources; deadline?: number; heartbeat?: { observedAt: number; evidenceRef: string }; modelObservation?: ReturnType<typeof observeRoleModel>; spec: Task; state: string; base: string; path: string; branch: string; attempt: number; lease: string; expires: number; nativeId: string | null; nativeBootstrap?: { cwd: string; origin_root: string; common_dir: string; branch: string; head: string }; units: Record<string, string>; validated: string | null; pausedState?: string; dispatchBase?: string; configRevision?: number; observedModel?: string | null; observedEffort?: string | null; modelResolution?: { requestedModel: string; requestedEffort: string; resolvedModel: string | null; resolvedEffort: string | null; nativeArguments?: ReturnType<typeof resolveRoleModel>['nativeArguments'] }; acceptanceEvidence?: { acceptanceId: string; evidenceRefs: string[] }[]; changedPaths?: string[]; reportedModel?: string | null; recoveryHead?: string; lastCommitSha?: string; attempts?: { number: number; path: string; branch: string; nativeId: string | null; stopped: boolean; reason: string; configRevision?: number; modelResolution?: Work['modelResolution']; observedModel?: string | null; observedEffort?: string | null; modelObservation?: Work['modelObservation']; resources?: AttemptResources }[] };
+type Work = { refreshEpoch?: number; recoveryReplay?: { path: string; branch: string; base: string }; dependencySetup?: DependencySetup | null; nativeContext?: NativeCapability; resources?: AttemptResources; deadline?: number; heartbeat?: { observedAt: number; evidenceRef: string }; modelObservation?: ReturnType<typeof observeRoleModel>; spec: Task; state: string; base: string; path: string; branch: string; attempt: number; lease: string; expires: number; nativeId: string | null; nativeBootstrap?: { cwd: string; origin_root: string; common_dir: string; branch: string; head: string }; units: Record<string, string>; validated: string | null; pausedState?: string; dispatchBase?: string; configRevision?: number; observedModel?: string | null; observedEffort?: string | null; modelResolution?: { requestedModel: string; requestedEffort: string; resolvedModel: string | null; resolvedEffort: string | null; nativeArguments?: ReturnType<typeof resolveRoleModel>['nativeArguments'] }; acceptanceEvidence?: { acceptanceId: string; evidenceRefs: string[] }[]; changedPaths?: string[]; reportedModel?: string | null; recoveryHead?: string; lastCommitSha?: string; attempts?: { number: number; path: string; branch: string; nativeId: string | null; stopped: boolean; reason: string; configRevision?: number; modelResolution?: Work['modelResolution']; observedModel?: string | null; observedEffort?: string | null; modelObservation?: Work['modelObservation']; resources?: AttemptResources }[] };
 type Finding = Review['findings'][number] & { fingerprint: string; lifecycle: string; seenRounds?: number[]; dispositions?: { status: 'ACCEPTED_RISK' | 'NOT_A_BUG' | 'DEFERRED'; reason: string; actor: 'user'; approvedAt: string; sha: string | null }[] };
 const attemptKey = (taskId: string, attempt: number) => { const key = `${taskId}-${attempt}`; return key.length <= 80 ? key : `attempt-${hash([taskId, attempt])}`; };
+const dispatchKey = (taskId: string, task: Work) => task.refreshEpoch ? `refresh-${hash([taskId, task.attempt, task.refreshEpoch])}` : attemptKey(taskId, task.attempt);
 const acceptedGate = (gate: { status: string }) => ['passed', 'waived'].includes(gate.status);
 // Run state must stay untracked. If the project does not ignore it, add a local-only exclude rather than failing or editing tracked files.
 async function ensureStateIgnored(root: string, commonDir: string, directory = '.orch/state') {
@@ -336,24 +337,80 @@ export class Engine {
     const next = await this.readRunConfig(run, true);
     for (const role of roleIds) resolveRoleModel({ config: next, host: approval.target_host, role, native });
     const active = Object.entries(run.tasks).filter(([, task]) => activeWriterStates.has(task.state));
+    const refresh = approval.refresh_stopped_tasks;
+    if (refresh.length) {
+      check(run.host === approval.target_host && run.runtimeRoot !== this.runtimeRoot && approval.runtime_migration_approved, 'REFRESH_MIGRATION_REQUIRED');
+      check(new Set(refresh).size === refresh.length && refresh.length === active.length && active.every(([key]) => refresh.includes(key)), 'REFRESH_SCOPE_MISMATCH');
+      const integration = await inspectRepository(run.integrationPath);
+      check(!integration.dirty && integration.commonDir === run.commonDir && integration.branch === run.integration && integration.head === run.integrationSha, 'INTEGRATION_DRIFT');
+    }
     for (const [key, task] of active) {
       const neverStarted = !task.nativeId && (task.state === 'LEASED' || task.pausedState === 'LEASED') && approval.never_started_tasks.includes(key);
       check(task.nativeId ? approval.stopped_agents.includes(task.nativeId) : neverStarted, 'WORKER_STOP_UNCONFIRMED');
       await this.taskIdentity(run, task);
+      if (refresh.length) {
+        check(task.deadline !== undefined && task.deadline > Date.now() && task.expires > Date.now(), 'REFRESH_DEADLINE_EXPIRED');
+        await this.verifyUnitCommits(run, task, await git(task.path, 'rev-parse', 'HEAD'));
+        const resolution = this.refreshResolution(run, task);
+        check(hash(resolution.nativeArguments) === hash(task.modelResolution?.nativeArguments) && resolution.resolvedModel === task.modelResolution?.resolvedModel && resolution.resolvedEffort === task.modelResolution?.resolvedEffort, 'REFRESH_MODEL_MISMATCH');
+        const sourceKey = `refresh-source-${hash([operation, key])}`;
+        const source = this.store.snapshots(run.id).find(item => item.kind === 'attempt' && item.key === sourceKey) ?? this.store.snapshot(run.id, 'attempt', sourceKey, task);
+        check(!source.redacted, 'REFRESH_EVIDENCE_REDACTED');
+        check(source.hash === hash(this.status(run.id).data.tasks[key]), 'REFRESH_SOURCE_CHANGED');
+      }
     }
     for (const [key, dispatch] of Object.entries(run.reviewDispatches ?? {})) if (!['COMPLETED', 'STOPPED'].includes(dispatch.state)) {
       check(dispatch.nativeId ? approval.stopped_agents.includes(dispatch.nativeId) : approval.never_started_reviews.includes(key), 'REVIEW_STOP_UNCONFIRMED');
     }
     const snapshotKey = `handoff-${hash(operation)}`;
     this.store.snapshot(run.id, 'handoff', snapshotKey, this.status(run.id));
-    for (const [key, task] of active) await this.retry(run, key, task.lease, task.attempt, true, approval.reason);
+    const refreshed = [];
+    for (const [key, task] of active) {
+      if (refresh.length) refreshed.push(await this.refreshStoppedTask(run, key, task, operation));
+      else await this.retry(run, key, task.lease, task.attempt, true, approval.reason);
+    }
+    if (refresh.length) check(active.every(([, task]) => task.deadline! > Date.now() && task.expires > Date.now()), 'REFRESH_DEADLINE_EXPIRED');
     for (const dispatch of Object.values(run.reviewDispatches ?? {})) if (!['COMPLETED', 'STOPPED'].includes(dispatch.state)) dispatch.state = 'STOPPED';
     run.hostHandoffs ??= [];
     run.hostHandoffs.push({ operationId: operation, fromHost: run.host, toHost: approval.target_host, fromRuntimeRoot: run.runtimeRoot!, toRuntimeRoot: this.runtimeRoot,
       runtimeChecksum: approval.target_runtime_checksum, runtimeVersion: release.version, reason: approval.reason, actor: 'user', approvedAt: new Date().toISOString(), previousCoordinatorStopped: true, snapshotKey });
     run.host = approval.target_host; run.runtimeRoot = this.runtimeRoot; run.hostEvidence = structuredClone(native);
     this.saveRunConfig(run, next);
-    return { state: run.state, host: run.host, runtimeRoot: run.runtimeRoot, preserved: true, retryableTasks: this.ready(run) };
+    return { state: run.state, host: run.host, runtimeRoot: run.runtimeRoot, preserved: true, retryableTasks: this.ready(run), refreshedTasks: refreshed };
+  }
+  private refreshResolution(run: Run, task: Work) {
+    check(this.native && task.modelResolution, 'MODEL_RESOLUTION_REQUIRED');
+    const pinned = structuredClone(run.config);
+    pinned.hosts[run.host].roles[task.spec.role] = { model: task.modelResolution.requestedModel, effort: task.modelResolution.requestedEffort };
+    return resolveRoleModel({ config: pinned, host: run.host, role: task.spec.role, native: this.native });
+  }
+  private async refreshStoppedTask(run: Run, taskId: string, task: Work, operation: string) {
+    const sourceKey = `refresh-source-${hash([operation, taskId])}`;
+    const source = this.store.snapshots(run.id).find(item => item.kind === 'attempt' && item.key === sourceKey);
+    check(source && !source.redacted, 'REFRESH_EVIDENCE_REDACTED');
+    const resolution = this.refreshResolution(run, task), oldPath = task.path, oldBranch = task.branch;
+    this.checkpointIntent(run);
+    await this.releaseTaskPort(run, taskId);
+    task.refreshEpoch = (task.refreshEpoch ?? 0) + 1;
+    task.expires = (source.value as Work).expires; task.lease = randomUUID(); task.nativeId = null; task.state = 'ORPHANED_UNKNOWN';
+    this.checkpointIntent(run);
+    const integration = run.integrationSha!;
+    const commits = await this.verifyUnitCommits(run, task, await git(task.path, 'rev-parse', 'HEAD'));
+    if (Object.keys(task.units).length && task.base !== integration) {
+      const replay = await this.replayUnits(run, task, integration, commits, task.attempt);
+      task.units = replay.units; task.lastCommitSha = replay.head; task.dispatchBase = replay.head;
+    } else task.dispatchBase = Object.keys(task.units).length ? await git(task.path, 'rev-parse', 'HEAD') : integration;
+    task.base = integration;
+    run.candidates ??= []; run.candidates.push({ path: oldPath, branch: oldBranch });
+    const key = dispatchKey(taskId, task);
+    task.path = join(run.managedRoot, run.id, key); task.branch = `orch/${run.id}/task/${key}`;
+    task.nativeContext = structuredClone(this.native!); task.observedModel = null; task.observedEffort = null; task.modelObservation = undefined;
+    task.nativeBootstrap = undefined; task.heartbeat = undefined; task.validated = null; task.recoveryHead = undefined; task.recoveryReplay = undefined; task.dependencySetup = undefined; task.resources = undefined;
+    this.checkpointIntent(run);
+    await git(run.origin, 'worktree', 'add', '-b', task.branch, task.path, task.dispatchBase);
+    check(task.deadline! > Date.now() && task.expires > Date.now(), 'REFRESH_DEADLINE_EXPIRED');
+    task.state = 'LEASED';
+    return this.preparedDispatch(run, taskId, task, resolution);
   }
   private async markAbandoned(run: Run, operation: string, approval: ReturnType<typeof runAbandonmentSchema.parse>) {
     check(run.origin === this.origin && (await inspectRepository(this.origin)).commonDir === run.commonDir, 'STATE_ORIGIN_MISMATCH');
@@ -414,7 +471,28 @@ export class Engine {
       if (request.tool === 'orch_run_abandon') {
         result = await this.markAbandoned(run, operationId, runAbandonmentSchema.parse(request.input));
       } else if (request.tool === 'orch_run_handoff') {
-        result = await this.markHandedOff(run, operationId, runHandoffSchema.parse(request.input));
+        const approval = runHandoffSchema.parse(request.input);
+        const blocked = approval.refresh_stopped_tasks.some(taskId => run.tasks[taskId]?.state === 'BLOCKED_RECOVERY_CONFLICT');
+        if (approval.refresh_stopped_tasks.length) {
+          for (const taskId of approval.refresh_stopped_tasks) {
+            const source = this.store.snapshots(run.id).find(item => item.kind === 'attempt' && item.key === `refresh-source-${hash([operationId, taskId])}`);
+            if (!source) continue;
+            check(!source.redacted, 'REFRESH_EVIDENCE_REDACTED');
+            const currentTask = run.tasks[taskId];
+            if ((currentTask.refreshEpoch ?? 0) > ((source.value as Work).refreshEpoch ?? 0)) await this.releaseTaskPort(run, taskId);
+            if (currentTask.path !== (source.value as Work).path) { run.candidates ??= []; run.candidates.push({ path: currentTask.path, branch: currentTask.branch }); }
+            run.tasks[taskId] = { ...structuredClone(source.value as Work), refreshEpoch: currentTask.refreshEpoch };
+          }
+        }
+        this.activeOperation = operationId;
+        try {
+          if (approval.refresh_stopped_tasks.length && (blocked || approval.refresh_stopped_tasks.some(taskId => run.tasks[taskId].deadline! <= Date.now() || run.tasks[taskId].expires <= Date.now()))) {
+            for (const taskId of approval.refresh_stopped_tasks) { run.tasks[taskId].state = 'ORPHANED_UNKNOWN'; run.tasks[taskId].expires = 0; }
+            run.pausedFrom = run.state; run.state = 'PAUSED';
+            result = { state: run.state, preserved: true, refreshedTasks: [], reason: blocked ? 'RECOVERY_REPLAY_CONFLICT' : 'REFRESH_DEADLINE_EXPIRED' };
+          } else result = await this.markHandedOff(run, operationId, approval);
+        }
+        finally { this.activeOperation = null; }
       } else if (request.tool === 'orch_plan_submit') {
         const repo = await inspectRepository(run.integrationPath);
         check(run.state === 'EXECUTING' && run.plan && repo.commonDir === run.commonDir && repo.branch === run.integration && repo.head === run.targetBase && !repo.dirty, 'RECOVERY_PLAN_NOT_PROVEN');
@@ -661,29 +739,34 @@ export class Engine {
       task.branch = `orch/${run.id}/task/${taskId}-${task.attempt + 1}`;
       task.path = join(run.managedRoot, run.id, `${taskId}-${task.attempt + 1}`);
     }
-    task.attempt++; task.lease = randomUUID(); task.deadline = Date.now() + run.config.execution.task_timeout_minutes * 60000; task.expires = task.deadline; task.heartbeat = undefined;
+    task.attempt++; task.refreshEpoch = undefined; task.lease = randomUUID(); task.deadline = Date.now() + run.config.execution.task_timeout_minutes * 60000; task.expires = task.deadline; task.heartbeat = undefined;
     check(within(run.managedRoot, task.path), 'WORKTREE_ROOT_UNSAFE');
     task.configRevision = run.configRevision ?? 1; task.modelResolution = resolution; task.nativeContext = structuredClone(this.native);
     task.validated = null; task.observedModel = null; task.observedEffort = null; task.modelObservation = undefined; task.nativeBootstrap = undefined; task.resources = undefined;
     task.state = 'LEASED'; task.nativeId = null; task.recoveryReplay = undefined; this.checkpointIntent(run);
     if (!reuse || createRecovered) await git(run.origin, 'worktree', 'add', '-b', task.branch, task.path, task.dispatchBase ?? task.base);
+    return this.preparedDispatch(run, taskId, task, resolution);
+  }
+  private async preparedDispatch(run: Run, taskId: string, task: Work, resolution: ReturnType<typeof resolveRoleModel>) {
     task.dependencySetup = await prepareNodeDependencies(run.origin, task.path, task.dependencySetup);
     const reservation = await reservePort();
-    try { task.resources = await allocateAttemptResources(run.origin, run.id, attemptKey(taskId, task.attempt), { host: reservation.host, port: reservation.port }); }
+    try { task.resources = await allocateAttemptResources(run.origin, run.id, dispatchKey(taskId, task), { host: reservation.host, port: reservation.port }); }
     catch (error) { await reservation.release(); throw error; }
     this.portReservations.set(task.lease, { runId: run.id, taskId, generation: task.attempt, reservation });
+    if (task.refreshEpoch) check(task.deadline! > Date.now() && task.expires > Date.now(), 'REFRESH_DEADLINE_EXPIRED');
     this.checkpointIntent(run);
-    this.store.snapshot(run.id, 'model', `${attemptKey(taskId, task.attempt)}-resolved`, { configRevision: task.configRevision, resolution, host: this.native });
-    this.store.snapshot(run.id, 'attempt', `${attemptKey(taskId, task.attempt)}-prepared`, task);
+    this.store.snapshot(run.id, 'model', `${dispatchKey(taskId, task)}-resolved`, { configRevision: task.configRevision, resolution: task.modelResolution, host: this.native });
+    this.store.snapshot(run.id, 'attempt', `${dispatchKey(taskId, task)}-prepared`, task);
     return { runId: run.id, taskId, attemptId: attemptKey(taskId, task.attempt), host: run.host, role: task.spec.role,
       modelId: resolution.resolvedModel, effort: resolution.resolvedEffort, nativeArguments: resolution.nativeArguments, resources: task.resources, configRevision: task.configRevision, baseSha: task.dispatchBase ?? task.base, lineageBaseSha: task.base, worktreePath: task.path,
       isolation: 'core_managed', dependencySetup: task.dependencySetup, leaseId: task.lease, fencingToken: task.attempt, expiresAt: new Date(task.expires).toISOString(), taskBrief: task.spec };
   }
-  private async replayUnits(run: Run, task: Work, integration: string, commits: { unitId: string; sha: string }[]) {
+  private async replayUnits(run: Run, task: Work, integration: string, commits: { unitId: string; sha: string }[], toAttempt = task.attempt + 1) {
     await git(run.origin, 'merge-base', '--is-ancestor', task.base, integration);
-    const sourceSnapshotKey = `recovery-${hash([task.spec.id, task.attempt, this.activeOperation])}`;
+    const sourceSnapshotKey = `recovery-${hash([task.spec.id, task.attempt, this.activeOperation, task.refreshEpoch ?? 0])}`;
     this.store.snapshot(run.id, 'attempt', sourceSnapshotKey, task);
-    const candidate = { path: join(run.managedRoot, run.id, `recovery-${this.activeOperation}`), branch: `orch/${run.id}/recovery/${this.activeOperation}` };
+    const name = `recovery-${hash([task.spec.id, this.activeOperation, task.refreshEpoch ?? 0])}`;
+    const candidate = { path: join(run.managedRoot, run.id, name), branch: `orch/${run.id}/recovery/${name}` };
     run.candidates ??= []; run.candidates.push(candidate);
     task.recoveryReplay = { ...candidate, base: integration }; this.checkpointIntent(run);
     await git(run.origin, 'worktree', 'add', '-b', candidate.branch, candidate.path, integration);
@@ -700,8 +783,8 @@ export class Engine {
     const head = await git(candidate.path, 'rev-parse', 'HEAD');
     await this.verifyUnitCommits(run, { ...task, path: candidate.path, base: integration, units }, head);
     check(await git(run.integrationPath, 'rev-parse', 'HEAD') === integration, 'INTEGRATION_DRIFT');
-    this.store.snapshot(run.id, 'attempt', `replayed-${hash([task.spec.id, task.attempt + 1, this.activeOperation])}`, {
-      sourceSnapshotKey, taskId: task.spec.id, fromAttempt: task.attempt, toAttempt: task.attempt + 1, fromBase: task.base, toBase: integration,
+    this.store.snapshot(run.id, 'attempt', `replayed-${hash([task.spec.id, toAttempt, this.activeOperation, task.refreshEpoch ?? 0])}`, {
+      sourceSnapshotKey, taskId: task.spec.id, fromAttempt: task.attempt, toAttempt, fromBase: task.base, toBase: integration,
       units: commits.map(commit => ({ unitId: commit.unitId, fromSha: commit.sha, toSha: units[commit.unitId] })),
     });
     return { head, units };
@@ -835,7 +918,7 @@ export class Engine {
     if (bootstrap) task.nativeBootstrap = structuredClone(bootstrap);
     task.observedModel = observedModel; task.observedEffort = observedEffort;
     task.nativeId = nativeAgentId.parse(nativeId); run.implementers ??= []; run.implementers.push(task.nativeId); task.state = 'RUNNING';
-    this.store.snapshot(run.id, 'model', `${attemptKey(taskId, task.attempt)}-observed`, { nativeId: task.nativeId, observation });
+    this.store.snapshot(run.id, 'model', `${dispatchKey(taskId, task)}-observed`, { nativeId: task.nativeId, observation });
     if (observation.policyViolation) {
       task.pausedState = 'RUNNING'; task.state = 'ORPHANED_UNKNOWN'; run.pausedFrom = run.state; run.state = 'PAUSED'; run.pauseStartedAt = Date.now();
       return { state: task.state, reason: 'MODEL_OBSERVATION_MISMATCH', observation };

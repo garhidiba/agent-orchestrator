@@ -73,6 +73,15 @@
     "runtime_migration_approved": {
       "type": "boolean",
       "const": true
+    },
+    "refresh_stopped_tasks": {
+      "default": [],
+      "maxItems": 1024,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$"
+      }
     }
   },
   "required": [
@@ -86,7 +95,8 @@
     "target_host",
     "expected_runtime_root",
     "target_runtime_root",
-    "target_runtime_checksum"
+    "target_runtime_checksum",
+    "refresh_stopped_tasks"
   ],
   "additionalProperties": false
 }

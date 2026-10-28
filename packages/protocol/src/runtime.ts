@@ -30,6 +30,7 @@ export const runHandoffSchema = runAbandonmentSchema.omit({ force: true }).exten
   expected_runtime_root: z.string().min(1), target_runtime_root: z.string().min(1),
   target_runtime_checksum: z.string().regex(/^[a-f0-9]{64}$/),
   runtime_migration_approved: z.literal(true).optional(),
+  refresh_stopped_tasks: z.array(id).max(1024).default([]),
 });
 export const findingSchema = z.strictObject({
   id, severity: z.enum(['critical', 'high', 'medium', 'low']), category: z.string().min(1),
