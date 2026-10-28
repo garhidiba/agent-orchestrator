@@ -485,8 +485,10 @@ export class Engine {
   async gate(run: Run, stage: string, path: string, task: string | null = null) {
     enforceRunBudget(run);
     await prepareNodeDependencies(run.origin, path, task ? run.tasks[task].dependencySetup : null);
+    const queued = task !== null && run.tasks[task].state === 'MERGE_QUEUED';
+    const taskDeadline = task === null || queued ? null : run.tasks[task].deadline!;
     let commands = run.config.quality.commands.filter(command => command.stages.includes(stage as 'baseline') && (task === null || run.tasks[task].spec.verification_ids.includes(command.id)));
-    if (!commands.length && run.missingTestsWaiver) commands = [{ id: 'missing-tests', executable: process.execPath, args: [], cwd: '.', stages: ['baseline', 'task', 'integration', 'final'], required: true, timeout_seconds: 1 }];
+    if (!commands.length && run.missingTestsWaiver && !queued) commands = [{ id: 'missing-tests', executable: process.execPath, args: [], cwd: '.', stages: ['baseline', 'task', 'integration', 'final'], required: true, timeout_seconds: 1 }];
     check(commands.some(command => command.required), 'REQUIRED_GATES_MISSING');
     const fingerprint = await sourceFingerprint(path);
     const result: Gate = { id: `gate-${randomUUID()}`, details: [], stage, task, sha: await git(path, 'rev-parse', 'HEAD'), source: fingerprint,
@@ -499,17 +501,17 @@ export class Engine {
     result.environment = environmentFingerprint(result.environmentOverrides);
     result.dependencies = await dependencyFingerprint(path);
     for (const command of commands) {
-      const budgetExpired = activeElapsedMs(run) >= run.config.execution.run_timeout_minutes * 60000 || task !== null && Date.now() >= run.tasks[task].deadline!;
+      const budgetExpired = activeElapsedMs(run) >= run.config.execution.run_timeout_minutes * 60000 || taskDeadline !== null && Date.now() >= taskDeadline;
       const cwd = await realpath(resolve(path, command.cwd));
       check(cwd === await realpath(path) || within(await realpath(path), cwd), 'GATE_CWD_OUTSIDE_ROOT');
       this.checkpointIntent(run);
       const startedAt = new Date().toISOString();
       let status: GateResult['status'] = 'passed', exitCode: number | null = 0, output = '';
-      const waiver = (run.waivers ?? []).find(item => item.stage === stage && item.taskId === task && item.gateId === command.id && item.sha === result.sha && item.source === fingerprint && item.command === hash(command)) ?? (command.id === 'missing-tests' ? run.missingTestsWaiver : undefined);
+      const waiver = queued ? undefined : (run.waivers ?? []).find(item => item.stage === stage && item.taskId === task && item.gateId === command.id && item.sha === result.sha && item.source === fingerprint && item.command === hash(command)) ?? (command.id === 'missing-tests' ? run.missingTestsWaiver : undefined);
       if (budgetExpired) { status = 'not_run'; exitCode = null; output = 'Not run: execution budget exhausted'; result.status = 'timed_out'; }
       else if (waiver) { status = 'waived'; exitCode = null; output = `User waiver: ${waiver.reason}`; if (result.status === 'passed') result.status = 'waived'; }
       else try {
-        const response = await exec(command.executable, command.args, { cwd, env: environment, timeout: Math.max(1, Math.min(command.timeout_seconds * 1000, run.config.execution.run_timeout_minutes * 60000 - activeElapsedMs(run), task ? run.tasks[task].deadline! - Date.now() : Infinity)), killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 });
+        const response = await exec(command.executable, command.args, { cwd, env: environment, timeout: Math.max(1, Math.min(command.timeout_seconds * 1000, run.config.execution.run_timeout_minutes * 60000 - activeElapsedMs(run), taskDeadline === null ? Infinity : taskDeadline - Date.now())), killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 });
         output = `${response.stdout}\n${response.stderr}`;
       } catch (error) {
         const failure = error as { killed?: boolean; code?: number; stdout?: string; stderr?: string };
@@ -517,7 +519,7 @@ export class Engine {
         output = `${failure.stdout ?? ''}\n${failure.stderr ?? ''}`;
         if (command.required) result.status = status;
       }
-      if (activeElapsedMs(run) >= run.config.execution.run_timeout_minutes * 60000 || task && Date.now() >= run.tasks[task].deadline!) { if (status !== 'not_run') status = 'timed_out'; result.status = 'timed_out'; }
+      if (activeElapsedMs(run) >= run.config.execution.run_timeout_minutes * 60000 || taskDeadline !== null && Date.now() >= taskDeadline) { if (status !== 'not_run') status = 'timed_out'; result.status = 'timed_out'; }
       const recordId = `quality-${randomUUID()}`;
       const logRef = await writeStateArtifact(run.origin, run.id, `${recordId}.log`, redact(output), 'logs');
       result.details!.push(gateResultSchema.parse({ id: recordId, runId: run.id, taskId: task, gateId: command.id,
@@ -931,7 +933,13 @@ export class Engine {
     enforceRunBudget(run);
     check(run.state === 'EXECUTING', 'INVALID_RUN_STATE');
     const task = run.tasks[taskId]; check(task?.state === 'MERGE_QUEUED', 'TASK_NOT_READY');
-    await this.verifySubmission(run, task);
+    try { await this.verifySubmission(run, task); }
+    catch (error) {
+      if (!(error instanceof Error) || error.message !== 'VALIDATION_STALE') throw error;
+      const gate = await this.gate(run, 'task', task.path, taskId);
+      if (!acceptedGate(gate)) return gate;
+      await this.verifySubmission(run, task);
+    }
     check(expectedSha === (run.integrationSha ?? run.targetBase) && await git(run.integrationPath, 'rev-parse', 'HEAD') === expectedSha, 'INTEGRATION_DRIFT');
     check(!(await inspectRepository(run.integrationPath)).dirty, 'DIRTY_CHECKOUT');
     const taskHead = await git(task.path, 'rev-parse', 'HEAD');
