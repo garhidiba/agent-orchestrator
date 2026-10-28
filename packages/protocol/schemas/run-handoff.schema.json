@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "approved": {
+      "type": "boolean",
+      "const": true
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "previous_coordinator_stopped": {
+      "type": "boolean",
+      "const": true
+    },
+    "stopped_agents": {
+      "default": [],
+      "maxItems": 1024,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "pattern": "^[^\\x00-\\x1f\\x7f]+$"
+      }
+    },
+    "never_started_tasks": {
+      "default": [],
+      "maxItems": 1024,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$"
+      }
+    },
+    "never_started_reviews": {
+      "default": [],
+      "maxItems": 1024,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$"
+      }
+    },
+    "expected_host": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude"
+      ]
+    },
+    "target_host": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude"
+      ]
+    },
+    "expected_runtime_root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "target_runtime_root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "target_runtime_checksum": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "runtime_migration_approved": {
+      "type": "boolean",
+      "const": true
+    }
+  },
+  "required": [
+    "approved",
+    "reason",
+    "previous_coordinator_stopped",
+    "stopped_agents",
+    "never_started_tasks",
+    "never_started_reviews",
+    "expected_host",
+    "target_host",
+    "expected_runtime_root",
+    "target_runtime_root",
+    "target_runtime_checksum"
+  ],
+  "additionalProperties": false
+}

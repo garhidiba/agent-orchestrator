@@ -25,6 +25,12 @@ export const runAbandonmentSchema = z.strictObject({
   stopped_agents: z.array(nativeAgentId).max(1024).default([]),
   never_started_tasks: z.array(id).max(1024).default([]), never_started_reviews: z.array(id).max(1024).default([]),
 });
+export const runHandoffSchema = runAbandonmentSchema.omit({ force: true }).extend({
+  expected_host: z.enum(['codex', 'claude']), target_host: z.enum(['codex', 'claude']),
+  expected_runtime_root: z.string().min(1), target_runtime_root: z.string().min(1),
+  target_runtime_checksum: z.string().regex(/^[a-f0-9]{64}$/),
+  runtime_migration_approved: z.literal(true).optional(),
+});
 export const findingSchema = z.strictObject({
   id, severity: z.enum(['critical', 'high', 'medium', 'low']), category: z.string().min(1),
   path: relativePath, symbol: z.string().min(1), line_start: z.int().positive(), line_end: z.int().positive(),

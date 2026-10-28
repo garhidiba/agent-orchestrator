@@ -9,7 +9,7 @@ For duplicate requests, reuse the original operation ID and inputs. After a comm
 | Condition | Action |
 |---|---|
 | BLOCKED_CAPABILITY / NEEDS_RELOAD | Keep state; report missing adapter proof or reload requirement; no silent fallback |
-| RUNTIME_VERSION_PINNED | Use the original immutable runtimeRoot for pending execution. Pure completed-operation response/lock housekeeping and approved administrative disposal do not execute old code and may cross versions; stored runtimeRoot stays unchanged |
+| RUNTIME_VERSION_PINNED | Use the pinned runtime for ordinary execution/reconciliation. Completed-operation housekeeping and approved administrative disposal may cross versions without changing the pin. An explicit approved host handoff may repin a verified release with immutable provenance as described below |
 | STATE_CONFLICT / CONFIG_CONFLICT | Reread state/config, retain concurrent changes, re-evaluate |
 | BASE_SHA_MISMATCH / ownership violation | Stop writes; preserve changes and repair assignment/base deliberately |
 | ORPHANED_UNKNOWN / stop unconfirmed | Preserve worktree and determine real native lifecycle |
@@ -33,6 +33,35 @@ Begin `orch_cleanup` with `dry_run=true`; inspect every proposed removal. Unknow
 `orch_task_retry` requires task/lease/fencing identity, confirmed `native_stopped` and a reason. It preserves failed dirty work and committed units, fences the old attempt, and enforces the attempt limit. Pause/resume uses `stopped_agents`; a never-started leased task requires explicit `never_started_tasks` evidence instead of a fabricated stopped agent. Checkpoints do not renew leases. `orch_heartbeat` uses the normal authenticated CAS envelope and task/lease/fencing identity plus `native_id` and `receipt:{source:"host_status"|"host_event",status:"running",observedAt:epochMs,evidenceRef}` from an actual host observation. A model self-report, stale/future receipt or expired lease cannot establish fresh liveness. Confirmation reports actual `leaseRenewed` and preserves the fixed attempt deadline; it does not create an extra timeout window. `orch_liveness_reconcile` preserves uncertain expired workers as `ORPHANED_UNKNOWN`; it is not a native stop command. Persist a report with `orch_report persist=true` only when authorized; that action requires coordinator authentication.
 
 Session configuration is process-local: restarting the MCP server removes it. Reread effective config and reapply only authorized overrides using the new `hashes.session`; never claim the previous ephemeral session survived. Explicit paused time is tracked outside the active run budget. Waivers and run-scoped finalization consent are persisted separately from ordinary settings and do not authorize a native capability bypass.
+
+## Continue the same run on another host
+
+Use authenticated CAS `orch_run_handoff` for Claude-to-Codex or Codex-to-Claude continuation. Keep this conversation as coordinator; do not create a replacement run. Confirm the old coordinator and every active native writer/reviewer have actually stopped. Preserve dirty files, worktrees, branches, receipts and state first. Reconcile every pending operation using its pinned runtime before handoff; the handoff has no force option. A pause is optional and retains the write lock; `ORPHANED_UNKNOWN` still requires actual stop evidence.
+
+Connect the new host's actual native tool through `orch_host_connect` (or refresh its current receipt), then read current run status and effective config. The handoff checks the physical origin/common directory, unchanged target branch/SHA and integration branch/SHA, and resolves every new-host role against the authenticated native capability/model metadata. Model and effort pins must be supported exactly; `allow_cross_host:false` continues to forbid cross-provider model substitution. Only host/model policy settings may change during takeover; unrelated run policy changes require a new run. Reapply any authorized process-local session config to the new server before handing off.
+
+Call `orch_run_handoff` with the ordinary authenticated envelope and input:
+
+```json
+{
+  "approved": true,
+  "reason": "Continue the existing run from the confirmed-stopped host",
+  "previous_coordinator_stopped": true,
+  "expected_host": "claude",
+  "target_host": "codex",
+  "expected_runtime_root": "/absolute/old/immutable/runtime/",
+  "target_runtime_root": "/absolute/new/immutable/runtime/",
+  "target_runtime_checksum": "<SHA-256 of the new release.json>",
+  "runtime_migration_approved": true,
+  "stopped_agents": ["<every active old native ID>"],
+  "never_started_tasks": [],
+  "never_started_reviews": []
+}
+```
+
+`runtime_migration_approved:true` is required when the pin changes. The executing server's runtime root must exactly equal `target_runtime_root`, including its trailing slash. The runtime must be a release produced by `packRelease` and pass its manifest checksum, complete content, platform and runtime checks. Package a fresh immutable directory with the existing `orch:manage pack --source <source> --bundle <fresh-directory> --version <version>` command or `packRelease(source,bundle)`, retain the returned checksum, and start that bundle's `packages/mcp-server/src/stdio.ts --host <new-host> --origin <client-project>`. A scoped SDK MCP client may connect directly to this fresh server when the registered server lacks the new operation; use the same authenticated native handshake/relay, never SQL edits, old-bundle replacement or a second AI CLI. Global skills/config installation is unnecessary for this administrative activation. Retain the verified release at its approved path for subsequent execution.
+
+The operation preserves a full pre-handoff snapshot, old host evidence, config revisions, attempts, gates, reviews and queued/integrated results. It records both runtime pins plus the new release version/checksum, then fences confirmed-stopped active attempts through bounded retry and marks abandoned read-only dispatches STOPPED without approving them. It never copies dirty work. Normal prepare creates the replacement attempt; give its worker the preserved attempt path and reconcile only owned changes against the new assigned base. Attempt exhaustion remains blocked. A PAUSED run remains paused; use ordinary `orch_run_control action=resume` before preparation. Keep the same run ID, operation journal and write lock. Ordinary execution remains pinned, so the old runtime cannot continue writing after migration. Ordinary pending-operation reconciliation also requires the current server host, even when both hosts share one runtime; completed-response housekeeping remains allowed. If handoff itself is interrupted, reconnect the approved target host/runtime and reconcile its original operation ID after verifying coordinator stop; do not invent another takeover.
 
 ## Gate failures, target movement and findings
 

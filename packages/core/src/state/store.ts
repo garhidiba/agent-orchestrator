@@ -10,7 +10,7 @@ import { id, requireCondition } from '../../../protocol/src/runtime.ts';
 export const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value, (_key, item: unknown) =>
   item !== null && typeof item === 'object' && !Array.isArray(item) ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item)).digest('hex');
 
-export type SnapshotKind = 'config' | 'catalog' | 'model' | 'attempt' | 'plan';
+export type SnapshotKind = 'config' | 'catalog' | 'model' | 'attempt' | 'plan' | 'handoff';
 export type StateSnapshot = { kind: SnapshotKind; key: string; hash: string; createdAt: string; value: unknown; redacted: boolean };
 
 const tableDefinitions = {
@@ -89,7 +89,7 @@ export class Store {
   }
   snapshot(run: string, kind: SnapshotKind, key: string, value: unknown): StateSnapshot {
     this.get(run); id.parse(key);
-    requireCondition(['config', 'catalog', 'model', 'attempt', 'plan'].includes(kind), 'SNAPSHOT_KIND_INVALID');
+    requireCondition(['config', 'catalog', 'model', 'attempt', 'plan', 'handoff'].includes(kind), 'SNAPSHOT_KIND_INVALID');
     const serialized = JSON.stringify(value);
     requireCondition(serialized !== undefined, 'SNAPSHOT_VALUE_INVALID');
     const fingerprint = hash(value), data = JSON.stringify(redactEvidence(JSON.parse(serialized)));

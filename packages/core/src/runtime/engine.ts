@@ -12,9 +12,9 @@ import { writeRequirements } from '../requirements/index.ts';
 import { writeStateArtifact } from '../state/artifacts.ts';
 import { Store, hash } from '../state/store.ts';
 import { git, inspectRepository, preflightRepository, within, owns, overlaps, changedPaths, sourceFingerprint } from '../git/repository.ts';
-import { configSchema } from '../../../protocol/src/config.ts';
+import { configSchema, roleIds } from '../../../protocol/src/config.ts';
 import type { Config } from '../../../protocol/src/config.ts';
-import { id, nativeAgentId, requirementsSchema, requireCondition as check, validatePlan, planAmendmentSchema, runAbandonmentSchema, reviewSchema, taskResultSchema, gateResultSchema } from '../../../protocol/src/runtime.ts';
+import { id, nativeAgentId, requirementsSchema, requireCondition as check, validatePlan, planAmendmentSchema, runAbandonmentSchema, runHandoffSchema, reviewSchema, taskResultSchema, gateResultSchema } from '../../../protocol/src/runtime.ts';
 import type { Task, Plan, Review, GateResult, Requirements } from '../../../protocol/src/runtime.ts';
 
 import { completionEvidence, findingBlocks } from './completion.ts';
@@ -98,6 +98,7 @@ export type Run = {
   candidates?: { path: string; branch: string }[];
   targetConflict?: { path: string; branch: string; expected: string; target: string };
   runtimeRoot?: string; configRevision?: number; configRevisions?: { revision: number; hash: string; roles: Config['hosts']; timestamp: string }[];
+  hostHandoffs?: { operationId: string; fromHost: Run['host']; toHost: Run['host']; fromRuntimeRoot: string; toRuntimeRoot: string; runtimeChecksum: string; runtimeVersion: string; reason: string; actor: 'user'; approvedAt: string; previousCoordinatorStopped: true; snapshotKey: string }[];
   abandonment?: { forced: boolean; operationId: string; unresolvedOperations: string[]; actor: 'user'; reason: string; approvedAt: string; previousCoordinatorStopped: true; stoppedAgents: string[]; neverStartedTasks: string[]; neverStartedReviews: string[] };
   finalizationApproval?: { actor: 'user'; target: string; runId: string; approvedAt: string };
   activeTimeMs?: number; activeSince?: number | null; pauseTimeMs?: number; pauseStartedAt?: number; finalizedAt?: string;
@@ -163,14 +164,14 @@ export class Engine {
     if (this.native) this.store.snapshot(runId, 'catalog', `host-${hash(this.native)}`, this.native);
     return { runId, version: 0 };
   }
-  async change<T>(runId: string, operation: string, expected: number, input: unknown, fn: (run: Run) => Promise<T>, administrativeAbandon = false) {
+  async change<T>(runId: string, operation: string, expected: number, input: unknown, fn: (run: Run) => Promise<T>, administrative = false) {
     id.parse(operation);
     const snapshot = this.status(runId);
     const mutex = await this.acquireOperationMutex(snapshot.data, operation);
     try {
       const current = this.status(runId);
-      // Disposal is administrative; it never executes or upgrades a pinned runtime.
-      check(current.data.runtimeRoot === this.runtimeRoot || administrativeAbandon, 'RUNTIME_VERSION_PINNED');
+      // Only explicit administrative disposal/handoff can cross the saved execution pin.
+      check(current.data.runtimeRoot === this.runtimeRoot || administrative, 'RUNTIME_VERSION_PINNED');
       const completedOperation = this.canReleaseWriteLock(current.data) && this.store.operation(runId, operation)?.status === 'complete';
       if (completedOperation) {
         const previous = this.store.intent(runId, operation, input, current)!;
@@ -309,6 +310,51 @@ export class Engine {
     }
     return this.change(runId, operation, expected, { tool: 'orch_run_abandon', input: approval }, run => this.markAbandoned(run, operation, approval), true);
   }
+  async handoff(runId: string, operation: string, expected: number, input: unknown) {
+    const approval = runHandoffSchema.parse(input);
+    check(approval.target_runtime_root === this.runtimeRoot, 'RUNTIME_TARGET_MISMATCH');
+    return this.change(runId, operation, expected, { tool: 'orch_run_handoff', input: approval }, run => this.markHandedOff(run, operation, approval), true);
+  }
+  private async markHandedOff(run: Run, operation: string, approval: ReturnType<typeof runHandoffSchema.parse>) {
+    check(!['COMPLETED', 'CANCELLED', 'FAILED'].includes(run.state) && !run.abandonment, 'INVALID_RUN_STATE');
+    check(run.host === approval.expected_host && run.host !== approval.target_host, 'HOST_HANDOFF_CONFLICT');
+    check(run.runtimeRoot === approval.expected_runtime_root && approval.target_runtime_root === this.runtimeRoot, 'RUNTIME_TARGET_MISMATCH');
+    check(run.runtimeRoot === this.runtimeRoot || approval.runtime_migration_approved, 'RUNTIME_MIGRATION_APPROVAL_REQUIRED');
+    check(this.store.pending(run.id).every(item => item.id === operation), 'RECONCILIATION_REQUIRED');
+    // Handoff may repin only an explicitly approved, checksum-verified release; never mutate the old bundle.
+    const { verifyRelease } = await import('../../../installer/src/installation/index.ts');
+    const release = await verifyRelease(this.runtimeRoot, approval.target_runtime_checksum);
+    const native = this.native, origin = await inspectRepository(this.origin);
+    check(run.origin === this.origin && origin.root === run.origin && origin.commonDir === run.commonDir, 'STATE_ORIGIN_MISMATCH');
+    check(origin.branch === run.target && origin.head === run.targetBase, 'TARGET_DRIFT');
+    check(native?.verified && native.contextMatches && native.host === approval.target_host && native.source === 'coordinator_native_receipt' &&
+      native.evidence.at(-2) === origin.root && native.evidence.at(-1) === origin.head, 'HOST_CONTEXT_MISMATCH');
+    if (run.plan) {
+      const integration = await inspectRepository(run.integrationPath);
+      check(integration.commonDir === run.commonDir && integration.branch === run.integration && integration.head === run.integrationSha, 'INTEGRATION_DRIFT');
+    }
+    const next = await this.readRunConfig(run, true);
+    for (const role of roleIds) resolveRoleModel({ config: next, host: approval.target_host, role, native });
+    const active = Object.entries(run.tasks).filter(([, task]) => activeWriterStates.has(task.state));
+    for (const [key, task] of active) {
+      const neverStarted = !task.nativeId && (task.state === 'LEASED' || task.pausedState === 'LEASED') && approval.never_started_tasks.includes(key);
+      check(task.nativeId ? approval.stopped_agents.includes(task.nativeId) : neverStarted, 'WORKER_STOP_UNCONFIRMED');
+      await this.taskIdentity(run, task);
+    }
+    for (const [key, dispatch] of Object.entries(run.reviewDispatches ?? {})) if (!['COMPLETED', 'STOPPED'].includes(dispatch.state)) {
+      check(dispatch.nativeId ? approval.stopped_agents.includes(dispatch.nativeId) : approval.never_started_reviews.includes(key), 'REVIEW_STOP_UNCONFIRMED');
+    }
+    const snapshotKey = `handoff-${hash(operation)}`;
+    this.store.snapshot(run.id, 'handoff', snapshotKey, this.status(run.id));
+    for (const [key, task] of active) await this.retry(run, key, task.lease, task.attempt, true, approval.reason);
+    for (const dispatch of Object.values(run.reviewDispatches ?? {})) if (!['COMPLETED', 'STOPPED'].includes(dispatch.state)) dispatch.state = 'STOPPED';
+    run.hostHandoffs ??= [];
+    run.hostHandoffs.push({ operationId: operation, fromHost: run.host, toHost: approval.target_host, fromRuntimeRoot: run.runtimeRoot!, toRuntimeRoot: this.runtimeRoot,
+      runtimeChecksum: approval.target_runtime_checksum, runtimeVersion: release.version, reason: approval.reason, actor: 'user', approvedAt: new Date().toISOString(), previousCoordinatorStopped: true, snapshotKey });
+    run.host = approval.target_host; run.runtimeRoot = this.runtimeRoot; run.hostEvidence = structuredClone(native);
+    this.saveRunConfig(run, next);
+    return { state: run.state, host: run.host, runtimeRoot: run.runtimeRoot, preserved: true, retryableTasks: this.ready(run) };
+  }
   private async markAbandoned(run: Run, operation: string, approval: ReturnType<typeof runAbandonmentSchema.parse>) {
     check(run.origin === this.origin && (await inspectRepository(this.origin)).commonDir === run.commonDir, 'STATE_ORIGIN_MISMATCH');
     check(run.state !== 'COMPLETED' && !run.abandonment, 'INVALID_RUN_STATE');
@@ -335,7 +381,7 @@ export class Engine {
     const version = this.status(run.id).version;
     this.store.db.prepare('UPDATE operations SET snapshot=? WHERE run_id=? AND id=?').run(JSON.stringify({ version, data: run }), run.id, this.activeOperation);
   }
-  async reconcile(runId: string, operationId: string, previousCoordinatorStopped: boolean) {
+  async reconcile(runId: string, operationId: string, previousCoordinatorStopped: boolean, serverHost?: Run['host']) {
     check(previousCoordinatorStopped, 'COORDINATOR_STOP_UNCONFIRMED');
     const current = this.status(runId);
     const pendingRecord = this.store.pending(runId).find(item => item.id === operationId);
@@ -344,7 +390,10 @@ export class Engine {
     const completedTerminal = completedOperation && this.canReleaseWriteLock(current.data);
     check(pendingRecord || completedOperation, 'OPERATION_NOT_PENDING');
     const pendingTool = (pendingRecord?.input as { tool?: string } | null)?.tool;
-    const administrative = pendingTool === 'orch_run_abandon' || completedOperation;
+    const handoffTarget = (pendingRecord?.input as { input?: { target_host?: string } } | null)?.input?.target_host;
+    check(!serverHost || completedOperation || pendingTool === 'orch_run_abandon' ||
+      (pendingTool === 'orch_run_handoff' ? handoffTarget === serverHost : current.data.host === serverHost), 'RUN_HOST_MISMATCH');
+    const administrative = pendingTool === 'orch_run_abandon' || pendingTool === 'orch_run_handoff' || completedOperation;
     check(current.data.runtimeRoot === this.runtimeRoot || administrative, 'RUNTIME_VERSION_PINNED');
     const lockText = await readFile(join(current.data.commonDir, 'orch', 'locks', 'write.json'), 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
     const owner = lockText ? JSON.parse(lockText) as { runId: string } : null;
@@ -364,6 +413,8 @@ export class Engine {
       let result: unknown;
       if (request.tool === 'orch_run_abandon') {
         result = await this.markAbandoned(run, operationId, runAbandonmentSchema.parse(request.input));
+      } else if (request.tool === 'orch_run_handoff') {
+        result = await this.markHandedOff(run, operationId, runHandoffSchema.parse(request.input));
       } else if (request.tool === 'orch_plan_submit') {
         const repo = await inspectRepository(run.integrationPath);
         check(run.state === 'EXECUTING' && run.plan && repo.commonDir === run.commonDir && repo.branch === run.integration && repo.head === run.targetBase && !repo.dirty, 'RECOVERY_PLAN_NOT_PROVEN');
@@ -544,19 +595,22 @@ export class Engine {
     run.pausedFrom = Object.values(run.tasks).every(task => task.state === 'INTEGRATED') ? 'VERIFYING' : 'EXECUTING';
     return { state: run.state, revision };
   }
-  async syncConfig(run: Run) {
-    if (this.readConfig) {
-      const next = configSchema.parse(await this.readConfig());
-      const policies = (value: Config) => ({ ...value, hosts: undefined, model_selection: undefined });
-      check(hash(policies(next)) === hash(policies(run.config)) && hash(next.hosts[run.host === 'codex' ? 'claude' : 'codex']) === hash(run.config.hosts[run.host === 'codex' ? 'claude' : 'codex']), 'RUN_POLICY_CHANGE_REQUIRES_NEW_RUN');
-      if (hash(next) !== hash(run.config)) {
-        run.config = next; run.configRevision = (run.configRevision ?? 1) + 1; run.configRevisions ??= [];
-        run.configRevisions.push({ revision: run.configRevision, hash: hash(next), roles: structuredClone(next.hosts), timestamp: new Date().toISOString() });
-      }
+  private async readRunConfig(run: Run, handoff = false) {
+    const next = this.readConfig ? configSchema.parse(await this.readConfig()) : run.config;
+    const policies = (value: Config) => ({ ...value, hosts: undefined, model_selection: undefined });
+    const inactive = run.host === 'codex' ? 'claude' : 'codex';
+    check(hash(policies(next)) === hash(policies(run.config)) && (handoff || hash(next.hosts[inactive]) === hash(run.config.hosts[inactive])), 'RUN_POLICY_CHANGE_REQUIRES_NEW_RUN');
+    return next;
+  }
+  private saveRunConfig(run: Run, next: Config) {
+    if (hash(next) !== hash(run.config)) {
+      run.config = next; run.configRevision = (run.configRevision ?? 1) + 1; run.configRevisions ??= [];
+      run.configRevisions.push({ revision: run.configRevision, hash: hash(next), roles: structuredClone(next.hosts), timestamp: new Date().toISOString() });
     }
     this.store.snapshot(run.id, 'config', `revision-${run.configRevision ?? 1}`, run.config);
     if (this.native) this.store.snapshot(run.id, 'catalog', `host-${hash(this.native)}`, this.native);
   }
+  async syncConfig(run: Run) { this.saveRunConfig(run, await this.readRunConfig(run)); }
   async prepare(run: Run, taskId: string) {
     check(run.state === 'EXECUTING', 'INVALID_RUN_STATE');
     check(this.native?.verified && this.native.contextMatches && this.native.host === run.host && this.native.evidence.length, 'BLOCKED_CAPABILITY');
@@ -708,7 +762,7 @@ export class Engine {
     const task = run.tasks[taskId]; check(task, 'TASK_NOT_FOUND');
     check(task.lease === lease && task.attempt === generation, 'STALE_LEASE');
     check(nativeStopped && reason.trim().length > 0, 'WORKER_STOP_UNCONFIRMED');
-    check(['RUNNING', 'LEASED', 'ORPHANED_UNKNOWN'].includes(task.state), 'INVALID_TASK_STATE');
+    check(activeWriterStates.has(task.state), 'INVALID_TASK_STATE');
     await this.taskIdentity(run, task);
     await this.releaseTaskPort(run, taskId);
     task.attempts ??= []; task.attempts.push({ number: task.attempt, path: task.path, branch: task.branch, nativeId: task.nativeId, stopped: true, reason, configRevision: task.configRevision, modelResolution: structuredClone(task.modelResolution), observedModel: task.observedModel, observedEffort: task.observedEffort, modelObservation: structuredClone(task.modelObservation), resources: task.resources });

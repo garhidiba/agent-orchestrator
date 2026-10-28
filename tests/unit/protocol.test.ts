@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
-import { requirementsSchema, taskResultSchema, gateResultSchema, recommendationSchema, envelopeSchema, sha, relativePath, validatePlan, taskSchema, planSchema, planAmendmentSchema, runAbandonmentSchema, reviewSchema } from '../../packages/protocol/src/runtime.ts';
+import { requirementsSchema, taskResultSchema, gateResultSchema, recommendationSchema, envelopeSchema, sha, relativePath, validatePlan, taskSchema, planSchema, planAmendmentSchema, runAbandonmentSchema, runHandoffSchema, reviewSchema } from '../../packages/protocol/src/runtime.ts';
 
 const hash = 'a'.repeat(40);
 const task = { id: 'T1', title: 'work', role: 'coder', depends_on: [], acceptance_ids: ['AC-1'], read_paths: [], write_paths: ['src/**'], exclusive_resources: [], risk: 'low', complexity: 'low', verification_ids: ['unit'], commit_units: [{ id: 'U1', purpose: 'feature' }] };
@@ -45,7 +45,7 @@ test('plans reject repeated dependency, acceptance and unit references', () => {
 });
 
 test('published JSON schemas match the canonical runtime schemas', async () => {
-  for (const [name, schema] of [['requirements', requirementsSchema], ['task', taskSchema], ['plan', planSchema], ['plan-amendment', planAmendmentSchema], ['run-abandonment', runAbandonmentSchema], ['task-result', taskResultSchema], ['gate-result', gateResultSchema], ['review', reviewSchema], ['recommendation', recommendationSchema], ['write-envelope', envelopeSchema]] as const) {
+  for (const [name, schema] of [['requirements', requirementsSchema], ['task', taskSchema], ['plan', planSchema], ['plan-amendment', planAmendmentSchema], ['run-abandonment', runAbandonmentSchema], ['run-handoff', runHandoffSchema], ['task-result', taskResultSchema], ['gate-result', gateResultSchema], ['review', reviewSchema], ['recommendation', recommendationSchema], ['write-envelope', envelopeSchema]] as const) {
     const artifact = JSON.parse(await readFile(new URL(`../../packages/protocol/schemas/${name}.schema.json`, import.meta.url), 'utf8'));
     assert.deepEqual(artifact, z.toJSONSchema(schema), name);
   }
