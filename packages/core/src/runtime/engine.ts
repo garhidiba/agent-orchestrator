@@ -26,7 +26,7 @@ import { prepareNodeDependencies, dependencyFingerprint, environmentFingerprint,
 
 const exec = promisify(execFile);
 type Gate = { dependencies?: string; environment?: string; environmentOverrides?: Record<string, string>; id?: string; details?: GateResult[]; stage: string; task: string | null; sha: string; source: string; commands: string; status: string; results: { id: string; status: string; exitCode: number | null }[] };
-type Work = { dependencySetup?: DependencySetup | null; nativeContext?: NativeCapability; resources?: AttemptResources; deadline?: number; heartbeat?: { observedAt: number; evidenceRef: string }; modelObservation?: ReturnType<typeof observeRoleModel>; spec: Task; state: string; base: string; path: string; branch: string; attempt: number; lease: string; expires: number; nativeId: string | null; nativeBootstrap?: { cwd: string; origin_root: string; common_dir: string; branch: string; head: string }; units: Record<string, string>; validated: string | null; pausedState?: string; dispatchBase?: string; configRevision?: number; observedModel?: string | null; observedEffort?: string | null; modelResolution?: { requestedModel: string; requestedEffort: string; resolvedModel: string | null; resolvedEffort: string | null; nativeArguments?: ReturnType<typeof resolveRoleModel>['nativeArguments'] }; acceptanceEvidence?: { acceptanceId: string; evidenceRefs: string[] }[]; changedPaths?: string[]; reportedModel?: string | null; recoveryHead?: string; lastCommitSha?: string; attempts?: { number: number; path: string; branch: string; nativeId: string | null; stopped: boolean; reason: string; configRevision?: number; modelResolution?: Work['modelResolution']; observedModel?: string | null; observedEffort?: string | null; modelObservation?: Work['modelObservation']; resources?: AttemptResources }[] };
+type Work = { recoveryReplay?: { path: string; branch: string; base: string }; dependencySetup?: DependencySetup | null; nativeContext?: NativeCapability; resources?: AttemptResources; deadline?: number; heartbeat?: { observedAt: number; evidenceRef: string }; modelObservation?: ReturnType<typeof observeRoleModel>; spec: Task; state: string; base: string; path: string; branch: string; attempt: number; lease: string; expires: number; nativeId: string | null; nativeBootstrap?: { cwd: string; origin_root: string; common_dir: string; branch: string; head: string }; units: Record<string, string>; validated: string | null; pausedState?: string; dispatchBase?: string; configRevision?: number; observedModel?: string | null; observedEffort?: string | null; modelResolution?: { requestedModel: string; requestedEffort: string; resolvedModel: string | null; resolvedEffort: string | null; nativeArguments?: ReturnType<typeof resolveRoleModel>['nativeArguments'] }; acceptanceEvidence?: { acceptanceId: string; evidenceRefs: string[] }[]; changedPaths?: string[]; reportedModel?: string | null; recoveryHead?: string; lastCommitSha?: string; attempts?: { number: number; path: string; branch: string; nativeId: string | null; stopped: boolean; reason: string; configRevision?: number; modelResolution?: Work['modelResolution']; observedModel?: string | null; observedEffort?: string | null; modelObservation?: Work['modelObservation']; resources?: AttemptResources }[] };
 type Finding = Review['findings'][number] & { fingerprint: string; lifecycle: string; seenRounds?: number[]; dispositions?: { status: 'ACCEPTED_RISK' | 'NOT_A_BUG' | 'DEFERRED'; reason: string; actor: 'user'; approvedAt: string; sha: string | null }[] };
 const attemptKey = (taskId: string, attempt: number) => { const key = `${taskId}-${attempt}`; return key.length <= 80 ? key : `attempt-${hash([taskId, attempt])}`; };
 const acceptedGate = (gate: { status: string }) => ['passed', 'waived'].includes(gate.status);
@@ -317,7 +317,7 @@ export class Engine {
   }
   private async markHandedOff(run: Run, operation: string, approval: ReturnType<typeof runHandoffSchema.parse>) {
     check(!['COMPLETED', 'CANCELLED', 'FAILED'].includes(run.state) && !run.abandonment, 'INVALID_RUN_STATE');
-    check(run.host === approval.expected_host && run.host !== approval.target_host, 'HOST_HANDOFF_CONFLICT');
+    check(run.host === approval.expected_host && (run.host !== approval.target_host || run.runtimeRoot !== this.runtimeRoot), 'HOST_HANDOFF_CONFLICT');
     check(run.runtimeRoot === approval.expected_runtime_root && approval.target_runtime_root === this.runtimeRoot, 'RUNTIME_TARGET_MISMATCH');
     check(run.runtimeRoot === this.runtimeRoot || approval.runtime_migration_approved, 'RUNTIME_MIGRATION_APPROVAL_REQUIRED');
     check(this.store.pending(run.id).every(item => item.id === operation), 'RECONCILIATION_REQUIRED');
@@ -436,11 +436,17 @@ export class Engine {
         task.state = 'INTEGRATED'; run.integrationSha = await git(run.integrationPath, 'rev-parse', 'HEAD'); run.reviews = [];
         run.state = Object.values(run.tasks).every(item => item.state === 'INTEGRATED') ? 'VERIFYING' : 'EXECUTING'; result = { sha: head, recovered: true };
       } else if (request.tool === 'orch_task_prepare' && task) {
-        const repo = await inspectRepository(task.path);
-        check(repo.commonDir === run.commonDir && repo.branch === task.branch && repo.head === (task.dispatchBase ?? task.base) && !repo.dirty && task.state === 'LEASED', 'RECOVERY_WORKTREE_NOT_PROVEN');
-        task.dependencySetup = await prepareNodeDependencies(run.origin, task.path, task.dependencySetup);
-        // The caller never received the lost dispatch; retain its lease, do not start another worker.
-        result = { recovered: true, task, requiresNativeStateCheck: true };
+        if (task.recoveryReplay) {
+          check(['RETRYABLE_FAILED', 'BLOCKED_RECOVERY_CONFLICT'].includes(task.state) && task.expires === 0, 'RECOVERY_WORKTREE_NOT_PROVEN');
+          result = { recovered: true, state: task.state, preserved: task.recoveryReplay.path, requiresNewPrepare: task.state === 'RETRYABLE_FAILED' };
+          task.recoveryReplay = undefined;
+        } else {
+          const repo = await inspectRepository(task.path);
+          check(repo.commonDir === run.commonDir && repo.branch === task.branch && repo.head === (task.dispatchBase ?? task.base) && !repo.dirty && task.state === 'LEASED', 'RECOVERY_WORKTREE_NOT_PROVEN');
+          task.dependencySetup = await prepareNodeDependencies(run.origin, task.path, task.dependencySetup);
+          // The caller never received the lost dispatch; retain its lease, do not start another worker.
+          result = { recovered: true, task, requiresNativeStateCheck: true };
+        }
       } else if (request.tool === 'orch_reintegrate') {
         const expected = request.input?.expected_target_sha, candidate = run.candidates?.at(-1);
         check(expected && candidate?.branch === `orch/${run.id}/target/${operationId}`, 'RECOVERY_REINTEGRATE_NOT_PROVEN');
@@ -629,6 +635,15 @@ export class Engine {
     await prepareNodeDependencies(run.origin, run.integrationPath);
     const reuse = Object.keys(task.units).length > 0;
     const createRecovered = reuse && !!task.recoveryHead;
+    if (createRecovered) {
+      check((await this.taskIdentity(run, task)).head === task.recoveryHead, 'COMMIT_HEAD_MISMATCH');
+      const commits = await this.verifyUnitCommits(run, task, task.recoveryHead!);
+      const integration = run.integrationSha ?? run.targetBase;
+      if (task.base !== integration) {
+        const replay = await this.replayUnits(run, task, integration, commits);
+        task.base = integration; task.units = replay.units; task.recoveryHead = replay.head; task.lastCommitSha = replay.head;
+      }
+    }
     if (reuse && task.recoveryHead) {
       run.candidates ??= []; run.candidates.push({ path: task.path, branch: task.branch });
       task.dispatchBase = task.recoveryHead; task.recoveryHead = undefined;
@@ -648,7 +663,7 @@ export class Engine {
     check(within(run.managedRoot, task.path), 'WORKTREE_ROOT_UNSAFE');
     task.configRevision = run.configRevision ?? 1; task.modelResolution = resolution; task.nativeContext = structuredClone(this.native);
     task.validated = null; task.observedModel = null; task.observedEffort = null; task.modelObservation = undefined; task.nativeBootstrap = undefined; task.resources = undefined;
-    task.state = 'LEASED'; task.nativeId = null; this.checkpointIntent(run);
+    task.state = 'LEASED'; task.nativeId = null; task.recoveryReplay = undefined; this.checkpointIntent(run);
     if (!reuse || createRecovered) await git(run.origin, 'worktree', 'add', '-b', task.branch, task.path, task.dispatchBase ?? task.base);
     task.dependencySetup = await prepareNodeDependencies(run.origin, task.path, task.dependencySetup);
     const reservation = await reservePort();
@@ -661,6 +676,33 @@ export class Engine {
     return { runId: run.id, taskId, attemptId: attemptKey(taskId, task.attempt), host: run.host, role: task.spec.role,
       modelId: resolution.resolvedModel, effort: resolution.resolvedEffort, nativeArguments: resolution.nativeArguments, resources: task.resources, configRevision: task.configRevision, baseSha: task.dispatchBase ?? task.base, lineageBaseSha: task.base, worktreePath: task.path,
       isolation: 'core_managed', dependencySetup: task.dependencySetup, leaseId: task.lease, fencingToken: task.attempt, expiresAt: new Date(task.expires).toISOString(), taskBrief: task.spec };
+  }
+  private async replayUnits(run: Run, task: Work, integration: string, commits: { unitId: string; sha: string }[]) {
+    await git(run.origin, 'merge-base', '--is-ancestor', task.base, integration);
+    const sourceSnapshotKey = `recovery-${hash([task.spec.id, task.attempt, this.activeOperation])}`;
+    this.store.snapshot(run.id, 'attempt', sourceSnapshotKey, task);
+    const candidate = { path: join(run.managedRoot, run.id, `recovery-${this.activeOperation}`), branch: `orch/${run.id}/recovery/${this.activeOperation}` };
+    run.candidates ??= []; run.candidates.push(candidate);
+    task.recoveryReplay = { ...candidate, base: integration }; this.checkpointIntent(run);
+    await git(run.origin, 'worktree', 'add', '-b', candidate.branch, candidate.path, integration);
+    const units: Record<string, string> = {};
+    for (const commit of commits) {
+      try { await git(candidate.path, 'cherry-pick', '--no-edit', commit.sha); }
+      catch {
+        task.state = 'BLOCKED_RECOVERY_CONFLICT'; run.state = 'BLOCKED_RECOVERY_CONFLICT';
+        this.checkpointIntent(run);
+        throw new Error('RECOVERY_REPLAY_CONFLICT');
+      }
+      units[commit.unitId] = await git(candidate.path, 'rev-parse', 'HEAD');
+    }
+    const head = await git(candidate.path, 'rev-parse', 'HEAD');
+    await this.verifyUnitCommits(run, { ...task, path: candidate.path, base: integration, units }, head);
+    check(await git(run.integrationPath, 'rev-parse', 'HEAD') === integration, 'INTEGRATION_DRIFT');
+    this.store.snapshot(run.id, 'attempt', `replayed-${hash([task.spec.id, task.attempt + 1, this.activeOperation])}`, {
+      sourceSnapshotKey, taskId: task.spec.id, fromAttempt: task.attempt, toAttempt: task.attempt + 1, fromBase: task.base, toBase: integration,
+      units: commits.map(commit => ({ unitId: commit.unitId, fromSha: commit.sha, toSha: units[commit.unitId] })),
+    });
+    return { head, units };
   }
   async attemptPort(run: Run, taskId: string, lease: string, generation: number, action: 'status' | 'release_for_claim') {
     const task = run.tasks[taskId]; check(task, 'TASK_NOT_FOUND');
@@ -847,15 +889,25 @@ export class Engine {
     check(repo.commonDir === run.commonDir && repo.branch === task.branch && !repo.dirty, 'DIRTY_CHECKOUT');
     check((await changedPaths(task.path, task.base)).every(path => owns(task.spec.write_paths, path)), 'OWNERSHIP_VIOLATION');
     await git(task.path, 'merge-base', '--is-ancestor', task.base, 'HEAD');
-    const submitted = (await git(task.path, 'rev-list', `${task.base}..HEAD`)).split('\n').filter(Boolean);
-    check(submitted.length === Object.keys(task.units).length && submitted.every(sha => Object.values(task.units).includes(sha)), 'UNTRACKED_COMMIT');
-    for (const unit of task.spec.commit_units) {
-      const sha = task.units[unit.id], message = `${await git(task.path, 'show', '-s', '--format=%B', sha)}\n`;
-      const parents = (await git(task.path, 'show', '-s', '--format=%P', sha)).split(' ');
-      check(parents.length === 1 && message.includes(`Orch-Run: ${run.id}\n`) && message.includes(`Orch-Task: ${task.spec.id}\n`) && message.includes(`Orch-Unit: ${unit.id}\n`), 'UNTRACKED_COMMIT');
-    }
+    await this.verifyUnitCommits(run, task, repo.head);
     const gate = run.gates.filter(item => item.task === task.spec.id && item.stage === 'task').at(-1);
     check(gate && acceptedGate(gate) && gate.commands === hash(run.config.quality.commands) && gate.source === await sourceFingerprint(task.path) && await this.gateInputsFresh(gate, task.path), 'VALIDATION_STALE');
+  }
+  private async verifyUnitCommits(run: Run, task: Work, head: string) {
+    const submitted = (await git(task.path, 'rev-list', '--reverse', `${task.base}..${head}`)).split('\n').filter(Boolean);
+    const bySha = new Map(Object.entries(task.units).map(([unitId, sha]) => [sha, unitId]));
+    check(bySha.size === Object.keys(task.units).length && submitted.length === bySha.size && submitted.every(sha => bySha.has(sha)), 'UNTRACKED_COMMIT');
+    let parent = task.base;
+    for (const sha of submitted) {
+      const unitId = bySha.get(sha)!;
+      const message = `${await git(task.path, 'show', '-s', '--format=%B', sha)}\n`;
+      check(task.spec.commit_units.some(unit => unit.id === unitId) && await git(task.path, 'show', '-s', '--format=%P', sha) === parent &&
+        message.includes(`Orch-Run: ${run.id}\n`) && message.includes(`Orch-Task: ${task.spec.id}\n`) && message.includes(`Orch-Unit: ${unitId}\n`), 'UNTRACKED_COMMIT');
+      const paths = (await git(task.path, 'diff', '--no-renames', '--name-only', '-z', parent, sha)).split('\0').filter(Boolean);
+      check(paths.every(path => owns(task.spec.write_paths, path)), 'OWNERSHIP_VIOLATION');
+      parent = sha;
+    }
+    return submitted.map(sha => ({ sha, unitId: bySha.get(sha)! }));
   }
   async complete(run: Run, taskId: string, lease: string, generation: number, nativeStopped: boolean, submittedResult: unknown = null) {
     const task = this.leased(run, taskId, lease, generation);

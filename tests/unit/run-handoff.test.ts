@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runtimeFixture, fixtureTaskResult } from '../fixtures/runtime.ts';
-import { git } from '../../packages/core/src/git/repository.ts';
+import { git, inspectRepository } from '../../packages/core/src/git/repository.ts';
 import { packRelease } from '../../packages/installer/src/installation/index.ts';
 import { roleIds } from '../../packages/protocol/src/config.ts';
 import { modelSchema } from '../../packages/core/src/model-registry/index.ts';
@@ -188,17 +188,32 @@ test('handoff settles stopped read-only dispatches without manufacturing complet
   } finally { await f.close(); }
 });
 
-test('a packaged MCP authenticates takeover then uses ordinary preparation on the same run', async () => {
+for (const host of ['claude', 'codex'] as const) test(`a packaged ${host} MCP authenticates takeover or runtime upgrade then prepares the same run`, async () => {
   const f = await runtimeFixture();
   const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
   const { InMemoryTransport } = await import('@modelcontextprotocol/sdk/inMemory.js');
   const { createServer } = await import(pathToFileURL(join(bundle, 'packages/mcp-server/src/server.ts')).href);
   const tokenPath = join(f.dir, 'handoff.token');
-  const server = await createServer(f.root, 'claude', join(f.dir, 'managed'), tokenPath);
+  const server = await createServer(f.root, host, join(f.dir, 'managed'), tokenPath);
   const client = new Client({ name: 'packaged-handoff-contract', version: '1' });
   const [a, b] = InMemoryTransport.createLinkedPair();
   try {
+    if (host === 'codex') f.plan.tasks[0].commit_units.push({ id: 'U2', purpose: 'finish after dependency recovery' });
     await f.change({}, run => f.engine.plan(run, f.plan, true));
+    if (host === 'codex') {
+      for (const taskId of ['T1', 'T2']) {
+        const first = await f.change({}, run => f.engine.prepare(run, taskId));
+        await f.change({}, run => f.engine.bind(run, taskId, first.result.leaseId, first.result.fencingToken, `old-${taskId}`, null, null));
+        await writeFile(join(first.result.worktreePath, `${taskId}.txt`), `${taskId} committed before upgrade\n`);
+        await f.change({}, run => f.engine.validate(run, taskId, first.result.leaseId, first.result.fencingToken));
+        await f.change({}, run => f.engine.commit(run, taskId, first.result.leaseId, first.result.fencingToken, 'U1'));
+        if (taskId === 'T2') {
+          await f.change({}, async run => f.engine.complete(run, taskId, first.result.leaseId, first.result.fencingToken, true, await fixtureTaskResult(run, taskId)));
+          await f.change({}, run => f.engine.integrate(run, taskId, run.integrationSha!));
+        }
+      }
+      await writeFile(join(f.engine.status(f.created.runId).data.tasks.T1.path, 'T1.txt'), 'dirty original remains preserved\n');
+    }
     await server.connect(a); await client.connect(b);
     const call = async (name: string, args: Record<string, unknown> = {}) => {
       const response = await client.callTool({ name, arguments: args });
@@ -208,20 +223,28 @@ test('a packaged MCP authenticates takeover then uses ordinary preparation on th
     const auth = { coordinator_token: await readFile(tokenPath, 'utf8') };
     const envelope = { ...auth, protocol_version: 1, run_id: f.created.runId, operation_id: 'mcp-takeover', expected_state_version: before.version,
       input: { approved: true, reason: 'Continue same run via authenticated MCP', previous_coordinator_stopped: true,
-        expected_host: 'codex', target_host: 'claude', expected_runtime_root: before.data.runtimeRoot,
-        target_runtime_root: `${bundle}/`, target_runtime_checksum: checksum, runtime_migration_approved: true } };
+        expected_host: 'codex', target_host: host, expected_runtime_root: before.data.runtimeRoot,
+        target_runtime_root: `${bundle}/`, target_runtime_checksum: checksum, runtime_migration_approved: true, stopped_agents: host === 'codex' ? ['old-T1'] : [] } };
     assert.equal((await call('orch_run_handoff', { ...envelope, coordinator_token: 'worker' })).error.code, 'COORDINATOR_RELAY_REQUIRED');
     assert.ok((await call('orch_run_handoff', { ...envelope, lease_id: 'unpaired' })).error);
     assert.equal((await call('orch_run_handoff', envelope)).error.code, 'HOST_CONTEXT_MISMATCH');
-    await call('orch_host_connect', { ...auth, native_tool: 'Agent', native_agent_id: 'synthetic-native-probe', probe: {
+    await call('orch_host_connect', { ...auth, native_tool: host === 'codex' ? 'spawn_agent' : 'Agent', native_agent_id: 'synthetic-native-probe', probe: {
       challenge: environment.nativeHandshake.challenge, cwd: before.data.origin, origin_root: before.data.origin, branch: before.data.target, head: before.data.targetBase } });
     const handedOff = await call('orch_run_handoff', { ...envelope, operation_id: 'mcp-connected-takeover' });
     assert.equal(handedOff.error, undefined, JSON.stringify(handedOff));
+    const noop = await call('orch_run_handoff', { ...envelope, operation_id: 'mcp-noop-takeover', expected_state_version: handedOff.data.version,
+      input: { ...envelope.input, expected_host: host, expected_runtime_root: `${bundle}/` } });
+    assert.equal(noop.error.code, 'HOST_HANDOFF_CONFLICT');
     const prepared = await call('orch_task_prepare', { ...envelope, operation_id: 'mcp-next-worker', expected_state_version: handedOff.data.version, input: { task_id: 'T1' } });
     assert.equal(prepared.error, undefined, JSON.stringify(prepared));
-    assert.equal(prepared.data.result.host, 'claude');
+    assert.equal(prepared.data.result.host, host);
     assert.equal(prepared.data.result.runId, f.created.runId);
-    const oldServer = await createServer(f.root, 'codex', join(f.dir, 'managed'), join(f.dir, 'old-host.token'));
+    if (host === 'codex') {
+      assert.equal(prepared.data.result.lineageBaseSha, before.data.integrationSha);
+      assert.equal(await readFile(join(prepared.data.result.worktreePath, 'T2.txt'), 'utf8'), 'T2 committed before upgrade\n');
+      assert.notEqual(f.engine.status(f.created.runId).data.tasks.T1.units.U1, before.data.tasks.T1.units.U1);
+    }
+    const oldServer = await createServer(f.root, host === 'claude' ? 'codex' : 'claude', join(f.dir, 'managed'), join(f.dir, 'old-host.token'));
     const oldClient = new Client({ name: 'old-host-recovery', version: '1' });
     const [oldA, oldB] = InMemoryTransport.createLinkedPair();
     try {
@@ -236,6 +259,25 @@ test('a packaged MCP authenticates takeover then uses ordinary preparation on th
       const completed = await oldClient.callTool({ name: 'orch_reconcile', arguments: { ...request, coordinator_token: await readFile(join(f.dir, 'old-host.token'), 'utf8') } });
       assert.equal(completed.isError, undefined);
     } finally { await oldClient.close(); await oldServer.close(); }
+    if (host === 'codex') {
+      let operation = 0;
+      const mutate = async (name: string, input: Record<string, unknown>) => {
+        const response = await call(name, { ...envelope, operation_id: `mcp-recovered-${++operation}`, expected_state_version: f.engine.status(f.created.runId).version, input });
+        assert.equal(response.error, undefined, JSON.stringify(response));
+        return response.data;
+      };
+      const lease = { task_id: 'T1', lease_id: prepared.data.result.leaseId, fencing_token: prepared.data.result.fencingToken };
+      const repo = await inspectRepository(prepared.data.result.worktreePath);
+      await mutate('orch_task_bind', { ...lease, native_id: 'new-upgraded-worker', observed_model: null, observed_effort: null,
+        bootstrap: { cwd: repo.root, origin_root: repo.root, common_dir: repo.commonDir, branch: repo.branch, head: repo.head } });
+      await writeFile(join(repo.root, 'T1.txt'), 'finished on new dependency base\n');
+      await mutate('orch_task_validate', lease);
+      await mutate('orch_task_commit', { ...lease, unit_id: 'U2' });
+      await mutate('orch_task_complete', { ...lease, native_stopped: true, result: await fixtureTaskResult(f.engine.status(f.created.runId).data, 'T1') });
+      await mutate('orch_integrate', { task_id: 'T1', expected_integration_sha: before.data.integrationSha });
+      assert.equal(f.engine.status(f.created.runId).data.tasks.T1.state, 'INTEGRATED');
+      assert.equal(await readFile(join(before.data.tasks.T1.path, 'T1.txt'), 'utf8'), 'dirty original remains preserved\n');
+    }
   } finally { await client.close(); await server.close(); await f.close(); }
 });
 
