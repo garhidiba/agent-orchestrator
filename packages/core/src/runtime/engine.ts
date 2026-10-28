@@ -933,15 +933,20 @@ export class Engine {
     enforceRunBudget(run);
     check(run.state === 'EXECUTING', 'INVALID_RUN_STATE');
     const task = run.tasks[taskId]; check(task?.state === 'MERGE_QUEUED', 'TASK_NOT_READY');
+    const verifyIntegration = async () => {
+      const repo = await inspectRepository(run.integrationPath);
+      check(expectedSha === (run.integrationSha ?? run.targetBase) && repo.commonDir === run.commonDir && repo.branch === run.integration && repo.head === expectedSha, 'INTEGRATION_DRIFT');
+      check(!repo.dirty, 'DIRTY_CHECKOUT');
+    };
     try { await this.verifySubmission(run, task); }
     catch (error) {
       if (!(error instanceof Error) || error.message !== 'VALIDATION_STALE') throw error;
+      await verifyIntegration();
       const gate = await this.gate(run, 'task', task.path, taskId);
       if (!acceptedGate(gate)) return gate;
       await this.verifySubmission(run, task);
     }
-    check(expectedSha === (run.integrationSha ?? run.targetBase) && await git(run.integrationPath, 'rev-parse', 'HEAD') === expectedSha, 'INTEGRATION_DRIFT');
-    check(!(await inspectRepository(run.integrationPath)).dirty, 'DIRTY_CHECKOUT');
+    await verifyIntegration();
     const taskHead = await git(task.path, 'rev-parse', 'HEAD');
     const candidate = { path: join(run.managedRoot, run.id, `conflict-${this.activeOperation}`), branch: `orch/${run.id}/conflict/${this.activeOperation}` };
     run.candidates ??= []; run.candidates.push(candidate);

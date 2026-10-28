@@ -98,3 +98,18 @@ test('a fresh queued result integrates without another task gate even after its 
     assert.deepEqual(after.gates, before.data.gates);
   } finally { await f.close(); }
 });
+
+for (const invalid of ['wrong-sha', 'dirty', 'branch'] as const) test(`a stale queued gate rejects ${invalid} integration without commands or pending operations`, async () => {
+  const f = await queuedFixture();
+  try {
+    const before = f.engine.status(f.created.runId), count = await f.executions();
+    if (invalid === 'dirty') await writeFile(join(before.data.integrationPath, 'unapproved.txt'), 'dirty integration\n');
+    if (invalid === 'branch') await git(before.data.integrationPath, 'switch', '-c', 'unowned-integration');
+    process.env.ORCH_QUEUED_OUTCOME = 'new-host-environment';
+    const expected = invalid === 'wrong-sha' ? '0'.repeat(40) : before.data.integrationSha!;
+    await assert.rejects(f.change({}, run => f.engine.integrate(run, 'T1', expected)), invalid === 'dirty' ? /DIRTY_CHECKOUT/ : /INTEGRATION_DRIFT/);
+    assert.equal(await f.executions(), count);
+    assert.deepEqual(f.engine.status(f.created.runId), before);
+    assert.equal(f.engine.store.pending(f.created.runId).length, 0);
+  } finally { await f.close(); }
+});
