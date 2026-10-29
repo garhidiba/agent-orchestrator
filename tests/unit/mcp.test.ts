@@ -165,6 +165,37 @@ for (const host of ['codex', 'hermes'] as const) test(`${host} MCP connects the 
   } finally { await client.close(); await server.close(); await f.close(); }
 });
 
+test('Hermes can authenticate one project binding after gateway startup without creating project state', async () => {
+  const { realpath, readFile, access, mkdir, writeFile } = await import('node:fs/promises');
+  const { git } = await import('../../packages/core/src/git/repository.ts');
+  const dir = await mkdtemp(join(tmpdir(), 'orch-hermes-connect-')), f = { dir, root: join(dir, 'repo') };
+  await mkdir(f.root); await git(f.root, 'init');
+  await git(f.root, 'config', 'user.name', 'ORCH Test'); await git(f.root, 'config', 'user.email', 'test@example.invalid');
+  await writeFile(join(f.root, 'base'), 'base'); await git(f.root, 'add', 'base'); await git(f.root, 'commit', '-m', 'baseline');
+  const token = join(f.dir, 'late-origin.token');
+  const server = await createServer(null, 'hermes', join(f.dir, 'managed'), token);
+  const client = new Client({ name: 'hermes-late-origin', version: '1' });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(a); await client.connect(b);
+    const call = async (name: string, args: Record<string, unknown> = {}) => JSON.parse(((await client.callTool({ name, arguments: args })).content as { text: string }[])[0].text);
+    const root = await realpath(f.root), auth = { coordinator_token: await readFile(token, 'utf8') };
+    const before = (await call('orch_environment')).data;
+    assert.equal(before.originRoot, null);
+    assert.equal((await call('orch_project_connect', { origin_root: root })).error.code, 'COORDINATOR_RELAY_REQUIRED');
+    assert.equal((await call('orch_project_connect', { ...auth, origin_root: f.dir })).error.code, 'PROJECT_CONTEXT_MISMATCH');
+    const connections = await Promise.all([call('orch_project_connect', { ...auth, origin_root: root }), call('orch_project_connect', { ...auth, origin_root: root })]);
+    assert.equal(connections.filter(result => !result.error).length, 1);
+    assert.equal(connections.find(result => result.error)?.error.code, 'PROJECT_ALREADY_CONNECTED');
+    const after = (await call('orch_environment')).data;
+    assert.equal(after.originRoot, root); assert.equal(after.nativeDispatch, 'NEEDS_HOST_HANDSHAKE');
+    assert.notEqual(after.nativeHandshake.challenge, before.nativeHandshake.challenge);
+    assert.equal((await call('orch_project_connect', { ...auth, origin_root: root })).error.code, 'PROJECT_ALREADY_CONNECTED');
+    assert.equal((await call('orch_config', { action: 'effective' })).data.files.project, join(root, '.orch/config.yaml'));
+    await assert.rejects(access(join(root, '.orch/state')), { code: 'ENOENT' });
+  } finally { await client.close(); await server.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
 test('project initialization requires coordinator auth and ordinary config reads remain read-only', async () => {
   const { readFile, writeFile, access } = await import('node:fs/promises');
   const { git } = await import('../../packages/core/src/git/repository.ts');

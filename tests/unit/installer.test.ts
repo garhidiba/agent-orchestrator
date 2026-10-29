@@ -44,6 +44,7 @@ test('Hermes install, update, doctor and removal preserve user YAML, comments an
     const config = parse(installed);
     assert.equal(config.model.default, 'provider/model'); assert.equal(config.mcp_servers.other.command, 'other');
     assert.ok(config.mcp_servers.orch.args.includes('hermes')); assert.match(installed, /# user settings/); assert.match(installed, /# keep other server/);
+    assert.equal(config.mcp_servers.orch.args.at(-1), '${workspaceFolder}');
     assert.equal(first.mcp, 'HANDSHAKE_VERIFIED'); assert.equal(first.execution, 'UNVERIFIED');
     const skill = join(f.home, '.hermes/skills/orch/SKILL.md');
     assert.equal(await readFile(skill, 'utf8'), '# ORCH\n');

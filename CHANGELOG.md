@@ -2,6 +2,8 @@
 
 ## 0.1.0 — development
 
+- Added Hermes Agent host settings, provider-neutral role policy, authenticated native delegation relay, user-profile MCP/skill installation, update/rollback/removal and diagnostics. Hermes uses workspace-aware MCP origin expansion; write dispatch requires interactive live controls and actual bootstrap receipts.
+
 - Added deterministic protocol/config/state/Git/MCP foundations and fixture coverage.
 - Added common ORCH entry skills, configuration advisor guidance and operational documentation.
 - Native host capability adapters and both-host E2E release gates remain unverified; this is not a v1 completion announcement.

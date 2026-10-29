@@ -53,7 +53,7 @@ export async function doctor(origin: string | null, host: HostKind, options: { h
           const entry = entrySchema.parse(record.entry);
           const version = z.string().regex(/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/).parse(record.version);
           await verifyRelease(join(root, 'versions', version), manifest.releases[version]);
-          if (!isAbsolute(entry.command) || entry.command !== record.runtime || entry.args[0] !== join(root, 'versions', version, 'packages/mcp-server/src/stdio.ts') || entry.args[1] !== '--host' || entry.args[2] !== host || entry.args[3] !== '--origin' || entry.args[4] !== (base === home ? '.' : base) || entry.args.length !== 5) throw new Error();
+          if (!isAbsolute(entry.command) || entry.command !== record.runtime || entry.args[0] !== join(root, 'versions', version, 'packages/mcp-server/src/stdio.ts') || entry.args[1] !== '--host' || entry.args[2] !== host || entry.args[3] !== '--origin' || entry.args[4] !== (base === home ? host === 'hermes' ? '${workspaceFolder}' : '.' : base) || entry.args.length !== 5) throw new Error();
           installation = 'integrity_verified'; mcp = 'not_run_untrusted';
           const currentStdio = await realpath(fileURLToPath(new URL('../../../mcp-server/src/stdio.ts', import.meta.url)));
           // Repository-owned hashes prove integrity, never authority to launch a different installation.

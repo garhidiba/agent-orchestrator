@@ -305,7 +305,7 @@ export async function install(options: InstallOptions) {
       const before = await optional(configFile), config = decodeConfig(host, before), mcp = entries(host, config);
       if (mcp.orch !== undefined && (!previous || !isDeepStrictEqual(mcp.orch, previous.entry))) throw new Error(`INSTALL_CONFLICT: ${configFile} MCP orch`);
       if (previous && mcp.orch === undefined) throw new Error(`INSTALL_CONFLICT: ${configFile} owned MCP removed`);
-      const entry = { command: runtime, args: [join(versionDir, 'packages/mcp-server/src/stdio.ts'), '--host', host, '--origin', options.scope === 'project' ? base : '.'] };
+      const entry = { command: runtime, args: [join(versionDir, 'packages/mcp-server/src/stdio.ts'), '--host', host, '--origin', options.scope === 'project' ? base : host === 'hermes' ? '${workspaceFolder}' : '.'] };
       mcp.orch = entry;
       const owned: Record<string, string> = {};
       const sources: Record<string, Buffer> = {};

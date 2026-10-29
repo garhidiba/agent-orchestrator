@@ -1,12 +1,12 @@
 # ORCH
 
-ORCH is a local coordination runtime for work started inside an existing Codex or Claude Code conversation. The current session stays in charge; MCP manages configuration, task state, Git worktrees, checks, reviews and recovery.
+ORCH is a local coordination runtime for work started inside an existing Codex, Claude Code or Hermes Agent conversation. The current session stays in charge; MCP manages configuration, task state, Git worktrees, checks, reviews and recovery.
 
 **Development implementation, not a completed v1 release.** Installation readies the MCP; the current conversation connects its native Agent tool automatically before running workers. Each role resolves its own model/effort from authenticated host capabilities; unsupported pins remain blocked and actual observations stay separate. Deterministic tests alone do not prove native host execution. See [compatibility](docs/compatibility.md) and [acceptance evidence](docs/acceptance.md). The [completion audit](docs/prd-completion.md) tracks the current findings and pending evidence.
 
 ## Install once
 
-Requires **Node.js 24+** (with npm), Git, and Codex CLI or Claude Code. From this checkout, run one command:
+Requires **Node.js 24+** (with npm), Git, and Codex CLI, Claude Code or NousResearch Hermes Agent. From this checkout, run one command:
 
 ```sh
 ./scripts/install.sh
@@ -24,11 +24,13 @@ cd agent-orchestrator
 
 On Windows PowerShell, run `./scripts/install.ps1` instead. Installation registers the `orch` MCP server and copies `agent-orch` / `agent-orch-configure` into each host's skills directory. Restart/reload the host afterward.
 
-Both detected hosts are installed automatically. After restarting, use `$agent-orch init` in Codex or **`/agent-orch init` in Claude Code**. The default installer installs standalone skills; it does not activate the optional Claude plugin, so `/agent-orch:init` is not a default-install command. If Claude reports `Unknown command: /agent-orch:init`, use `/agent-orch init` instead. See [optional plugin loading](docs/installation.md#diagnostics-and-claude-plugin) only if you specifically need namespaced plugin commands.
+All detected hosts are installed automatically in user scope. After restarting, use `$agent-orch init` in Codex or **`/agent-orch init` in Claude Code or Hermes**. The default installer installs standalone skills; it does not activate the optional Claude plugin, so `/agent-orch:init` is not a default-install command. If Claude reports `Unknown command: /agent-orch:init`, use `/agent-orch init` instead. See [optional plugin loading](docs/installation.md#diagnostics-and-claude-plugin) only if you specifically need namespaced plugin commands.
 
 The default installation is user-wide. Keep this ORCH checkout separate from the client projects you manage; installation is done once, not in every client repository.
 
 Optional: `./scripts/install.sh --target codex` selects just Codex (`claude` selects Claude Code); `--dry-run` previews host changes. Project-only installation uses `--scope project --project /absolute/path/to/git-root`. Dependency setup can still write local `node_modules` during a preview. See [installation](docs/installation.md) for paths, advanced verified-bundle options and removal.
+
+For Hermes, use `./scripts/install.sh --target hermes`. The default user profile receives the MCP in `~/.hermes/config.yaml` and both skills in `~/.hermes/skills/`; project-only installation and custom profiles are not supported. Open Hermes in the client Git project, reconnect MCP, then use `/agent-orch init`; the skill connects an initially null gateway origin to the verified project. Hermes roles inherit its delegation settings; the default delegation tool cannot apply individual model/effort pins. Writing requires interactive background delegation with live controls; one-shot mode supports initialization and read-only checks. See [Hermes integration](references/hermes.md) for bootstrap and capability requirements. `--target both` retains its Codex/Claude meaning; `--target all` selects all three.
 
 ## Use in a conversation
 
@@ -42,7 +44,7 @@ Optional: `./scripts/install.sh --target codex` selects just Codex (`claude` sel
 
    In Claude Code use `/agent-orch init` after the default installation. The skill verifies the MCP origin against the physical client Git root before writing. Initialization creates or completes only `.orch/config.yaml`: the client needs no `package.json`, `node_modules`, ORCH checkout or copied ORCH code. Global settings remain unchanged.
 
-The file visibly includes all eight roles for both hosts, model/effort policies, and execution, Git, review, quality and other defaults. Missing fields are seeded from global settings and shipped defaults; existing values and comments are preserved. Initialization configures the project without starting a run or an AI worker. Concrete role-model setup uses supported current-host metadata through `agent-orch-configure`; unresolved `auto` values remain explicit when that metadata is unavailable. A full file alone does not mean workers are ready.
+The file visibly includes all eight roles for all three hosts, model/effort policies, and execution, Git, review, quality and other defaults. Missing fields are seeded from global settings and shipped defaults; existing values and comments are preserved. Initialization configures the project without starting a run or an AI worker. Concrete role-model setup uses supported current-host metadata through `agent-orch-configure`; unresolved `auto` values remain explicit when that metadata is unavailable. A full file alone does not mean workers are ready.
 
 For a read-only preview use `$agent-orch init 설정 파일 변경안을 보여줘. 아직 쓰지 마.` An ordinary first invocation also creates a missing full config, while preserving existing files. Explicit no-write requests and direct configuration explanations remain read-only. Keep the generated project file ignored or commit it according to your project policy before a write run that requires a clean checkout; agent-orch does not silently commit it.
 
@@ -102,7 +104,7 @@ On an execution request, `$agent-orch` first connects this conversation’s nati
 |---|---|
 | `schema_version` | Configuration format version; currently `1`. |
 | `model_selection` | Selection goal (`balanced`, `quality`, `economy`, `fast`), metadata cache lifetime in hours, and behavior when a model is unavailable. Profiles are goals, not hardcoded model rankings; changing the label alone does not select different models. |
-| `hosts.codex` / `hosts.claude` | Host enablement and each role's `model` and `effort`. Configuration can include both hosts; execution uses the current host without cross-host fallback. |
+| `hosts.codex` / `hosts.claude` / `hosts.hermes` | Host enablement and each role's `model` and `effort`. Configuration can include all three hosts; execution uses the current host without cross-host fallback. |
 | `execution` | Worker parallelism, task-attempt/review limits, and task/run timeouts in **minutes**. Defaults allow four parallel workers and three task attempts. Quality gates are currently serialized; `max_parallel_test_jobs` does not enable concurrent checks. |
 | `planning` | Whether the plan requires approval; explicit user overrides are preserved. |
 | `git` | Target branch, integration branch prefix, atomic commits and finalization approval. `target_branch: null` uses the invocation branch. Dirty checkouts stop write runs; automatic remote push is disabled. |
@@ -180,19 +182,19 @@ npm run check
 
 Remove `--dry-run` only when you intend to apply that project configuration change. Explicit `--global` selects user settings; role pins are preserved by profile configuration. The Advisor uses validated catalog/default or comparative evidence to recommend role selections, then applies an authorized recommendation with a fresh configuration hash; a profile label alone does not prove native model application. [Configuration](references/configuration.md) covers set/unset, field precedence, session overrides and model validation. No `orch run` command or global `orch` shell executable is installed; use the conversation skills or the source commands above.
 
-To preview removal and then uninstall both host integrations from this source checkout:
+To preview removal and then uninstall host integrations from this source checkout:
 
 ```sh
-npm run orch:manage -- uninstall --target both --scope user --dry-run
-npm run orch:manage -- uninstall --target both --scope user --keep-data
+npm run orch:manage -- uninstall --target all --scope user --dry-run
+npm run orch:manage -- uninstall --target all --scope user --keep-data
 ```
 
-Only owned, unmodified assets are removed. Run data, old runtime versions and unrelated settings are retained. Use the same project scope/path if installed for a project.
+Only owned, unmodified assets are removed. Run data, old runtime versions and unrelated settings are retained. Use the same project scope/path and `--target both` (or one host) if installed for a project.
 
 ## How it fits
 
 ```text
-Current Codex or Claude conversation (coordinator)
+Current Codex, Claude or Hermes conversation (coordinator)
   ├─ host-native Agents (parent relay + checked worktree bootstrap)
   └─ local ORCH MCP
        ├─ configuration + model metadata

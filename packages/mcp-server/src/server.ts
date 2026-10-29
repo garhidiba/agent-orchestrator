@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { lstat, readFile, mkdir, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, isAbsolute } from 'node:path';
 import { Engine } from '../../core/src/runtime/engine.ts';
 import { loadConfig, globalConfigPath, resolveConfig } from '../../core/src/config/index.ts';
 import { createSessionConfig } from '../../core/src/config/session.ts';
@@ -67,6 +67,16 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
     });
   }
   register('orch_doctor', {}, async () => doctor(origin, host));
+  register('orch_project_connect', { ...auth, origin_root: z.string().min(1) }, async data => {
+    authenticate(data.coordinator_token); check(host === 'hermes', 'HOST_TOOL_MISMATCH');
+    check(isAbsolute(data.origin_root), 'PROJECT_CONTEXT_MISMATCH');
+    const repo = await inspectRepository(data.origin_root).catch(() => null);
+    check(repo && repo.root === data.origin_root, 'PROJECT_CONTEXT_MISMATCH');
+    check(origin === null && !engine && !native, 'PROJECT_ALREADY_CONNECTED');
+    origin = repo.root;
+    challenge = randomBytes(32).toString('hex'); challengeExpires = Date.now() + 300000;
+    return { originRoot: origin, nativeDispatch: 'NEEDS_HOST_HANDSHAKE' };
+  });
   register('orch_environment', {}, async () => {
     if (!native && Date.now() > challengeExpires) { challenge = randomBytes(32).toString('hex'); challengeExpires = Date.now() + 300000; }
     const detected = await detectHost(host);

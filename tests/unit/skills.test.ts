@@ -12,10 +12,10 @@ const names = ['agent-orch', 'agent-orch-configure'];
 const links = (text: string) => [...text.matchAll(/\[[^\]]*\]\(([^)\s]+)\)/g)]
   .map(match => match[1]).filter(path => !/^[a-z]+:/i.test(path)).map(path => path.split('#')[0]).filter(Boolean);
 
-test('shared skill sources form self-contained installed skills for both hosts', async () => {
+test('shared skill sources form self-contained installed skills for all hosts', async () => {
   const temp = await mkdtemp(join(tmpdir(), 'orch-skills-'));
   try {
-    for (const host of ['codex', 'claude']) {
+    for (const host of ['codex', 'claude', 'hermes']) {
       for (const name of names) {
         const source = join(root, 'skills', name), installed = join(temp, host, 'skills', name);
         await cp(source, installed, { recursive: true });
@@ -59,6 +59,7 @@ test('shipped role guidance covers the configured role contract', async () => {
   const documented = [...roles.matchAll(/^\| ([a-z_]+) \|/gm)].map(match => match[1]);
   assert.deepEqual(documented.sort(), Object.keys(config.hosts.codex.roles).sort());
   assert.deepEqual(Object.keys(config.hosts.codex.roles).sort(), Object.keys(config.hosts.claude.roles).sort());
+  assert.deepEqual(Object.keys(config.hosts.codex.roles).sort(), Object.keys(config.hosts.hermes.roles).sort());
 });
 
 test('bilingual evaluation set covers write, read-only, unrelated and blocked requests', async () => {

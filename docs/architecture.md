@@ -1,6 +1,6 @@
 # Architecture
 
-The current host conversation is the coordinator. `skills/` provides two common entry sources; installer-generated copies target Codex and Claude without maintaining divergent workflow text. Shared `references/` files are copied into each installed skill's `references/` directory. The source skill links target that generated installation layout.
+The current host conversation is the coordinator. `skills/` provides two common entry sources; installer-generated copies target Codex, Claude and Hermes without maintaining divergent workflow text. Shared `references/` files are copied into each installed skill's `references/` directory. The source skill links target that generated installation layout.
 
 `packages/protocol/` validates config, plans, reviews and mutation envelopes. `packages/core/` owns layered config, model normalization, SQLite state/journal, repository identity and deterministic run operations. `packages/host-codex/` and `packages/host-claude/` supply metadata; metadata access is not native dispatch. `packages/mcp-server/` exposes tools/resources over stdio. `packages/installer/` owns diagnostics and managed installation.
 
