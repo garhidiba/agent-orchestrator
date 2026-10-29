@@ -14,7 +14,8 @@
       "type": "string",
       "enum": [
         "codex",
-        "claude"
+        "claude",
+        "hermes"
       ]
     },
     "configRevision": {

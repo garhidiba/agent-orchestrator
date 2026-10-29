@@ -52,3 +52,16 @@ test('explicit effort matching the verified inherited parent needs no model over
  const result=runtime.resolveRoleModel({config,host:'codex',role:'coder',native:{host:'codex',verified:true,contextMatches:true,evidence:['synthetic-parent-receipt'],model:'undisclosed-option',effort:'high'}});
  assert.equal(result.resolvedEffort,'high'); assert.deepEqual(result.nativeArguments,{});
 });
+
+test('Hermes inherits delegation policy and validates provider-neutral pins against native capabilities', () => {
+ const config=resolveConfig({project:{hosts:{hermes:{roles:{coder:{model:'provider/model',effort:'high'}}}}}}).config;
+ const descriptor:Model={...model,host:'hermes',id:'provider/model',family:'unknown'};
+ const native={host:'hermes' as const,verified:true,contextMatches:true,evidence:['fixture:delegate_task'],model:null,effort:null,models:[descriptor]};
+ validateModels(config,[descriptor]);
+ assert.throws(()=>validateModels(config,[{...descriptor,host:'codex'}]),/MODEL_NOT_SUPPORTED/);
+ assert.throws(()=>runtime.resolveRoleModel({config,host:'hermes',role:'coder',native}),/BLOCKED_CAPABILITY/);
+ assert.deepEqual(runtime.resolveRoleModel({config,host:'hermes',role:'coder',native:{...native,perInvocationModel:true,perInvocationEffort:true}}).nativeArguments,{model:'provider/model',reasoning_effort:'high'});
+ const inherited=runtime.resolveRoleModel({config,host:'hermes',role:'reviewer',native});
+ assert.deepEqual(inherited.nativeArguments,{}); assert.equal(inherited.observedModel,null);
+ assert.throws(()=>runtime.resolveRoleModel({config,host:'hermes',role:'reviewer',native:{...native,host:'codex'}}),/BLOCKED_CAPABILITY/);
+});

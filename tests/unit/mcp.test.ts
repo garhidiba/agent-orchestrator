@@ -111,12 +111,12 @@ test('MCP session patches use CAS, dry-run and instance isolation without config
   }
 });
 
-test('installed MCP connects the current native coordinator without a daemon and prepares inherited workers', async () => {
+for (const host of ['codex', 'hermes'] as const) test(`${host} MCP connects the current native coordinator without a daemon and prepares inherited workers`, async () => {
   const { runtimeFixture } = await import('../fixtures/runtime.ts');
   const { readFile, realpath } = await import('node:fs/promises');
   const { git } = await import('../../packages/core/src/git/repository.ts');
-  const f = await runtimeFixture(false), tokenPath = join(f.dir, 'host.token');
-  const server = await createServer(f.root, 'codex', join(f.dir, 'managed'), tokenPath);
+  const f = await runtimeFixture(false, {}, tmpdir(), {}, host), tokenPath = join(f.dir, 'host.token');
+  const server = await createServer(f.root, host, join(f.dir, 'managed'), tokenPath);
   const client = new Client({ name: 'native-relay-contract', version: '1' });
   const [a, b] = InMemoryTransport.createLinkedPair();
   try {
@@ -129,10 +129,12 @@ test('installed MCP connects the current native coordinator without a daemon and
     assert.equal(environment.installation, 'READY');
     assert.equal(environment.nativeDispatch, 'NEEDS_HOST_HANDSHAKE');
     const auth = { coordinator_token: await readFile(tokenPath, 'utf8') };
-    const receipt = { ...auth, native_tool: 'spawn_agent', native_agent_id: '/root/native-probe',
+    assert.equal(environment.nativeHandshake.nativeTool, host === 'hermes' ? 'delegate_task' : 'spawn_agent');
+    const receipt = { ...auth, native_tool: host === 'hermes' ? 'delegate_task' : 'spawn_agent', native_agent_id: '/root/native-probe',
       probe: { challenge: environment.nativeHandshake.challenge, cwd: await realpath(f.root), origin_root: await realpath(f.root),
         branch: await git(f.root, 'branch', '--show-current'), head: await git(f.root, 'rev-parse', 'HEAD') } };
     assert.equal((await call('orch_host_connect', { ...receipt, coordinator_token: 'worker' })).error.code, 'COORDINATOR_RELAY_REQUIRED');
+    assert.equal((await call('orch_host_connect', { ...receipt, native_tool: 'Agent' })).error.code, 'HOST_TOOL_MISMATCH');
     assert.equal((await call('orch_host_connect', { ...receipt, probe: { ...receipt.probe, head: 'a'.repeat(40) } })).error.code, 'HOST_CONTEXT_MISMATCH');
     assert.equal((await call('orch_host_connect', { ...receipt, probe: { ...receipt.probe, challenge: '0'.repeat(64) } })).error.code, 'HOST_CHALLENGE_MISMATCH');
     const connectResult = await call('orch_host_connect', receipt); assert.equal(connectResult.error, undefined, JSON.stringify(connectResult));

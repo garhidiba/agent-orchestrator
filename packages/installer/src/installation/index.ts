@@ -4,6 +4,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep, posix } from 'node:p
 import { isDeepStrictEqual } from 'node:util';
 import * as TOML from '@iarna/toml';
 import { z } from 'zod';
+import { parseDocument } from 'yaml';
 import { probeMcp } from '../diagnostics/mcp.ts';
 import { parseConfig } from '../../../core/src/config/index.ts';
 
@@ -13,7 +14,7 @@ const hashesSchema = z.record(z.string(), z.string().regex(/^[a-f0-9]{64}$/));
 const releaseSchema = z.object({ schema: z.literal(1), version: versionSchema, nodeMajor: z.literal(24), platform: z.string(), arch: z.string(), hostExecution: z.literal('UNVERIFIED'), sqlite: z.literal('node:sqlite'), skippedOptionalPackages: z.array(z.string()).default([]), files: hashesSchema }).strict();
 type Release = z.infer<typeof releaseSchema>;
 const releaseSkills = (release: Release) => release.files['skills/agent-orch/SKILL.md'] ? ['agent-orch', 'agent-orch-configure'] : ['orch', 'orch-configure'];
-export type Host = 'codex' | 'claude';
+export type Host = 'codex' | 'claude' | 'hermes';
 export interface InstallOptions {
   root: string; home: string; scope: 'user' | 'project'; project?: string; configFile?: string;
   hosts: readonly Host[]; bundle: string; checksum: string; runtime?: string; dryRun?: boolean;
@@ -22,7 +23,7 @@ export interface InstallOptions {
   migrate?: (configFile: string, previousVersion: string | null) => Promise<void>;
 }
 const hostRecordSchema = z.object({ version: versionSchema, files: hashesSchema, entry: z.record(z.string(), z.unknown()), runtime: z.string() }).strict();
-const manifestSchema = z.object({ schema: z.literal(1), scope: z.enum(['user', 'project']), base: z.string(), releases: hashesSchema, activeVersion: versionSchema.nullable(), hosts: z.object({ codex: hostRecordSchema.optional(), claude: hostRecordSchema.optional() }).strict() }).strict();
+const manifestSchema = z.object({ schema: z.literal(1), scope: z.enum(['user', 'project']), base: z.string(), releases: hashesSchema, activeVersion: versionSchema.nullable(), hosts: z.object({ codex: hostRecordSchema.optional(), claude: hostRecordSchema.optional(), hermes: hostRecordSchema.optional() }).strict() }).strict();
 type Manifest = z.infer<typeof manifestSchema>;
 type HostRecord = z.infer<typeof hostRecordSchema>;
 
@@ -194,24 +195,35 @@ function layout(options: Pick<InstallOptions, 'root' | 'home' | 'scope' | 'proje
   return { root, home, base, manifest: join(root, 'installation.json'), config: options.configFile ? resolve(options.configFile) : options.scope === 'project' ? join(base, '.orch/config.yaml') : process.platform === 'win32' ? join(home, 'AppData/Roaming/orch/config.yaml') : join(home, '.config/orch/config.yaml') };
 }
 function configPath(host: Host, options: Pick<InstallOptions, 'home' | 'scope' | 'project'>) {
+  if (host === 'hermes' && options.scope !== 'user') throw new Error('HERMES_USER_SCOPE_REQUIRED');
   const base = options.scope === 'user' ? resolve(options.home) : resolve(options.project!);
-  return host === 'codex' ? join(base, '.codex/config.toml') : join(base, options.scope === 'user' ? '.claude.json' : '.mcp.json');
+  return host === 'codex' ? join(base, '.codex/config.toml') : host === 'hermes' ? join(base, '.hermes/config.yaml') : join(base, options.scope === 'user' ? '.claude.json' : '.mcp.json');
 }
-function skillRoot(host: Host, base: string) { return join(base, host === 'codex' ? '.agents/skills' : '.claude/skills'); }
+function skillRoot(host: Host, base: string) { return join(base, host === 'codex' ? '.agents/skills' : host === 'hermes' ? '.hermes/skills' : '.claude/skills'); }
 function decodeConfig(host: Host, data: Buffer | null): Record<string, unknown> {
   try {
-    const parsed: unknown = data === null ? {} : host === 'codex' ? TOML.parse(data.toString()) : JSON.parse(data.toString());
+    if (data && data.length > 1024 * 1024) throw new Error();
+    const doc = host === 'hermes' ? parseDocument(data?.toString() ?? '{}', { uniqueKeys: true, schema: 'core' }) : null;
+    if (doc && (doc.errors.length || doc.warnings.length)) throw new Error();
+    const parsed: unknown = doc ? doc.toJS({ maxAliasCount: 0 }) : data === null ? {} : host === 'codex' ? TOML.parse(data.toString()) : JSON.parse(data.toString());
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error();
     return parsed as Record<string, unknown>;
   } catch { throw new Error('HOST_CONFIG_INVALID'); }
 }
 function entries(host: Host, config: Record<string, unknown>) {
-  const key = host === 'codex' ? 'mcp_servers' : 'mcpServers';
+  const key = host === 'claude' ? 'mcpServers' : 'mcp_servers';
   if (config[key] === undefined) config[key] = {};
   if (!config[key] || typeof config[key] !== 'object' || Array.isArray(config[key])) throw new Error('HOST_CONFIG_INVALID');
   return config[key] as Record<string, unknown>;
 }
-function encodeConfig(host: Host, config: Record<string, unknown>) {
+function encodeConfig(host: Host, config: Record<string, unknown>, before: Buffer | null) {
+  if (host === 'hermes') {
+    const doc = parseDocument(before?.toString() ?? '{}', { uniqueKeys: true, schema: 'core' });
+    const entry = (config.mcp_servers as Record<string, unknown>).orch;
+    if (entry === undefined) doc.deleteIn(['mcp_servers', 'orch']);
+    else doc.setIn(['mcp_servers', 'orch'], entry);
+    return Buffer.from(doc.toString());
+  }
   return Buffer.from(host === 'codex' ? TOML.stringify(config as Parameters<typeof TOML.stringify>[0]) : JSON.stringify(config, null, 2) + '\n');
 }
 async function getManifest(path: string, scope: 'user' | 'project', base: string): Promise<Manifest> {
@@ -268,7 +280,8 @@ async function locked<T>(root: string, action: () => Promise<T>) {
 
 export async function install(options: InstallOptions) {
   const { root, base, manifest: manifestFile, config: orchConfig } = layout(options);
-  if (!options.hosts.length || options.hosts.some(host => host !== 'codex' && host !== 'claude')) throw new Error('INSTALL_HOST_REQUIRED');
+  if (!options.hosts.length || options.hosts.some(host => host !== 'codex' && host !== 'claude' && host !== 'hermes')) throw new Error('INSTALL_HOST_REQUIRED');
+  for (const host of options.hosts) configPath(host, options);
   const release = await verifyRelease(resolve(options.bundle), options.checksum);
   if (!relative(base, root).startsWith('..')) await safe(root, base);
   const runtime = resolve(options.runtime ?? process.execPath);
@@ -325,7 +338,7 @@ export async function install(options: InstallOptions) {
           changes.push({ file, before: old, after: null });
         }
       }
-      const after = previous && isDeepStrictEqual(previous.entry, entry) ? before : encodeConfig(host, config);
+      const after = previous && isDeepStrictEqual(previous.entry, entry) ? before : encodeConfig(host, config, before);
       changes.push({ file: configFile, before, after });
       newManifest.hosts[host] = { version: release.version, files: owned, entry, runtime };
     }
@@ -386,7 +399,7 @@ export async function uninstall(options: Pick<InstallOptions, 'root' | 'home' | 
       const owned = manifest.hosts[host]; if (!owned) continue;
       const configFile = configPath(host, options); await safe(configFile, base);
       const before = await optional(configFile), config = decodeConfig(host, before), mcp = entries(host, config);
-      if (isDeepStrictEqual(mcp.orch, owned.entry)) { delete mcp.orch; changes.push({ file: configFile, before, after: encodeConfig(host, config) }); }
+      if (isDeepStrictEqual(mcp.orch, owned.entry)) { delete mcp.orch; changes.push({ file: configFile, before, after: encodeConfig(host, config, before) }); }
       else if (mcp.orch !== undefined) preserved.push(`${configFile}#orch`);
       for (const [file, digest] of Object.entries(owned.files)) {
         await safe(file, skillRoot(host, base));

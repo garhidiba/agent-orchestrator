@@ -1,5 +1,5 @@
 param(
-  [ValidateSet('auto','codex','claude','both')][string]$Target = 'auto',
+  [ValidateSet('auto','codex','claude','hermes','both','all')][string]$Target = 'auto',
   [ValidateSet('user','project')][string]$Scope = 'user',
   [string]$Project, [string]$Bundle, [string]$Checksum, [string]$Version,
   [switch]$DryRun, [switch]$Yes, [switch]$KeepData

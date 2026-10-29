@@ -3,7 +3,7 @@ import { promisify } from 'node:util';
 
 import { resolveExecutable } from '../../../core/src/process/executable.ts';
 const exec = promisify(execFile);
-export type HostKind = 'codex' | 'claude';
+export type HostKind = 'codex' | 'claude' | 'hermes';
 
 // A version response establishes installation only; native execution needs M0 evidence.
 export async function detectHost(host: HostKind, executable?: string, timeout = 5000) {

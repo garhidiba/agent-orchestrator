@@ -11,10 +11,10 @@ import { git } from '../../core/src/git/repository.ts';
 
 const help = `ORCH local release management (Node >=24 and Git required)
   pack --source DIR --bundle DIR --version VERSION
-  install [--bundle DIR --checksum SHA256] [--target auto|codex|claude|both] [--scope user|project] [--project DIR] [--dry-run] [--yes]
+  install [--bundle DIR --checksum SHA256] [--target auto|codex|claude|hermes|both|all] [--scope user|project] [--project DIR] [--dry-run] [--yes]
   update --bundle DIR --checksum SHA256 [same options]
-  rollback --version VERSION [--target auto|codex|claude|both] [same scope options]
-  uninstall [--target auto|codex|claude|both] [--keep-data] [same scope options]
+  rollback --version VERSION [--target auto|codex|claude|hermes|both|all] [same scope options]
+  uninstall [--target auto|codex|claude|hermes|both|all] [--keep-data] [same scope options]
 
 user is the global/current-user scope; project requires a Git root.
 --checksum is the externally trusted SHA256 of the bundle's release.json.
@@ -39,7 +39,7 @@ export async function manage(args: string[]) {
   }
   if (!['install', 'update', 'uninstall', 'rollback'].includes(command)) throw new Error('INVALID_COMMAND');
   if (values.scope !== 'user' && values.scope !== 'project') throw new Error('INVALID_SCOPE');
-  if (!['auto', 'both', 'codex', 'claude'].includes(values.target)) throw new Error('INVALID_TARGET');
+  if (!['auto', 'both', 'all', 'codex', 'claude', 'hermes'].includes(values.target)) throw new Error('INVALID_TARGET');
   const home = homedir(), scope: 'user' | 'project' = values.scope;
   let project: string | undefined;
   if (scope === 'project') {
@@ -56,7 +56,11 @@ export async function manage(args: string[]) {
     try { hosts = Object.keys(JSON.parse(await readFile(join(root, 'installation.json'), 'utf8')).hosts) as Host[]; }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; hosts = []; }
   } else {
-    const requested: Host[] = values.target === 'both' || values.target === 'auto' ? ['codex', 'claude'] : [values.target as Host];
+    const customHermesHome = process.env.HERMES_HOME && resolve(process.env.HERMES_HOME) !== join(home, '.hermes');
+    const requested: Host[] = values.target === 'both' ? ['codex', 'claude'] : values.target === 'all' || values.target === 'auto' ? ['codex', 'claude', 'hermes'] : [values.target as Host];
+    if (values.target === 'auto' && (scope === 'project' || customHermesHome)) requested.splice(requested.indexOf('hermes'), 1);
+    if (requested.includes('hermes') && scope === 'project') throw new Error('HERMES_USER_SCOPE_REQUIRED');
+    if (requested.includes('hermes') && customHermesHome) throw new Error('HERMES_CUSTOM_HOME_UNSUPPORTED');
     if (command === 'uninstall' || command === 'rollback') hosts = requested;
     else {
       const detected = await Promise.all(requested.map(host => detectHost(host)));

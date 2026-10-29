@@ -21,7 +21,7 @@ import { roleIds } from '../../protocol/src/config.ts';
 import { envelopeSchema, id, nativeAgentId, sha, relativePath, requirementsSchema, planSchema, planAmendmentSchema, runAbandonmentSchema, reviewSchema, taskResultSchema, hostHeartbeatSchema, findingDispositionSchema, requireCondition as check } from '../../protocol/src/runtime.ts';
 import type { NativeCapability, Run } from '../../core/src/runtime/engine.ts';
 
-export async function createServer(origin: string | null, host: 'codex' | 'claude', managedRoot: string, tokenPath: string) {
+export async function createServer(origin: string | null, host: 'codex' | 'claude' | 'hermes', managedRoot: string, tokenPath: string) {
   await mkdir(join(tokenPath, '..'), { recursive: true });
   try { await writeFile(tokenPath, randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o600 }); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
@@ -73,15 +73,15 @@ export async function createServer(origin: string | null, host: 'codex' | 'claud
     return { installation: 'READY', host: { ...detected, executionReady: native !== null, capabilityEvidence: native?.source ?? null, capabilities: { ...detected.capabilities, nativeSubagents: native ? 'supported' : 'unknown' } }, coordinatorTokenRef: tokenPath,
       nativeDispatch: native ? 'READY' : 'NEEDS_HOST_HANDSHAKE', originRoot: origin,
       nativeControl: { transport: 'current_host_agent_tool', daemonRequired: false, executionReady: native !== null, source: native?.source ?? null, model: native?.model ?? null, effort: native?.effort ?? null, perInvocationModel: native?.perInvocationModel ?? false, perInvocationEffort: native?.perInvocationEffort ?? false, invocationModelIds: native?.invocationModelIds ?? null },
-      nativeHandshake: native ? null : { challenge, expiresAt: new Date(challengeExpires).toISOString(), originRoot: origin, nativeTool: host === 'codex' ? 'spawn_agent' : 'Agent' } };
+      nativeHandshake: native ? null : { challenge, expiresAt: new Date(challengeExpires).toISOString(), originRoot: origin, nativeTool: host === 'codex' ? 'spawn_agent' : host === 'hermes' ? 'delegate_task' : 'Agent' } };
   });
-  register('orch_host_connect', { ...auth, native_tool: z.enum(['spawn_agent', 'Agent']), native_agent_id: nativeAgentId,
+  register('orch_host_connect', { ...auth, native_tool: z.enum(['spawn_agent', 'Agent', 'delegate_task']), native_agent_id: nativeAgentId,
     native_context: nativeModelContextSchema.omit({ host: true, verified: true, contextMatches: true, evidence: true }).optional(),
     probe: z.strictObject({ challenge: z.string().regex(/^[a-f0-9]{64}$/), cwd: z.string(), origin_root: z.string(), branch: z.string(), head: sha }),
   }, async data => {
     authenticate(data.coordinator_token); check(origin, 'PROJECT_REQUIRED'); check(!native, 'HOST_ALREADY_CONNECTED');
     check(data.probe.challenge === challenge && Date.now() <= challengeExpires, 'HOST_CHALLENGE_MISMATCH');
-    check(data.native_tool === (host === 'codex' ? 'spawn_agent' : 'Agent'), 'HOST_TOOL_MISMATCH');
+    check(data.native_tool === (host === 'codex' ? 'spawn_agent' : host === 'hermes' ? 'delegate_task' : 'Agent'), 'HOST_TOOL_MISMATCH');
     const repo = await inspectRepository(origin);
     check(data.probe.cwd === repo.root && data.probe.origin_root === repo.root && data.probe.branch === repo.branch && data.probe.head === repo.head, 'HOST_CONTEXT_MISMATCH');
     // Trust the authenticated parent's native-tool receipt, not a worker's JSON role or a daemon probe.

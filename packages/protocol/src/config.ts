@@ -49,11 +49,11 @@ const observability = z.strictObject({
 
 export const configSchema = z.strictObject({
   schema_version: z.literal(1), model_selection: modelSelection,
-  hosts: z.strictObject({ codex: host, claude: host }), execution, planning, git, review, quality, cleanup, observability,
+  hosts: z.strictObject({ codex: host, claude: host, hermes: host }), execution, planning, git, review, quality, cleanup, observability,
 });
 const hostPatch = host.partial().extend({ roles: z.partialRecord(roleId, role.partial()).optional() });
 export const configPatchSchema = configSchema.partial().extend({
-  hosts: z.strictObject({ codex: hostPatch.optional(), claude: hostPatch.optional() }).optional(),
+  hosts: z.strictObject({ codex: hostPatch.optional(), claude: hostPatch.optional(), hermes: hostPatch.optional() }).optional(),
   model_selection: modelSelection.partial().optional(), execution: execution.partial().optional(),
   planning: planning.partial().optional(), git: git.partial().optional(), review: review.partial().optional(),
   quality: quality.partial().optional(), cleanup: cleanup.partial().optional(), observability: observability.partial().optional(),

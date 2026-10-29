@@ -95,7 +95,7 @@ const patchSchema = z.discriminatedUnion('op', [
   z.strictObject({ op: z.literal('remove'), path: pointer }),
 ]);
 export const recommendationSchema = z.strictObject({
-  scope: z.enum(['global', 'project', 'session']), host: z.enum(['codex', 'claude']), configRevision: z.int().nonnegative(),
+  scope: z.enum(['global', 'project', 'session']), host: z.enum(['codex', 'claude', 'hermes']), configRevision: z.int().nonnegative(),
   proposedPatch: z.array(patchSchema), selections: z.array(z.strictObject({
     role: z.enum(roleIds), modelId: text, effort: text.nullable(), reasons: texts.min(1), evidenceRefs: texts,
     confidence: z.enum(['low', 'medium', 'high']),

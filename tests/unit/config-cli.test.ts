@@ -29,5 +29,8 @@ test('developer CLI config mutation and configure dry-run preserve pins and reve
     assert.equal(roles.coder.observed, null);
     assert.equal(roles.coder.source.model, 'global');
     assert.equal((await run('models', 'available', '--host', 'claude')).status, 'partial');
+    assert.equal((await run('models', '--host', 'hermes')).coder.requested.model, 'inherit');
+    await run('models', 'set', 'coder', '--host', 'hermes', '--model', 'auto', '--effort', 'auto');
+    assert.deepEqual((await run('config', '--effective')).config.hosts.hermes.roles.coder, { model: 'auto', effort: 'auto' });
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

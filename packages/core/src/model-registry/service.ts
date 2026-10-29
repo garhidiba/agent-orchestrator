@@ -14,7 +14,7 @@ import type { Model } from './index.ts';
 import { resolveExecutable } from '../process/executable.ts';
 const exec = promisify(execFile);
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
-type Host = 'codex' | 'claude';
+type Host = 'codex' | 'claude' | 'hermes';
 export type CatalogOptions = { refresh?: boolean; readOnly?: boolean; claudeMetadata?: ClaudeMetadataAdapter; executable?: string; cacheRoot?: string; timeout?: number; now?: number; env?: NodeJS.ProcessEnv };
 export type CatalogResult = {
   status: 'partial' | 'failed'; models: Model[]; contextMatches: false; source: 'live' | 'cache' | 'none';
@@ -24,12 +24,12 @@ export type CatalogResult = {
 
 async function settingsFingerprint(origin: string | null, host: Host, env: NodeJS.ProcessEnv) {
   const home = env.HOME ?? env.USERPROFILE ?? homedir();
-  const hostHome = host === 'codex' ? env.CODEX_HOME ?? join(home, '.codex') : env.CLAUDE_CONFIG_DIR ?? join(home, '.claude');
-  const paths = [globalConfigPath(env), host === 'codex' ? join(hostHome, 'config.toml') : join(hostHome, 'settings.json')];
+  const hostHome = host === 'codex' ? env.CODEX_HOME ?? join(home, '.codex') : host === 'hermes' ? env.HERMES_HOME ?? join(home, '.hermes') : env.CLAUDE_CONFIG_DIR ?? join(home, '.claude');
+  const paths = [globalConfigPath(env), host === 'codex' ? join(hostHome, 'config.toml') : join(hostHome, host === 'hermes' ? 'config.yaml' : 'settings.json')];
   if (host === 'claude') paths.push(join(home, '.claude.json'));
   for (let dir = origin; dir !== null; dir = dirname(dir) === dir ? null : dirname(dir)) {
     paths.push(join(dir, '.orch', 'config.yaml'));
-    paths.push(...(host === 'codex' ? [join(dir, '.codex', 'config.toml')] : [join(dir, '.claude', 'settings.json'), join(dir, '.claude', 'settings.local.json')]));
+    paths.push(...(host === 'codex' ? [join(dir, '.codex', 'config.toml')] : host === 'hermes' ? [] : [join(dir, '.claude', 'settings.json'), join(dir, '.claude', 'settings.local.json')]));
   }
   const snapshots: unknown[] = [];
   for (const path of [...new Set(paths)].sort()) {
@@ -41,7 +41,7 @@ async function settingsFingerprint(origin: string | null, host: Host, env: NodeJ
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; snapshots.push([path, null]); }
   }
   // Auth file metadata detects local rotation without reading credentials or asserting account identity.
-  for (const path of [join(hostHome, host === 'codex' ? 'auth.json' : '.credentials.json')]) {
+  for (const path of host === 'hermes' ? [join(hostHome, '.env'), join(hostHome, 'auth.json')] : [join(hostHome, host === 'codex' ? 'auth.json' : '.credentials.json')]) {
     try { const info = await stat(path); snapshots.push([path, info.size, info.mtimeMs, info.ctimeMs]); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; snapshots.push([path, null]); }
   }
@@ -55,7 +55,7 @@ export async function getCatalogForHost(origin: string | null, host: Host, optio
   const now = options.now ?? Date.now(), timeout = options.timeout ?? 10000;
   let context: CatalogContext, ttl: number, cacheFile: string;
   try {
-    if (!['codex', 'claude'].includes(host)) throw new Error('CATALOG_HOST_INVALID');
+    if (!['codex', 'claude', 'hermes'].includes(host)) throw new Error('CATALOG_HOST_INVALID');
     const cwd = origin === null ? null : await realpath(origin);
     const resolved = await resolveExecutable(host, { cwd: cwd ?? undefined, env, trustedExecutable: options.executable });
     const executable = resolved.path; env = resolved.env;
@@ -76,7 +76,7 @@ export async function getCatalogForHost(origin: string | null, host: Host, optio
     stale: cached!.stale, fetchedAt: cached!.fetchedAt, expiresAt: cached!.expiresAt });
   if (cached && !cached.stale && !options.refresh) return useCache();
   try {
-    const live = host === 'codex' ? await discoverCodexModels(context.executable, timeout, { env, cwd: context.originRoot ?? undefined }) : await discoverClaudeModels(options.claudeMetadata);
+    const live = host === 'hermes' ? { status: 'partial' as const, models: [], reason: 'NATIVE_MODEL_METADATA_UNAVAILABLE' } : host === 'codex' ? await discoverCodexModels(context.executable, timeout, { env, cwd: context.originRoot ?? undefined }) : await discoverClaudeModels(options.claudeMetadata);
     if ('reason' in live && live.reason === 'NATIVE_MODEL_METADATA_UNAVAILABLE') throw new Error('NATIVE_MODEL_METADATA_UNAVAILABLE');
     const cache = createCatalogCache(context, [...live.models], ttl, now);
     result.status = 'partial'; result.models = cache.models; result.source = 'live'; result.stale = false;

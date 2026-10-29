@@ -49,9 +49,12 @@ test('missing executable and unavailable native metadata are explicit outcomes',
     assert.equal(missing.status, 'failed'); assert.equal(missing.source, 'none');
     assert.deepEqual(missing.errors, ['CATALOG_CONTEXT_UNAVAILABLE']);
     const executable = join(dir, 'claude'); await writeFile(executable, `#!${process.execPath}\nconsole.log('fixture-claude 1');`, { mode: 0o700 });
-    const partial = await getCatalogForHost(dir, 'claude', { executable, env });
-    assert.equal(partial.status, 'partial'); assert.equal(partial.source, 'none');
-    assert.deepEqual(partial.errors, ['NATIVE_MODEL_METADATA_UNAVAILABLE']); assert.equal(partial.contextMatches, false);
+    for (const host of ['claude', 'hermes'] as const) {
+      const partial = await getCatalogForHost(dir, host, { executable, env });
+      assert.equal(partial.status, 'partial'); assert.equal(partial.source, 'none');
+      assert.deepEqual(partial.errors, ['NATIVE_MODEL_METADATA_UNAVAILABLE']); assert.equal(partial.contextMatches, false);
+      assert.deepEqual(partial.models, []); assert.equal(partial.context?.host, host);
+    }
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 

@@ -31,6 +31,17 @@ hosts:
       reviewer:      { model: auto, effort: auto }
       repair:        { model: auto, effort: auto }
       final_auditor: { model: auto, effort: auto }
+  hermes:
+    enabled: true
+    roles:
+      coordinator:   { model: inherit, effort: inherit }
+      requirements:  { model: inherit, effort: inherit }
+      planner:       { model: inherit, effort: inherit }
+      coder:         { model: inherit, effort: inherit }
+      tester:        { model: inherit, effort: inherit }
+      reviewer:      { model: inherit, effort: inherit }
+      repair:        { model: inherit, effort: inherit }
+      final_auditor: { model: inherit, effort: inherit }
 
 execution:
   mode: interactive_native

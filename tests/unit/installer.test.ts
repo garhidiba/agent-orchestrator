@@ -26,6 +26,63 @@ for await (const line of readline.createInterface({input:process.stdin})) {
   return { dir, source, bundle, home, root, checksum };
 }
 
+test('Hermes install, update, doctor and removal preserve user YAML, comments and modified skills', async () => {
+  const { uninstall, update, rollback } = await import('../../packages/installer/src/installation/index.ts');
+  const { doctor } = await import('../../packages/installer/src/diagnostics/index.ts');
+  const { parse } = await import('yaml');
+  const f = await fixture();
+  try {
+    await mkdir(join(f.home, '.hermes'));
+    const file = join(f.home, '.hermes/config.yaml');
+    const original = '# user settings\nmodel: {default: provider/model}\nmcp_servers:\n  # keep other server\n  other: {command: other}\n';
+    await writeFile(file, original);
+    const options = { ...f, hosts: ['hermes'] as const, scope: 'user' as const };
+    await install({ ...options, dryRun: true });
+    assert.equal(await readFile(file, 'utf8'), original);
+    const first = await install(options);
+    const installed = await readFile(file, 'utf8');
+    const config = parse(installed);
+    assert.equal(config.model.default, 'provider/model'); assert.equal(config.mcp_servers.other.command, 'other');
+    assert.ok(config.mcp_servers.orch.args.includes('hermes')); assert.match(installed, /# user settings/); assert.match(installed, /# keep other server/);
+    assert.equal(first.mcp, 'HANDSHAKE_VERIFIED'); assert.equal(first.execution, 'UNVERIFIED');
+    const skill = join(f.home, '.hermes/skills/orch/SKILL.md');
+    assert.equal(await readFile(skill, 'utf8'), '# ORCH\n');
+    await install(options); assert.equal(await readFile(file, 'utf8'), installed);
+    const diagnosis = await doctor(null, 'hermes', { home: f.home, root: f.root, executable: process.execPath, catalog: false });
+    assert.equal(diagnosis.hostConfig.status, 'valid'); assert.equal(diagnosis.installation, 'integrity_verified');
+    assert.equal(diagnosis.executionReady, false);
+    await writeFile(join(f.source, 'skills/orch/SKILL.md'), '# Updated ORCH\n');
+    const newer = join(f.dir, 'newer'), checksum = await packRelease(f.source, newer, '0.1.1');
+    await update({ ...options, bundle: newer, checksum });
+    assert.equal(await readFile(skill, 'utf8'), '# Updated ORCH\n');
+    await rollback({ ...options, version: '0.1.0' });
+    assert.equal(await readFile(skill, 'utf8'), '# ORCH\n');
+    await writeFile(skill, '# user modified\n');
+    await assert.rejects(install(options), /INSTALL_CONFLICT/);
+    const removed = await uninstall(options);
+    assert.ok(removed.preserved.includes(skill)); assert.equal(await readFile(skill, 'utf8'), '# user modified\n');
+    const after = await readFile(file, 'utf8');
+    assert.match(after, /# user settings/); assert.equal(parse(after).mcp_servers.orch, undefined);
+    assert.equal(parse(after).mcp_servers.other.command, 'other');
+    await assert.rejects(install({ ...options, scope: 'project', project: f.home }), /HERMES_USER_SCOPE_REQUIRED/);
+    assert.equal(await readFile(file, 'utf8'), after);
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
+
+test('Hermes rejects malformed YAML and unowned MCP conflicts before installation writes', async () => {
+  const f = await fixture();
+  try {
+    await mkdir(join(f.home, '.hermes'));
+    const file = join(f.home, '.hermes/config.yaml');
+    for (const source of ['mcp_servers: []\n', 'model: one\nmodel: two\n', 'mcp_servers: &servers {other: {command: tool}}\nalias: *servers\n', 'mcp_servers: {orch: {command: user-tool}}\n']) {
+      await writeFile(file, source);
+      await assert.rejects(install({ ...f, hosts: ['hermes'], scope: 'user' }), /HOST_CONFIG_INVALID|INSTALL_CONFLICT/);
+      assert.equal(await readFile(file, 'utf8'), source);
+      await assert.rejects(readFile(join(f.root, 'installation.json')), { code: 'ENOENT' });
+    }
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
+
 test('AT-047: verified immutable install is idempotent and preserves other host configuration', async () => {
   const f = await fixture();
   try {

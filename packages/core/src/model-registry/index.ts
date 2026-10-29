@@ -3,7 +3,7 @@ import { requireCondition as check } from '../../../protocol/src/runtime.ts';
 import type { Config } from '../../../protocol/src/config.ts';
 
 export const modelSchema = z.strictObject({
-  host: z.enum(['codex', 'claude']), id: z.string().min(1), displayName: z.string(), resolvedId: z.string().nullable(),
+  host: z.enum(['codex', 'claude', 'hermes']), id: z.string().min(1), displayName: z.string(), resolvedId: z.string().nullable(),
   family: z.enum(['openai', 'claude', 'unknown']), support: z.enum(['advertised', 'verified', 'unsupported']),
   access: z.enum(['unknown', 'confirmed', 'denied']), availability: z.enum(['unknown', 'available', 'rate_limited', 'unavailable']),
   efforts: z.array(z.string()).nullable(), defaultEffort: z.string().nullable(), hidden: z.boolean(),
@@ -13,7 +13,7 @@ export const modelSchema = z.strictObject({
 export type Model = z.infer<typeof modelSchema>;
 export function validateModels(config: Config, catalog: Model[], previous?: Config) {
   const models = catalog.map(model => modelSchema.parse(model));
-  for (const host of ['codex', 'claude'] as const) for (const [role, policy] of Object.entries(config.hosts[host].roles)) {
+  for (const host of ['codex', 'claude', 'hermes'] as const) for (const [role, policy] of Object.entries(config.hosts[host].roles)) {
     const prior = previous?.hosts[host].roles[role as keyof Config['hosts']['codex']['roles']];
     if (prior?.model === policy.model && prior?.effort === policy.effort) continue;
     if (['auto', 'inherit'].includes(policy.model)) {
@@ -21,7 +21,7 @@ export function validateModels(config: Config, catalog: Model[], previous?: Conf
       continue;
     }
     const model = models.find(candidate => candidate.host === host && candidate.id === policy.model);
-    check(model && model.support !== 'unsupported' && model.family === (host === 'codex' ? 'openai' : 'claude'), 'MODEL_NOT_SUPPORTED');
+    check(model && model.support !== 'unsupported' && (host === 'hermes' || model.family === (host === 'codex' ? 'openai' : 'claude')), 'MODEL_NOT_SUPPORTED');
     check(model.access !== 'denied', 'MODEL_ACCESS_DENIED');
     check(!['unavailable', 'rate_limited'].includes(model.availability), 'MODEL_UNAVAILABLE');
     check(model.defaultEffort === null || model.efforts === null || model.efforts.includes(model.defaultEffort), 'EFFORT_METADATA_INVALID');

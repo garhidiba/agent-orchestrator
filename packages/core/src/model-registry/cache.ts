@@ -4,7 +4,7 @@ import { modelSchema } from './index.ts';
 
 // Unknown identity fields cannot establish equivalence with a native session.
 export const catalogContextSchema = z.strictObject({
-  host: z.enum(['codex', 'claude']), executable: z.string().min(1), version: z.string().min(1),
+  host: z.enum(['codex', 'claude', 'hermes']), executable: z.string().min(1), version: z.string().min(1),
   account: z.string().min(1).nullable(), workspace: z.string().min(1).nullable(),
   policyFingerprint: z.string().min(1),
   settingsFingerprint: z.string().min(1).optional(), originRoot: z.string().nullable().optional(),

@@ -7,7 +7,7 @@ import { hash } from '../../core/src/state/store.ts';
 import { git } from '../../core/src/git/repository.ts';
 import { createServer } from './server.ts';
 const { values } = parseArgs({ options: { host: { type: 'string' }, origin: { type: 'string' } } });
-if (values.host !== 'codex' && values.host !== 'claude') throw new Error('HOST_REQUIRED');
+if (values.host !== 'codex' && values.host !== 'claude' && values.host !== 'hermes') throw new Error('HOST_REQUIRED');
 const invocation = await realpath(resolve(values.origin ?? process.cwd()));
 let origin: string | null;
 try { origin = await realpath(await git(invocation, 'rev-parse', '--show-toplevel')); }

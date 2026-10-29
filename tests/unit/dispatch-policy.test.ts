@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { realpath } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { runtimeFixture } from '../fixtures/runtime.ts';
 import { modelSchema } from '../../packages/core/src/model-registry/index.ts';
 
@@ -8,6 +9,20 @@ const descriptor = (id: string) => modelSchema.parse({ host: 'codex', id, displa
   family: 'openai', support: 'advertised', access: 'unknown', availability: 'unknown', efforts: ['high', 'low'], defaultEffort: 'low',
   hidden: false, source: 'synthetic-native-tool-metadata', sourceVersion: null, fetchedAt: new Date().toISOString(), expiresAt: null,
   evidence: [{ kind: 'fixture', ref: 'synthetic-contract' }] });
+
+for (const host of ['codex', 'hermes'] as const) test(`${host} run rejects policy edits to every inactive host`, async () => {
+  const f = await runtimeFixture(true, {}, tmpdir(), {}, host);
+  try {
+    await f.change({}, run => f.engine.plan(run, f.plan, true));
+    for (const other of ['codex', 'claude', 'hermes'] as const) {
+      if (other === host) continue;
+      const config = structuredClone(f.engine.status(f.created.runId).data.config);
+      config.hosts[other].enabled = false;
+      f.engine.readConfig = async () => config;
+      await assert.rejects(f.change({ other }, run => f.engine.prepare(run, 'T1')), /RUN_POLICY_CHANGE_REQUIRES_NEW_RUN/);
+    }
+  } finally { await f.close(); }
+});
 
 test('Engine dispatch applies role pins and preserves each attempt resolution across config revisions', async () => {
   const f = await runtimeFixture(true, { hosts: { codex: { roles: { coder: { model: 'fixture-fast', effort: 'low' } } } } });

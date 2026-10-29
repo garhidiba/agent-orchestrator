@@ -6,7 +6,7 @@ import { modelSchema, type Model } from '../model-registry/index.ts';
 export type RoleId = typeof roleIds[number];
 // Only the authenticated coordinator may construct this from the current host tool receipt.
 export const nativeModelContextSchema = z.strictObject({
- host:z.enum(['codex','claude']),verified:z.boolean(),contextMatches:z.boolean(),evidence:z.array(z.string().min(1)),
+ host:z.enum(['codex','claude','hermes']),verified:z.boolean(),contextMatches:z.boolean(),evidence:z.array(z.string().min(1)),
  perInvocationModel:z.boolean().optional(),perInvocationEffort:z.boolean().optional(),
  invocationModelIds:z.array(z.string().min(1).max(256)).max(256).optional(),
  model:z.string().min(1).nullable(),effort:z.string().min(1).nullable(),models:z.array(modelSchema).optional(),
@@ -16,7 +16,7 @@ export type NativeModelContext = z.infer<typeof nativeModelContextSchema> & {cla
 const automatic = (value: string) => value === 'auto' || value === 'inherit';
 export function supportedModel(host: NativeModelContext['host'], value: Model, now: number) {
  const model=modelSchema.parse(value);
- check(model.host===host && model.family===(host==='codex'?'openai':'claude') && model.support!=='unsupported','MODEL_NOT_SUPPORTED');
+ check(model.host===host && (host==='hermes' || model.family===(host==='codex'?'openai':'claude')) && model.support!=='unsupported','MODEL_NOT_SUPPORTED');
  check(model.access!=='denied','MODEL_ACCESS_DENIED');
  check(!['rate_limited','unavailable'].includes(model.availability),'MODEL_UNAVAILABLE');
  check(model.expiresAt===null || Date.parse(model.expiresAt)>now,'CATALOG_EXPIRED');

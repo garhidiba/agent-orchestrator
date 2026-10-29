@@ -5,6 +5,7 @@ import { join, isAbsolute } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import * as TOML from '@iarna/toml';
 import { z } from 'zod';
+import { parseDocument } from 'yaml';
 import { detectHost, type HostKind } from '../detection/host.ts';
 import { globalConfigPath, loadConfig } from '../../../core/src/config/index.ts';
 import { getCatalogForHost } from '../../../core/src/model-registry/service.ts';
@@ -27,16 +28,18 @@ export async function doctor(origin: string | null, host: HostKind, options: { h
   let hostConfig = 'missing', installation = 'missing', mcp = 'not_configured';
   let protocol: Awaited<ReturnType<typeof probeMcp>> | null = null;
   try {
-    const fileFor = (base: string) => host === 'codex' ? join(base, '.codex/config.toml') : join(base, base === home ? '.claude.json' : '.mcp.json');
+    const fileFor = (base: string) => host === 'codex' ? join(base, '.codex/config.toml') : host === 'hermes' ? join(base, '.hermes/config.yaml') : join(base, base === home ? '.claude.json' : '.mcp.json');
     let entries: Record<string, unknown> = {};
-    for (const candidate of [...new Set([base, home])]) {
+    for (const candidate of host === 'hermes' ? [home] : [...new Set([base, home])]) {
       let bytes: string;
       try { bytes = await readFile(fileFor(candidate), 'utf8'); }
       catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }
       if (Buffer.byteLength(bytes) > 1024 * 1024) throw new Error('HOST_CONFIG_TOO_LARGE');
-      const parsed = host === 'codex' ? TOML.parse(bytes) : JSON.parse(bytes);
+      const doc = host === 'hermes' ? parseDocument(bytes, { uniqueKeys: true, schema: 'core' }) : null;
+      if (doc && (doc.errors.length || doc.warnings.length)) throw new Error('HOST_CONFIG_INVALID');
+      const parsed = doc ? doc.toJS({ maxAliasCount: 0 }) : host === 'codex' ? TOML.parse(bytes) : JSON.parse(bytes);
       const config = z.record(z.string(), z.unknown()).parse(parsed);
-      entries = z.record(z.string(), z.unknown()).parse(config[host === 'codex' ? 'mcp_servers' : 'mcpServers'] ?? {});
+      entries = z.record(z.string(), z.unknown()).parse(config[host === 'claude' ? 'mcpServers' : 'mcp_servers'] ?? {});
       hostConfig = 'valid'; base = candidate;
       if (entries.orch !== undefined) break;
     }

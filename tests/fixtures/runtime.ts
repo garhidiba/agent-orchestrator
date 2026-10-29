@@ -7,7 +7,7 @@ import { hash } from '../../packages/core/src/state/store.ts';
 import type { Plan } from '../../packages/protocol/src/runtime.ts';
 import { changedPaths, git } from '../../packages/core/src/git/repository.ts';
 
-export async function runtimeFixture(native = true, overrides: unknown = {}, parent = tmpdir(), createOptions: Parameters<Engine['create']>[5] = {}) {
+export async function runtimeFixture(native = true, overrides: unknown = {}, parent = tmpdir(), createOptions: Parameters<Engine['create']>[5] = {}, host: Run['host'] = 'codex') {
   const dir = await mkdtemp(join(parent, 'orch-engine-')), root = join(dir, 'repo');
   let engine: Engine | undefined;
   try {
@@ -18,8 +18,8 @@ export async function runtimeFixture(native = true, overrides: unknown = {}, par
   await mkdir(join(root, '.orch'));
   await writeFile(join(root, '.orch/config.yaml'), JSON.stringify(config));
   await git(root, 'add', '.orch/config.yaml'); await git(root, 'commit', '-m', 'fixture configuration');
-  engine = new Engine(join(root, '.orch/state/state.db'), native ? { host: 'codex', model: 'fixture-model', effort: 'high', evidence: ['test-fixture'], verified: true, contextMatches: true } : null);
-  const created = await engine.create(root, config, 'codex', join(dir, 'managed'), hash(config.quality.commands), createOptions);
+  engine = new Engine(join(root, '.orch/state/state.db'), native ? { host, model: 'fixture-model', effort: 'high', evidence: ['test-fixture'], verified: true, contextMatches: true } : null);
+  const created = await engine.create(root, config, host, join(dir, 'managed'), hash(config.quality.commands), createOptions);
   const active = engine;
   let op = 0;
   const change = <T>(input: object, fn: (run: Run) => Promise<T>) => active.change(created.runId, `op-${++op}`, active.status(created.runId).version, input, fn);

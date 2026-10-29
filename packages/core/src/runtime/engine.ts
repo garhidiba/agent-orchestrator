@@ -86,7 +86,7 @@ function inRepositoryWorktreeDirectory(root: string, managedRoot: string): strin
 const activeWriterStates = new Set(['LEASED', 'RUNNING', 'VALIDATING', 'ORPHANED_UNKNOWN']);
 const activePhases = new Set(['ANALYZING', 'EXECUTING', 'INTEGRATING', 'VERIFYING', 'REVIEWING', 'REPAIR_PLANNING', 'FINAL_AUDIT', 'FINALIZING', 'CLEANING']);
 export type Run = {
-  id: string; host: 'codex' | 'claude'; origin: string; commonDir: string; target: string; targetBase: string;
+  id: string; host: 'codex' | 'claude' | 'hermes'; origin: string; commonDir: string; target: string; targetBase: string;
   integration: string; integrationPath: string; managedRoot: string; state: string; config: Config;
   reviewDispatches?: Record<string, ReviewDispatch>;
   requirements?: Requirements; requirementRefs?: { json: string; markdown: string };
@@ -131,7 +131,7 @@ export class Engine {
     this.store = new Store(join(directory, 'state.db')); this.native = native; this.readConfig = readConfig;
   }
   status(run: string) { return this.store.get<Run>(id.parse(run)); }
-  async create(origin: string, configInput: unknown, host: 'codex' | 'claude', managedRoot: string, trustedCommandsHash: string, options: { missingTestsWaiver?: { approved: boolean; reason: string } } = {}) {
+  async create(origin: string, configInput: unknown, host: 'codex' | 'claude' | 'hermes', managedRoot: string, trustedCommandsHash: string, options: { missingTestsWaiver?: { approved: boolean; reason: string } } = {}) {
     const config = configSchema.parse(configInput), located = await inspectRepository(origin);
     check(located.root === this.origin, 'STATE_ORIGIN_MISMATCH');
     await ensureStateIgnored(located.root, located.commonDir);
@@ -548,7 +548,7 @@ export class Engine {
     if (this.readConfig) {
       const next = configSchema.parse(await this.readConfig());
       const policies = (value: Config) => ({ ...value, hosts: undefined, model_selection: undefined });
-      check(hash(policies(next)) === hash(policies(run.config)) && hash(next.hosts[run.host === 'codex' ? 'claude' : 'codex']) === hash(run.config.hosts[run.host === 'codex' ? 'claude' : 'codex']), 'RUN_POLICY_CHANGE_REQUIRES_NEW_RUN');
+      check(hash(policies(next)) === hash(policies(run.config)) && Object.keys(next.hosts).filter(host => host !== run.host).every(host => hash(next.hosts[host as Run['host']]) === hash(run.config.hosts[host as Run['host']])), 'RUN_POLICY_CHANGE_REQUIRES_NEW_RUN');
       if (hash(next) !== hash(run.config)) {
         run.config = next; run.configRevision = (run.configRevision ?? 1) + 1; run.configRevisions ??= [];
         run.configRevisions.push({ revision: run.configRevision, hash: hash(next), roles: structuredClone(next.hosts), timestamp: new Date().toISOString() });

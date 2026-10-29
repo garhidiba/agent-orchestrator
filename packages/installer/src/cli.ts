@@ -22,17 +22,17 @@ try {
     host: { type: 'string' }, effective: { type: 'boolean' }, help: { type: 'boolean' }, global: { type: 'boolean' },
     'dry-run': { type: 'boolean' }, profile: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' },
   } });
-  const host = flags.host === 'codex' || flags.host === 'claude' ? flags.host : null;
+  const host = flags.host === 'codex' || flags.host === 'claude' || flags.host === 'hermes' ? flags.host : null;
   const print = (value: unknown) => console.log(JSON.stringify(value, null, 2));
   const invalid = () => { throw new Error('Invalid command. Run npm run orch -- --help'); };
   if (flags.help || args.length === 0) {
     console.log(`ORCH development tools
 Usage:
-  npm run orch -- doctor --host <codex|claude>
+  npm run orch -- doctor --host <codex|claude|hermes>
   npm run orch -- config --effective
   npm run orch -- config <set|unset> <path> [YAML-value] [--global] [--dry-run]
-  npm run orch -- models [available|refresh] --host <codex|claude>
-  npm run orch -- models set <role> --host <codex|claude> --model <ID> [--effort <LEVEL>] [--global] [--dry-run]
+  npm run orch -- models [available|refresh] --host <codex|claude|hermes>
+  npm run orch -- models set <role> --host <codex|claude|hermes> --model <ID> [--effort <LEVEL>] [--global] [--dry-run]
   npm run orch -- configure [--profile <balanced|quality|economy|fast>] [--global] [--dry-run]`);
   } else if (args[0] === 'doctor' && args.length === 1 && host && !flags.effective && !flags.global && !flags['dry-run'] && !flags.profile && !flags.model && !flags.effort) {
     const result = await doctor(await originRoot(), host); print(result); if (result.status !== 'detected' || result.configuration.status !== 'valid' || result.hostConfig.status === 'invalid' || result.mcp.status !== 'verified') process.exitCode = 1;
